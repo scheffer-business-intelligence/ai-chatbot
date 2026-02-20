@@ -50,6 +50,7 @@ import {
   AGENT_ENGINE_PROVIDER_ID,
   createVertexSession,
   streamVertexQuery,
+  type VertexExtractedContext,
 } from "@/lib/vertex/agent-engine";
 import { generateTitleFromUserMessage } from "../../actions";
 import { type PostRequestBody, postRequestBodySchema } from "./schema";
@@ -235,24 +236,47 @@ export async function POST(request: Request) {
             role: "user",
             parts: message.parts,
             attachments: [],
+            chartSpec: null,
+            chartError: null,
             createdAt: new Date(),
           },
         ],
       });
     }
 
+    const extractedContext: VertexExtractedContext = {
+      chartSpec: null,
+      chartError: null,
+      hasChartContext: false,
+    };
+
     const handleOnFinish = async ({
       messages: finishedMessages,
     }: {
       messages: ChatMessage[];
     }) => {
+      const lastAssistantMessageId = [...finishedMessages]
+        .reverse()
+        .find((currentMessage) => currentMessage.role === "assistant")?.id;
+
       if (isToolApprovalFlow) {
         for (const finishedMsg of finishedMessages) {
           const existingMsg = uiMessages.find((m) => m.id === finishedMsg.id);
+          const shouldPersistChartContext =
+            isAgentEngineModel(selectedChatModel) &&
+            finishedMsg.role === "assistant" &&
+            finishedMsg.id === lastAssistantMessageId;
+
           if (existingMsg) {
             await updateMessage({
               id: finishedMsg.id,
               parts: finishedMsg.parts,
+              chartSpec: shouldPersistChartContext
+                ? extractedContext.chartSpec
+                : undefined,
+              chartError: shouldPersistChartContext
+                ? extractedContext.chartError
+                : undefined,
             });
           } else {
             await saveMessages({
@@ -263,6 +287,12 @@ export async function POST(request: Request) {
                   parts: finishedMsg.parts,
                   createdAt: new Date(),
                   attachments: [],
+                  chartSpec: shouldPersistChartContext
+                    ? extractedContext.chartSpec
+                    : null,
+                  chartError: shouldPersistChartContext
+                    ? extractedContext.chartError
+                    : null,
                   chatId: id,
                 },
               ],
@@ -277,6 +307,18 @@ export async function POST(request: Request) {
             parts: currentMessage.parts,
             createdAt: new Date(),
             attachments: [],
+            chartSpec:
+              isAgentEngineModel(selectedChatModel) &&
+              currentMessage.role === "assistant" &&
+              currentMessage.id === lastAssistantMessageId
+                ? extractedContext.chartSpec
+                : null,
+            chartError:
+              isAgentEngineModel(selectedChatModel) &&
+              currentMessage.role === "assistant" &&
+              currentMessage.id === lastAssistantMessageId
+                ? extractedContext.chartError
+                : null,
             chatId: id,
           })),
         });
@@ -341,6 +383,7 @@ export async function POST(request: Request) {
               userId: session.user.id,
               message: vertexMessage,
               signal: request.signal,
+              extractedContext,
             })) {
               if (!delta) {
                 continue;
@@ -362,6 +405,18 @@ export async function POST(request: Request) {
               throw new Error(
                 "Scheffer Agente Engine retornou resposta vazia."
               );
+            }
+
+            if (extractedContext.chartSpec) {
+              dataStream.write({
+                type: "data-chart-spec",
+                data: extractedContext.chartSpec,
+              });
+            } else if (extractedContext.chartError) {
+              dataStream.write({
+                type: "data-chart-warning",
+                data: extractedContext.chartError,
+              });
             }
 
             dataStream.write({ type: "text-end", id: textPartId });

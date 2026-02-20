@@ -9,7 +9,12 @@ import { formatISO } from 'date-fns';
 import { twMerge } from 'tailwind-merge';
 import type { DBMessage, Document } from '@/lib/db/schema';
 import { ChatSDKError, type ErrorCode } from './errors';
-import type { ChatMessage, ChatTools, CustomUIDataTypes } from './types';
+import type {
+  ChatMessage,
+  ChatTools,
+  CustomUIDataTypes,
+  MessageMetadata,
+} from './types';
 
 export function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
@@ -96,6 +101,8 @@ export function getTrailingMessageId({
 export function sanitizeText(text: string) {
   const bqContextOpenTag = '[BQ_CONTEXT]';
   const bqContextCloseTag = '[/BQ_CONTEXT]';
+  const chartContextOpenTag = '[CHART_CONTEXT]';
+  const chartContextCloseTag = '[/CHART_CONTEXT]';
 
   const getTrailingTagPrefixLength = (value: string, tag: string) => {
     const maxLength = Math.min(value.length, tag.length - 1);
@@ -121,11 +128,20 @@ export function sanitizeText(text: string) {
   const withoutContextBlocks = text
     .replace(/\[BQ_CONTEXT\][\s\S]*?\[\/BQ_CONTEXT\]/g, '')
     .replace(/\[BQ_CONTEXT\][\s\S]*$/g, '')
-    .replace(/\[\/BQ_CONTEXT\]/g, '');
+    .replace(/\[\/BQ_CONTEXT\]/g, '')
+    .replace(/\[CHART_CONTEXT\][\s\S]*?\[\/CHART_CONTEXT\]/g, '')
+    .replace(/\[CHART_CONTEXT\][\s\S]*$/g, '')
+    .replace(/\[\/CHART_CONTEXT\]/g, '');
 
   return stripTrailingPartialTag(
     stripTrailingPartialTag(
-      withoutContextBlocks.replace('<has_function_call>', ''),
+      stripTrailingPartialTag(
+        stripTrailingPartialTag(
+          withoutContextBlocks.replace('<has_function_call>', ''),
+          chartContextOpenTag,
+        ),
+        chartContextCloseTag,
+      ),
       bqContextOpenTag,
     ),
     bqContextCloseTag,
@@ -133,14 +149,20 @@ export function sanitizeText(text: string) {
 }
 
 export function convertToUIMessages(messages: DBMessage[]): ChatMessage[] {
-  return messages.map((message) => ({
-    id: message.id,
-    role: message.role as 'user' | 'assistant' | 'system',
-    parts: message.parts as UIMessagePart<CustomUIDataTypes, ChatTools>[],
-    metadata: {
+  return messages.map((message) => {
+    const metadata: MessageMetadata = {
       createdAt: formatISO(message.createdAt),
-    },
-  }));
+      chartSpec: (message.chartSpec as MessageMetadata['chartSpec']) ?? null,
+      chartError: message.chartError ?? null,
+    };
+
+    return {
+      id: message.id,
+      role: message.role as 'user' | 'assistant' | 'system',
+      parts: message.parts as UIMessagePart<CustomUIDataTypes, ChatTools>[],
+      metadata,
+    };
+  });
 }
 
 export function getTextFromMessage(message: ChatMessage | UIMessage): string {

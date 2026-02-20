@@ -1,3 +1,5 @@
+import { parseChartContextFromText } from "@/lib/charts/context";
+import type { ChartSpecV1 } from "@/lib/charts/schema";
 import { sanitizeText } from "@/lib/utils";
 
 export const AGENT_ENGINE_PROVIDER_ID = "google-agent-engine";
@@ -5,6 +7,12 @@ export const VERTEX_PROJECT_ID = process.env.VERTEX_PROJECT_ID || "";
 export const VERTEX_LOCATION = process.env.VERTEX_LOCATION || "us-central1";
 export const VERTEX_REASONING_ENGINE =
   process.env.VERTEX_REASONING_ENGINE || "";
+
+export type VertexExtractedContext = {
+  chartSpec: ChartSpecV1 | null;
+  chartError: string | null;
+  hasChartContext: boolean;
+};
 
 function getBaseVertexUrl(engineId: string) {
   return `https://${VERTEX_LOCATION}-aiplatform.googleapis.com/v1/projects/${VERTEX_PROJECT_ID}/locations/${VERTEX_LOCATION}/reasoningEngines/${engineId}`;
@@ -510,12 +518,14 @@ export async function* streamVertexQuery({
   userId,
   message,
   signal,
+  extractedContext,
 }: {
   accessToken: string;
   sessionId: string;
   userId: string;
   message: string | { role: "user"; parts: Record<string, unknown>[] };
   signal?: AbortSignal;
+  extractedContext?: VertexExtractedContext;
 }): AsyncGenerator<string, void, void> {
   if (!VERTEX_PROJECT_ID) {
     throw new Error("VERTEX_PROJECT_ID is not configured");
@@ -550,6 +560,15 @@ export async function* streamVertexQuery({
 
   let accumulatedRawText = "";
   let accumulatedVisibleText = "";
+  const writeExtractedContext = (rawText: string) => {
+    if (!extractedContext) {
+      return;
+    }
+    const parsedContext = parseChartContextFromText(rawText);
+    extractedContext.chartSpec = parsedContext.chartSpec;
+    extractedContext.chartError = parsedContext.chartError;
+    extractedContext.hasChartContext = parsedContext.hasChartContext;
+  };
 
   if (!response.body) {
     const responseText = await response.text();
@@ -576,6 +595,8 @@ export async function* streamVertexQuery({
         yield delta;
       }
     }
+
+    writeExtractedContext(accumulatedRawText);
 
     if (!accumulatedVisibleText.trim()) {
       throw new Error("Vertex AI returned an empty response");
@@ -612,6 +633,8 @@ export async function* streamVertexQuery({
       yield delta;
     }
   }
+
+  writeExtractedContext(accumulatedRawText);
 
   if (!accumulatedVisibleText.trim()) {
     if (rawSamples.length > 0) {

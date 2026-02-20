@@ -71,6 +71,13 @@ function PureArtifactMessages({
             return true;
           }
 
+          if (
+            part.type === "data-chart-spec" ||
+            part.type === "data-chart-warning"
+          ) {
+            return true;
+          }
+
           return part.type === "file";
         }) ?? false
       );

@@ -4,6 +4,7 @@ import { useState } from "react";
 import type { Vote } from "@/lib/db/schema";
 import type { ChatMessage } from "@/lib/types";
 import { cn, sanitizeText } from "@/lib/utils";
+import { ChartRenderer } from "./charts/chart-renderer";
 import { useDataStream } from "./data-stream-provider";
 import { DocumentToolResult } from "./document";
 import { DocumentPreview } from "./document-preview";
@@ -53,9 +54,28 @@ const PurePreviewMessage = ({
   const attachmentsFromMessage = message.parts.filter(
     (part) => part.type === "file"
   );
+  const chartSpecFromParts = (
+    message.parts.find((part) => part.type === "data-chart-spec") as
+      | { type: "data-chart-spec"; data?: unknown }
+      | undefined
+  )?.data;
+  const chartWarningFromParts = (
+    message.parts.find((part) => part.type === "data-chart-warning") as
+      | { type: "data-chart-warning"; data?: unknown }
+      | undefined
+  )?.data;
+  const chartSpec = chartSpecFromParts ?? message.metadata?.chartSpec ?? null;
+  const chartWarning =
+    (typeof chartWarningFromParts === "string"
+      ? chartWarningFromParts
+      : null) ??
+    message.metadata?.chartError ??
+    null;
   const hasVisibleAssistantContent =
     message.role !== "assistant" ||
     attachmentsFromMessage.length > 0 ||
+    chartSpec !== null ||
+    typeof chartWarning === "string" ||
     message.parts.some((part) => {
       if (part.type === "text") {
         return sanitizeText(part.text).trim().length > 0;
@@ -66,6 +86,13 @@ const PurePreviewMessage = ({
       }
 
       if (part.type.startsWith("tool-")) {
+        return true;
+      }
+
+      if (
+        part.type === "data-chart-spec" ||
+        part.type === "data-chart-warning"
+      ) {
         return true;
       }
 
@@ -106,7 +133,9 @@ const PurePreviewMessage = ({
                 (message.parts?.some(
                   (p) => p.type === "text" && p.text?.trim()
                 ) ||
-                  message.parts?.some((p) => p.type.startsWith("tool-")))) ||
+                  message.parts?.some((p) => p.type.startsWith("tool-")) ||
+                  chartSpec !== null ||
+                  typeof chartWarning === "string")) ||
               mode === "edit",
             "max-w-[calc(100%-2.5rem)] sm:max-w-[min(fit-content,80%)]":
               message.role === "user" && mode !== "edit",
@@ -370,6 +399,10 @@ const PurePreviewMessage = ({
 
             return null;
           })}
+
+          {message.role === "assistant" && (
+            <ChartRenderer chartSpec={chartSpec} chartWarning={chartWarning} />
+          )}
 
           {!isReadonly && (
             <MessageActions

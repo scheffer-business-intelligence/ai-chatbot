@@ -330,6 +330,8 @@ export async function saveMessages({ messages }: { messages: DBMessage[] }) {
           role: sql`excluded."role"`,
           parts: sql`excluded."parts"`,
           attachments: sql`excluded."attachments"`,
+          chartSpec: sql`excluded."chartSpec"`,
+          chartError: sql`excluded."chartError"`,
           createdAt: sql`excluded."createdAt"`,
         },
       });
@@ -342,12 +344,26 @@ export async function saveMessages({ messages }: { messages: DBMessage[] }) {
 export async function updateMessage({
   id,
   parts,
+  chartSpec,
+  chartError,
 }: {
   id: string;
   parts: DBMessage["parts"];
+  chartSpec?: DBMessage["chartSpec"];
+  chartError?: DBMessage["chartError"];
 }) {
   try {
-    return await db.update(message).set({ parts }).where(eq(message.id, id));
+    const nextValues: Partial<typeof message.$inferInsert> = { parts };
+
+    if (chartSpec !== undefined) {
+      nextValues.chartSpec = chartSpec;
+    }
+
+    if (chartError !== undefined) {
+      nextValues.chartError = chartError;
+    }
+
+    return await db.update(message).set(nextValues).where(eq(message.id, id));
   } catch (_error) {
     throw new ChatSDKError("bad_request:database", "Failed to update message");
   }
