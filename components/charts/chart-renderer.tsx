@@ -1,7 +1,33 @@
 "use client";
 
-import { Check, Copy, Download, Maximize2, TriangleAlert } from "lucide-react";
-import { type Ref, useMemo, useRef, useState } from "react";
+import { toBlob, toPng } from "html-to-image";
+import {
+  Check,
+  Copy,
+  Download,
+  Maximize2,
+  RotateCcw,
+  TriangleAlert,
+} from "lucide-react";
+import { type Ref, useEffect, useMemo, useRef, useState } from "react";
+import {
+  Area,
+  AreaChart,
+  Bar,
+  BarChart,
+  Brush,
+  CartesianGrid,
+  Cell,
+  LabelList,
+  Line,
+  LineChart,
+  Pie,
+  PieChart,
+  ResponsiveContainer,
+  Tooltip,
+  XAxis,
+  YAxis,
+} from "recharts";
 import { toast } from "sonner";
 import type { ChartSpecV1 } from "@/lib/charts/schema";
 import { chartSpecSchema } from "@/lib/charts/schema";
@@ -21,26 +47,52 @@ type ChartRendererProps = {
   className?: string;
 };
 
-type NormalizedSeries = {
+type ChartSeries = {
   key: string;
   label: string;
   color: string;
-  values: number[];
 };
 
-type CartesianData = {
-  labels: string[];
-  series: NormalizedSeries[];
-  maxValue: number;
+type CartesianRow = {
+  x: string;
+} & Record<string, number | string>;
+
+type CartesianModel = {
+  kind: "cartesian";
+  chartType: Exclude<ChartSpecV1["type"], "pie">;
+  rows: CartesianRow[];
+  series: ChartSeries[];
+  xLabel: string;
+  yLabel: string;
+  unit?: string;
 };
 
 type PieSlice = {
-  label: string;
+  key: string;
+  name: string;
   value: number;
   color: string;
 };
 
+type PieModel = {
+  kind: "pie";
+  slices: PieSlice[];
+};
+
+type ChartModel = CartesianModel | PieModel;
+
+type ZoomRange = {
+  startIndex: number;
+  endIndex: number;
+};
+
 const DEFAULT_COLORS = ["#22c55e", "#0ea5e9", "#f97316", "#eab308", "#ef4444"];
+
+const EXPORT_OPTIONS = {
+  cacheBust: true,
+  pixelRatio: 2,
+  backgroundColor: "#ffffff",
+};
 
 function getColor(index: number, preferred?: string) {
   return preferred ?? DEFAULT_COLORS[index % DEFAULT_COLORS.length];
@@ -75,17 +127,11 @@ function slugifyTitle(value: string) {
     .toLowerCase();
 }
 
-function formatAxisNumber(value: number, unit?: string) {
-  const formatted = value.toLocaleString("pt-BR", {
-    maximumFractionDigits: 2,
-  });
-  return unit ? `${formatted} ${unit}` : formatted;
-}
-
-function truncateLabel(value: string, limit = 14) {
+function truncateLabel(value: string, limit = 24) {
   if (value.length <= limit) {
     return value;
   }
+
   return `${value.slice(0, limit - 1)}...`;
 }
 
@@ -99,13 +145,41 @@ function humanizeKey(value: string) {
   return normalized.replace(/\b\w/g, (char) => char.toUpperCase());
 }
 
-function getAxisLabels(spec: ChartSpecV1, cartesianData: CartesianData) {
+function formatNumber(value: number, unit?: string) {
+  const formatted = value.toLocaleString("pt-BR", {
+    maximumFractionDigits: 2,
+  });
+
+  return unit ? `${formatted} ${unit}` : formatted;
+}
+
+function formatTooltipValue(value: unknown, unit?: string) {
+  const numeric = toNumericValue(value);
+  if (numeric === null) {
+    return String(value ?? "-");
+  }
+
+  return formatNumber(numeric, unit);
+}
+
+function formatBarLabel(value: unknown) {
+  const numeric = toNumericValue(value);
+  if (numeric === null) {
+    return "";
+  }
+
+  return numeric.toLocaleString("pt-BR", {
+    maximumFractionDigits: 2,
+  });
+}
+
+function getAxisLabels(spec: ChartSpecV1, series: ChartSeries[]) {
   const xLabel = spec.xLabel ?? (spec.xKey ? humanizeKey(spec.xKey) : "Eixo X");
 
   const fallbackY = spec.yKey
     ? humanizeKey(spec.yKey)
-    : cartesianData.series.length === 1
-      ? cartesianData.series[0].label
+    : series.length === 1
+      ? series[0].label
       : "Valores";
 
   const yLabelBase = spec.yLabel ?? fallbackY;
@@ -114,27 +188,26 @@ function getAxisLabels(spec: ChartSpecV1, cartesianData: CartesianData) {
   return { xLabel, yLabel };
 }
 
-function buildWideSeries(spec: ChartSpecV1) {
+function normalizeWideCartesian(spec: ChartSpecV1): CartesianModel | null {
   if (!spec.xKey) {
     return null;
   }
 
-  const labels = spec.data.map((row, index) => {
-    const raw = row[spec.xKey as string];
-    if (raw === undefined || raw === null || String(raw).trim() === "") {
-      return `Item ${index + 1}`;
-    }
-    return String(raw);
-  });
+  const inferredKeys = Array.from(
+    spec.data.reduce((keys, row) => {
+      for (const [key, value] of Object.entries(row)) {
+        if (key === spec.xKey) {
+          continue;
+        }
 
-  const firstRow = spec.data[0] ?? {};
-  const inferredKeys = Object.keys(firstRow).filter((key) => {
-    if (key === spec.xKey) {
-      return false;
-    }
+        if (toNumericValue(value) !== null) {
+          keys.add(key);
+        }
+      }
 
-    return toNumericValue(firstRow[key]) !== null;
-  });
+      return keys;
+    }, new Set<string>())
+  );
 
   const selectedSeries: Array<{
     key: string;
@@ -143,260 +216,194 @@ function buildWideSeries(spec: ChartSpecV1) {
   }> =
     spec.series && spec.series.length > 0
       ? spec.series
-      : inferredKeys.slice(0, 4).map((key) => ({
-          key,
-          label: key,
-          color: undefined,
-        }));
+      : inferredKeys.slice(0, 8).map((key) => ({ key, label: key }));
 
-  const normalizedSeries: NormalizedSeries[] = selectedSeries.map(
-    (series, seriesIndex) => ({
-      key: series.key,
-      label: series.label ?? series.key,
-      color: getColor(seriesIndex, series.color),
-      values: spec.data.map((row) => toNumericValue(row[series.key]) ?? 0),
-    })
-  );
+  const series: ChartSeries[] = selectedSeries.map((entry, index) => ({
+    key: entry.key,
+    label: entry.label ?? entry.key,
+    color: getColor(index, entry.color),
+  }));
 
-  const maxValue = normalizedSeries.reduce((max, currentSeries) => {
-    const seriesMax = Math.max(...currentSeries.values, 0);
-    return Math.max(max, seriesMax);
-  }, 0);
+  if (series.length === 0) {
+    return null;
+  }
+
+  const rows: CartesianRow[] = spec.data.map((row, index) => {
+    const rawX = row[spec.xKey as string];
+    const xValue =
+      rawX === undefined || rawX === null || String(rawX).trim() === ""
+        ? `Item ${index + 1}`
+        : String(rawX);
+
+    const normalizedRow: CartesianRow = { x: xValue };
+
+    for (const currentSeries of series) {
+      normalizedRow[currentSeries.key] =
+        toNumericValue(row[currentSeries.key]) ?? 0;
+    }
+
+    return normalizedRow;
+  });
+
+  const { xLabel, yLabel } = getAxisLabels(spec, series);
 
   return {
-    labels,
-    series: normalizedSeries,
-    maxValue,
+    kind: "cartesian",
+    chartType: spec.type as CartesianModel["chartType"],
+    rows,
+    series,
+    xLabel,
+    yLabel,
+    unit: spec.unit,
   };
 }
 
-function buildLongSeries(spec: ChartSpecV1) {
+function normalizeLongCartesian(spec: ChartSpecV1): CartesianModel | null {
   if (!spec.xKey || !spec.seriesKey || !spec.yKey) {
     return null;
   }
 
-  const labelOrder: string[] = [];
-  const labelIndex = new Map<string, number>();
-  const seriesMap = new Map<string, NormalizedSeries>();
+  const labels: string[] = [];
+  const labelToIndex = new Map<string, number>();
+  const seriesValues = new Map<string, number[]>();
 
   for (const row of spec.data) {
-    const xValue = row[spec.xKey];
-    const seriesValue = row[spec.seriesKey];
-    const yValue = toNumericValue(row[spec.yKey]);
-
-    if (xValue === undefined || xValue === null || yValue === null) {
+    const rawX: unknown = row[spec.xKey];
+    if (rawX === undefined || rawX === null || String(rawX).trim() === "") {
       continue;
     }
 
-    const label = String(xValue);
-    if (!labelIndex.has(label)) {
-      labelIndex.set(label, labelOrder.length);
-      labelOrder.push(label);
+    const xValue: string = String(rawX);
+
+    if (!labelToIndex.has(xValue)) {
+      labelToIndex.set(xValue, labels.length);
+      labels.push(xValue);
+
+      for (const values of seriesValues.values()) {
+        values.push(0);
+      }
     }
 
-    const seriesLabel = String(seriesValue ?? "Serie");
-    const existing = seriesMap.get(seriesLabel);
+    const seriesName = String(row[spec.seriesKey] ?? "Serie");
 
-    if (existing) {
-      existing.values[labelIndex.get(label) ?? 0] = yValue;
+    if (!seriesValues.has(seriesName)) {
+      seriesValues.set(seriesName, new Array(labels.length).fill(0));
+    }
+
+    const values = seriesValues.get(seriesName);
+    if (!values) {
       continue;
     }
 
-    const override = spec.series?.find(
-      (series) => series.key === seriesLabel || series.label === seriesLabel
-    );
-    const nextSeries: NormalizedSeries = {
-      key: seriesLabel,
-      label: override?.label ?? seriesLabel,
-      color: getColor(seriesMap.size, override?.color),
-      values: new Array(labelOrder.length).fill(0),
-    };
-    nextSeries.values[labelIndex.get(label) ?? 0] = yValue;
-    seriesMap.set(seriesLabel, nextSeries);
+    if (values.length < labels.length) {
+      while (values.length < labels.length) {
+        values.push(0);
+      }
+    }
+
+    const labelIndex = labelToIndex.get(xValue) ?? 0;
+    values[labelIndex] = toNumericValue(row[spec.yKey]) ?? 0;
   }
 
-  const normalizedSeries = Array.from(seriesMap.values()).map((series) => {
-    if (series.values.length < labelOrder.length) {
-      const filled = [...series.values];
-      while (filled.length < labelOrder.length) {
-        filled.push(0);
-      }
-      return { ...series, values: filled };
-    }
-    return series;
+  const discoveredSeriesKeys = Array.from(seriesValues.keys());
+
+  const orderedSeriesKeys =
+    spec.series && spec.series.length > 0
+      ? [
+          ...spec.series
+            .map((entry) => entry.key)
+            .filter((key) => discoveredSeriesKeys.includes(key)),
+          ...discoveredSeriesKeys.filter(
+            (key) => !spec.series?.some((entry) => entry.key === key)
+          ),
+        ]
+      : discoveredSeriesKeys;
+
+  const series: ChartSeries[] = orderedSeriesKeys.map((seriesKey, index) => {
+    const override = spec.series?.find(
+      (entry) => entry.key === seriesKey || entry.label === seriesKey
+    );
+
+    return {
+      key: seriesKey,
+      label: override?.label ?? seriesKey,
+      color: getColor(index, override?.color),
+    };
   });
 
-  const maxValue = normalizedSeries.reduce((max, currentSeries) => {
-    const seriesMax = Math.max(...currentSeries.values, 0);
-    return Math.max(max, seriesMax);
-  }, 0);
-
-  return {
-    labels: labelOrder,
-    series: normalizedSeries,
-    maxValue,
-  };
-}
-
-function getCartesianData(spec: ChartSpecV1): CartesianData | null {
-  const longData =
-    spec.seriesKey && spec.yKey ? buildLongSeries(spec) : buildWideSeries(spec);
-
-  if (
-    !longData ||
-    longData.labels.length === 0 ||
-    longData.series.length === 0
-  ) {
+  if (labels.length === 0 || series.length === 0) {
     return null;
   }
 
+  const rows: CartesianRow[] = labels.map((label, index) => {
+    const normalizedRow: CartesianRow = { x: label };
+
+    for (const currentSeries of series) {
+      const values = seriesValues.get(currentSeries.key) ?? [];
+      normalizedRow[currentSeries.key] = values[index] ?? 0;
+    }
+
+    return normalizedRow;
+  });
+
+  const { xLabel, yLabel } = getAxisLabels(spec, series);
+
   return {
-    labels: longData.labels,
-    series: longData.series,
-    maxValue: Math.max(1, longData.maxValue * 1.1),
+    kind: "cartesian",
+    chartType: spec.type as CartesianModel["chartType"],
+    rows,
+    series,
+    xLabel,
+    yLabel,
+    unit: spec.unit,
   };
 }
 
-function getPieData(spec: ChartSpecV1): PieSlice[] {
+function normalizePie(spec: ChartSpecV1): PieModel {
   if (!spec.nameKey || !spec.valueKey) {
-    return [];
+    return { kind: "pie", slices: [] };
   }
 
   const slices: PieSlice[] = [];
 
   for (const row of spec.data) {
-    const labelValue = row[spec.nameKey];
-    const value = toNumericValue(row[spec.valueKey]);
+    const rawName = row[spec.nameKey];
+    const rawValue = toNumericValue(row[spec.valueKey]);
 
-    if (labelValue === undefined || labelValue === null || value === null) {
+    if (rawName === undefined || rawName === null || rawValue === null) {
       continue;
     }
 
-    if (value <= 0) {
+    if (rawValue <= 0) {
       continue;
     }
+
+    const name = String(rawName);
+    const override = spec.series?.find(
+      (entry) => entry.key === name || entry.label === name
+    );
 
     slices.push({
-      label: String(labelValue),
-      value,
-      color: getColor(slices.length),
+      key: name,
+      name,
+      value: rawValue,
+      color: getColor(slices.length, override?.color),
     });
   }
 
-  return slices;
+  return { kind: "pie", slices };
 }
 
-function toArcPath(
-  cx: number,
-  cy: number,
-  radius: number,
-  startAngle: number,
-  endAngle: number
-) {
-  const startX = cx + radius * Math.cos(startAngle);
-  const startY = cy + radius * Math.sin(startAngle);
-  const endX = cx + radius * Math.cos(endAngle);
-  const endY = cy + radius * Math.sin(endAngle);
-  const largeArc = endAngle - startAngle > Math.PI ? 1 : 0;
-
-  return [
-    `M ${cx} ${cy}`,
-    `L ${startX} ${startY}`,
-    `A ${radius} ${radius} 0 ${largeArc} 1 ${endX} ${endY}`,
-    "Z",
-  ].join(" ");
-}
-
-async function svgToPngBlob(svg: SVGSVGElement): Promise<Blob> {
-  const serializer = new XMLSerializer();
-
-  const clone = svg.cloneNode(true) as SVGSVGElement;
-  const originalElements = [svg, ...Array.from(svg.querySelectorAll("*"))];
-  const clonedElements = [clone, ...Array.from(clone.querySelectorAll("*"))];
-  const resolvableAttributes = ["fill", "stroke", "color"] as const;
-
-  for (let index = 0; index < clonedElements.length; index += 1) {
-    const clonedElement = clonedElements[index];
-    const originalElement = originalElements[index];
-
-    if (!clonedElement || !originalElement) {
-      continue;
-    }
-
-    const computedStyle = getComputedStyle(originalElement);
-
-    for (const attributeName of resolvableAttributes) {
-      const currentValue = clonedElement.getAttribute(attributeName);
-      if (!currentValue) {
-        continue;
-      }
-
-      if (!currentValue.includes("var(") && currentValue !== "currentColor") {
-        continue;
-      }
-
-      const resolved = computedStyle.getPropertyValue(attributeName).trim();
-      if (resolved) {
-        clonedElement.setAttribute(attributeName, resolved);
-      }
-    }
+function buildChartModel(spec: ChartSpecV1): ChartModel | null {
+  if (spec.type === "pie") {
+    return normalizePie(spec);
   }
 
-  const rawSvg = serializer.serializeToString(clone);
-  const svgWithNamespace = rawSvg.includes("xmlns=")
-    ? rawSvg
-    : rawSvg.replace("<svg", '<svg xmlns="http://www.w3.org/2000/svg"');
-
-  const svgBlob = new Blob([svgWithNamespace], {
-    type: "image/svg+xml;charset=utf-8",
-  });
-  const svgUrl = URL.createObjectURL(svgBlob);
-
-  try {
-    const image = await new Promise<HTMLImageElement>((resolve, reject) => {
-      const chartImage = new Image();
-      chartImage.onload = () => resolve(chartImage);
-      chartImage.onerror = () => reject(new Error("Falha ao carregar SVG"));
-      chartImage.src = svgUrl;
-    });
-
-    const viewBox = svg.viewBox.baseVal;
-    const width = Math.max(
-      1,
-      Math.round(viewBox.width || svg.clientWidth || 800)
-    );
-    const height = Math.max(
-      1,
-      Math.round(viewBox.height || svg.clientHeight || 360)
-    );
-
-    const canvas = document.createElement("canvas");
-    canvas.width = width * 2;
-    canvas.height = height * 2;
-
-    const context = canvas.getContext("2d");
-    if (!context) {
-      throw new Error("Falha ao obter contexto 2D");
-    }
-
-    context.fillStyle = "#ffffff";
-    context.fillRect(0, 0, canvas.width, canvas.height);
-    context.drawImage(image, 0, 0, canvas.width, canvas.height);
-
-    const pngBlob = await new Promise<Blob>((resolve, reject) => {
-      canvas.toBlob((blob) => {
-        if (!blob) {
-          reject(new Error("Falha ao converter grafico para PNG"));
-          return;
-        }
-        resolve(blob);
-      }, "image/png");
-    });
-
-    return pngBlob;
-  } finally {
-    URL.revokeObjectURL(svgUrl);
+  if (spec.seriesKey && spec.yKey) {
+    return normalizeLongCartesian(spec);
   }
+
+  return normalizeWideCartesian(spec);
 }
 
 function ChartWarning({ text }: { text: string }) {
@@ -408,19 +415,143 @@ function ChartWarning({ text }: { text: string }) {
   );
 }
 
-function ChartSvg({
-  spec,
-  svgRef,
-  expanded,
+function CustomTooltip({
+  active,
+  payload,
+  label,
+  unit,
 }: {
-  spec: ChartSpecV1;
-  svgRef: Ref<SVGSVGElement>;
-  expanded?: boolean;
+  active?: boolean;
+  payload?: Array<{ color?: string; name?: string; value?: unknown }>;
+  label?: string | number;
+  unit?: string;
 }) {
-  if (spec.type === "pie") {
-    const pieData = getPieData(spec);
+  if (!active || !payload || payload.length === 0) {
+    return null;
+  }
 
-    if (pieData.length === 0) {
+  return (
+    <div className="rounded-md border bg-background px-3 py-2 shadow-md">
+      {label !== undefined && (
+        <div className="mb-1 font-medium text-xs">{String(label)}</div>
+      )}
+
+      <div className="space-y-1 text-xs">
+        {payload.map((item, index) => (
+          <div
+            className="flex items-center gap-2"
+            key={`${item.name}-${index}`}
+          >
+            <span
+              className="inline-block size-2.5 rounded-sm"
+              style={{ backgroundColor: item.color ?? "#64748b" }}
+            />
+            <span className="text-muted-foreground">
+              {item.name ?? "Serie"}:
+            </span>
+            <span className="font-medium">
+              {formatTooltipValue(item.value, unit)}
+            </span>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function SeriesLegend({
+  items,
+  hidden,
+  onToggle,
+}: {
+  items: Array<{ key: string; label: string; color: string }>;
+  hidden: Record<string, boolean>;
+  onToggle: (key: string) => void;
+}) {
+  if (items.length === 0) {
+    return null;
+  }
+
+  return (
+    <div className="mt-1 flex flex-wrap gap-2">
+      {items.map((item) => {
+        const isHidden = hidden[item.key] === true;
+
+        return (
+          <button
+            className={cn(
+              "inline-flex items-center gap-2 rounded-md border px-2 py-1 text-xs transition",
+              isHidden
+                ? "border-muted-foreground/30 text-muted-foreground"
+                : "border-border text-foreground"
+            )}
+            key={item.key}
+            onClick={() => onToggle(item.key)}
+            type="button"
+          >
+            <span
+              className="inline-block size-2.5 rounded-sm"
+              style={{
+                backgroundColor: item.color,
+                opacity: isHidden ? 0.35 : 1,
+              }}
+            />
+            <span className={isHidden ? "line-through" : ""}>
+              {truncateLabel(item.label, 32)}
+            </span>
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+function getBrushRange(
+  range: { startIndex?: number; endIndex?: number } | null | undefined,
+  total: number
+): ZoomRange | null {
+  if (
+    !range ||
+    range.startIndex === undefined ||
+    range.endIndex === undefined ||
+    total <= 0
+  ) {
+    return null;
+  }
+
+  const startIndex = Math.max(0, Math.min(range.startIndex, total - 1));
+  const endIndex = Math.max(startIndex, Math.min(range.endIndex, total - 1));
+
+  if (startIndex === 0 && endIndex === total - 1) {
+    return null;
+  }
+
+  return { startIndex, endIndex };
+}
+
+function ChartViewport({
+  model,
+  expanded,
+  hiddenSeries,
+  onToggleSeries,
+  zoomRange,
+  onZoomRangeChange,
+  chartContainerRef,
+}: {
+  model: ChartModel;
+  expanded?: boolean;
+  hiddenSeries: Record<string, boolean>;
+  onToggleSeries: (key: string) => void;
+  zoomRange: ZoomRange | null;
+  onZoomRangeChange: (range: ZoomRange | null) => void;
+  chartContainerRef: Ref<HTMLDivElement>;
+}) {
+  if (model.kind === "pie") {
+    const visibleSlices = model.slices.filter(
+      (slice) => hiddenSeries[slice.key] !== true
+    );
+
+    if (model.slices.length === 0) {
       return (
         <div className="rounded-md border border-dashed px-3 py-4 text-muted-foreground text-sm">
           Dados insuficientes para renderizar o grafico de pizza.
@@ -428,107 +559,64 @@ function ChartSvg({
       );
     }
 
-    const width = expanded ? 940 : 760;
-    const height = expanded ? 520 : 380;
-    const centerX = expanded ? 320 : 260;
-    const centerY = height / 2;
-    const radius = expanded ? 150 : 120;
-    const total = pieData.reduce((sum, item) => sum + item.value, 0);
+    if (visibleSlices.length === 0) {
+      return (
+        <div className="rounded-md border border-dashed px-3 py-4 text-muted-foreground text-sm">
+          Ative ao menos uma serie na legenda para exibir o grafico.
+        </div>
+      );
+    }
 
-    let currentAngle = -Math.PI / 2;
+    const total = visibleSlices.reduce((sum, slice) => sum + slice.value, 0);
 
     return (
-      <div className="overflow-x-auto">
-        <svg
-          className="mx-auto"
-          height={height}
-          ref={svgRef}
-          viewBox={`0 0 ${width} ${height}`}
-          width={width}
-        >
-          {pieData.map((slice) => {
-            const sliceAngle = (slice.value / total) * Math.PI * 2;
-            const start = currentAngle;
-            const end = currentAngle + sliceAngle;
-            const path = toArcPath(centerX, centerY, radius, start, end);
-            currentAngle = end;
-
-            return (
-              <path
-                d={path}
-                fill={slice.color}
-                key={`${slice.label}-${slice.value}`}
-                stroke="var(--color-background)"
-                strokeWidth={1}
+      <div ref={chartContainerRef}>
+        <div className={cn("h-[340px] w-full", expanded && "h-[520px]")}>
+          <ResponsiveContainer height="100%" width="100%">
+            <PieChart margin={{ top: 16, right: 16, bottom: 16, left: 16 }}>
+              <Tooltip
+                content={<CustomTooltip payload={undefined} unit={undefined} />}
               />
-            );
-          })}
+              <Pie
+                animationDuration={500}
+                data={visibleSlices}
+                dataKey="value"
+                innerRadius={expanded ? 100 : 72}
+                isAnimationActive={true}
+                nameKey="name"
+                outerRadius={expanded ? 170 : 130}
+                paddingAngle={2}
+              >
+                {visibleSlices.map((slice) => (
+                  <Cell fill={slice.color} key={slice.key} />
+                ))}
+              </Pie>
+            </PieChart>
+          </ResponsiveContainer>
+        </div>
 
-          <circle
-            cx={centerX}
-            cy={centerY}
-            fill="var(--color-background)"
-            opacity={0.95}
-            r={radius * 0.45}
-          />
-          <text
-            fill="currentColor"
-            fontSize={expanded ? 18 : 16}
-            fontWeight={700}
-            textAnchor="middle"
-            x={centerX}
-            y={centerY - 6}
-          >
-            {total.toLocaleString("pt-BR", { maximumFractionDigits: 2 })}
-          </text>
-          <text
-            fill="currentColor"
-            fontSize={expanded ? 13 : 12}
-            opacity={0.7}
-            textAnchor="middle"
-            x={centerX}
-            y={centerY + 14}
-          >
-            Total
-          </text>
+        <div className="mb-1 text-muted-foreground text-xs">
+          Total: {formatNumber(total)}
+        </div>
 
-          <g
-            transform={`translate(${expanded ? 560 : 450}, ${expanded ? 120 : 90})`}
-          >
-            {pieData.map((slice, index) => {
-              const percentage = ((slice.value / total) * 100).toLocaleString(
-                "pt-BR",
-                { maximumFractionDigits: 1 }
-              );
-              return (
-                <g
-                  key={`${slice.label}-${index}`}
-                  transform={`translate(0 ${index * 30})`}
-                >
-                  <rect
-                    fill={slice.color}
-                    height={12}
-                    rx={2}
-                    width={12}
-                    x={0}
-                    y={2}
-                  />
-                  <text fill="currentColor" fontSize={12} x={20} y={12}>
-                    {truncateLabel(slice.label, expanded ? 30 : 22)} (
-                    {percentage}%)
-                  </text>
-                </g>
-              );
-            })}
-          </g>
-        </svg>
+        <SeriesLegend
+          hidden={hiddenSeries}
+          items={model.slices.map((slice) => ({
+            key: slice.key,
+            label: slice.name,
+            color: slice.color,
+          }))}
+          onToggle={onToggleSeries}
+        />
       </div>
     );
   }
 
-  const cartesianData = getCartesianData(spec);
+  const visibleSeries = model.series.filter(
+    (series) => hiddenSeries[series.key] !== true
+  );
 
-  if (!cartesianData) {
+  if (model.rows.length === 0 || model.series.length === 0) {
     return (
       <div className="rounded-md border border-dashed px-3 py-4 text-muted-foreground text-sm">
         Dados insuficientes para renderizar o grafico.
@@ -536,231 +624,269 @@ function ChartSvg({
     );
   }
 
-  const pointCount = cartesianData.labels.length;
-  const width = Math.max(expanded ? 940 : 720, 160 + pointCount * 72);
-  const height = expanded ? 520 : 360;
-  const margin = { top: 18, right: 22, bottom: 84, left: 68 };
-  const plotWidth = width - margin.left - margin.right;
-  const plotHeight = height - margin.top - margin.bottom;
-  const yTickCount = 5;
-  const yTicks = Array.from({ length: yTickCount + 1 }, (_, index) => {
-    const ratio = index / yTickCount;
-    return cartesianData.maxValue * ratio;
-  });
-  const labelStep = Math.max(1, Math.ceil(pointCount / 12));
-  const xSlot = plotWidth / Math.max(1, pointCount);
-  const xAxisLabels: Array<{ key: string; label: string; pointIndex: number }> =
-    [];
-  const labelOccurrences = new Map<string, number>();
-
-  for (
-    let pointIndex = 0;
-    pointIndex < cartesianData.labels.length;
-    pointIndex += 1
-  ) {
-    const label = cartesianData.labels[pointIndex];
-    const nextOccurrence = (labelOccurrences.get(label) ?? 0) + 1;
-    labelOccurrences.set(label, nextOccurrence);
-    xAxisLabels.push({
-      key: `${label}-${nextOccurrence}`,
-      label,
-      pointIndex,
-    });
+  if (visibleSeries.length === 0) {
+    return (
+      <div className="rounded-md border border-dashed px-3 py-4 text-muted-foreground text-sm">
+        Ative ao menos uma serie na legenda para exibir o grafico.
+      </div>
+    );
   }
 
-  const mapX = (index: number) => margin.left + xSlot * index + xSlot / 2;
-  const mapY = (value: number) =>
-    margin.top + plotHeight - (value / cartesianData.maxValue) * plotHeight;
-  const { xLabel, yLabel } = getAxisLabels(spec, cartesianData);
+  const totalPoints = model.rows.length;
+  const startIndex = zoomRange?.startIndex ?? 0;
+  const endIndex = zoomRange?.endIndex ?? Math.max(0, totalPoints - 1);
+
+  const brushEnabled = totalPoints > 6;
 
   return (
-    <div className="overflow-x-auto">
-      <svg
-        className="mx-auto"
-        height={height}
-        ref={svgRef}
-        viewBox={`0 0 ${width} ${height}`}
-        width={width}
-      >
-        {yTicks.map((tick) => {
-          const y = mapY(tick);
-          return (
-            <g key={`y-${tick.toFixed(4)}`}>
-              <line
-                opacity={0.2}
-                stroke="currentColor"
-                strokeDasharray="4 4"
-                x1={margin.left}
-                x2={width - margin.right}
-                y1={y}
-                y2={y}
-              />
-              <text
-                fill="currentColor"
-                fontSize={11}
-                opacity={0.7}
-                textAnchor="end"
-                x={margin.left - 8}
-                y={y + 4}
-              >
-                {formatAxisNumber(tick, spec.unit)}
-              </text>
-            </g>
-          );
-        })}
-
-        <line
-          stroke="currentColor"
-          strokeWidth={1.2}
-          x1={margin.left}
-          x2={margin.left}
-          y1={margin.top}
-          y2={height - margin.bottom}
-        />
-        <line
-          stroke="currentColor"
-          strokeWidth={1.2}
-          x1={margin.left}
-          x2={width - margin.right}
-          y1={height - margin.bottom}
-          y2={height - margin.bottom}
-        />
-
-        {spec.type === "bar" &&
-          cartesianData.series.map((series, seriesIndex) => {
-            const groupWidth = xSlot * 0.72;
-            const barWidth = Math.max(
-              8,
-              Math.min(34, groupWidth / cartesianData.series.length)
-            );
-            return series.values.map((value, pointIndex) => {
-              const xBase = mapX(pointIndex) - groupWidth / 2;
-              const x = xBase + seriesIndex * barWidth;
-              const y = mapY(value);
-              const barHeight = height - margin.bottom - y;
-
-              return (
-                <rect
-                  fill={series.color}
-                  height={Math.max(0, barHeight)}
-                  key={`${series.key}-${pointIndex}`}
-                  opacity={0.9}
-                  rx={2}
-                  width={barWidth - 2}
-                  x={x}
-                  y={y}
-                />
-              );
-            });
-          })}
-
-        {(spec.type === "line" || spec.type === "area") &&
-          cartesianData.series.map((series) => {
-            const points = series.values.map((value, index) => ({
-              x: mapX(index),
-              y: mapY(value),
-            }));
-
-            const linePath = points
-              .map(
-                (point, index) =>
-                  `${index === 0 ? "M" : "L"} ${point.x} ${point.y}`
-              )
-              .join(" ");
-
-            const areaPath = [
-              linePath,
-              `L ${points.at(-1)?.x ?? margin.left} ${height - margin.bottom}`,
-              `L ${points[0]?.x ?? margin.left} ${height - margin.bottom}`,
-              "Z",
-            ].join(" ");
-
-            return (
-              <g key={series.key}>
-                {spec.type === "area" && (
-                  <path d={areaPath} fill={series.color} opacity={0.2} />
-                )}
-                <path
-                  d={linePath}
-                  fill="none"
-                  stroke={series.color}
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
-                  strokeWidth={2.5}
-                />
-                {points.map((point, index) => (
-                  <circle
-                    cx={point.x}
-                    cy={point.y}
-                    fill={series.color}
-                    key={`${series.key}-point-${index}`}
-                    r={3.2}
-                  />
-                ))}
-              </g>
-            );
-          })}
-
-        {xAxisLabels.map(({ key, label, pointIndex }) => {
-          if (pointIndex % labelStep !== 0) {
-            return null;
-          }
-
-          return (
-            <text
-              fill="currentColor"
-              fontSize={11}
-              key={key}
-              opacity={0.8}
-              textAnchor="middle"
-              x={mapX(pointIndex)}
-              y={height - margin.bottom + 16}
+    <div ref={chartContainerRef}>
+      <div className={cn("h-[340px] w-full", expanded && "h-[520px]")}>
+        <ResponsiveContainer height="100%" width="100%">
+          {model.chartType === "bar" ? (
+            <BarChart
+              data={model.rows}
+              margin={{ top: 16, right: 16, bottom: 24, left: 16 }}
             >
-              {truncateLabel(label)}
-            </text>
-          );
-        })}
-
-        <g transform={`translate(${margin.left}, ${height - 36})`}>
-          {cartesianData.series.map((series, index) => (
-            <g key={series.key} transform={`translate(${index * 170}, 0)`}>
-              <rect
-                fill={series.color}
-                height={10}
-                rx={2}
-                width={10}
-                x={0}
-                y={0}
+              <CartesianGrid
+                opacity={0.35}
+                strokeDasharray="4 4"
+                vertical={false}
               />
-              <text fill="currentColor" fontSize={12} x={16} y={9}>
-                {truncateLabel(series.label, 24)}
-              </text>
-            </g>
-          ))}
-        </g>
+              <XAxis
+                axisLine={true}
+                dataKey="x"
+                height={48}
+                interval="preserveStartEnd"
+                label={{
+                  value: truncateLabel(model.xLabel, expanded ? 68 : 44),
+                  position: "insideBottom",
+                  offset: -2,
+                  style: { fontSize: 12, fontWeight: 600 },
+                }}
+                minTickGap={14}
+                tick={{ fontSize: 11 }}
+                tickLine={false}
+                tickMargin={5}
+              />
+              <YAxis
+                axisLine={false}
+                label={{
+                  value: truncateLabel(model.yLabel, expanded ? 68 : 44),
+                  angle: -90,
+                  position: "insideLeft",
+                  style: {
+                    textAnchor: "middle",
+                    fontSize: 12,
+                    fontWeight: 600,
+                  },
+                }}
+                tick={{ fontSize: 11 }}
+                tickFormatter={(value) =>
+                  formatNumber(toNumericValue(value) ?? 0, model.unit)
+                }
+                tickLine={false}
+                width={88}
+              />
+              <Tooltip content={<CustomTooltip unit={model.unit} />} />
 
-        <text
-          fill="currentColor"
-          fontSize={12}
-          fontWeight={600}
-          opacity={0.85}
-          textAnchor="middle"
-          x={(margin.left + (width - margin.right)) / 2}
-          y={height - 10}
-        >
-          {truncateLabel(xLabel, expanded ? 64 : 44)}
-        </text>
-        <text
-          fill="currentColor"
-          fontSize={12}
-          fontWeight={600}
-          opacity={0.85}
-          textAnchor="middle"
-          transform={`translate(${expanded ? 20 : 18}, ${(margin.top + (height - margin.bottom)) / 2}) rotate(-90)`}
-        >
-          {truncateLabel(yLabel, expanded ? 64 : 40)}
-        </text>
-      </svg>
+              {visibleSeries.map((series) => (
+                <Bar
+                  animationDuration={520}
+                  dataKey={series.key}
+                  fill={series.color}
+                  isAnimationActive={true}
+                  key={series.key}
+                  name={series.label}
+                  radius={[4, 4, 0, 0]}
+                >
+                  <LabelList
+                    dataKey={series.key}
+                    fill="#475569"
+                    fontSize={10}
+                    formatter={(value: unknown) => formatBarLabel(value)}
+                    position="top"
+                  />
+                </Bar>
+              ))}
+
+              {brushEnabled && (
+                <Brush
+                  dataKey="x"
+                  endIndex={endIndex}
+                  height={24}
+                  onChange={(range) =>
+                    onZoomRangeChange(getBrushRange(range, totalPoints))
+                  }
+                  startIndex={startIndex}
+                  stroke="#94a3b8"
+                  travellerWidth={10}
+                />
+              )}
+            </BarChart>
+          ) : model.chartType === "line" ? (
+            <LineChart
+              data={model.rows}
+              margin={{ top: 16, right: 16, bottom: 24, left: 16 }}
+            >
+              <CartesianGrid
+                opacity={0.35}
+                strokeDasharray="4 4"
+                vertical={false}
+              />
+              <XAxis
+                axisLine={true}
+                dataKey="x"
+                height={48}
+                interval="preserveStartEnd"
+                label={{
+                  value: truncateLabel(model.xLabel, expanded ? 68 : 44),
+                  position: "insideBottom",
+                  offset: -2,
+                  style: { fontSize: 12, fontWeight: 600 },
+                }}
+                minTickGap={14}
+                tick={{ fontSize: 11 }}
+                tickLine={false}
+                tickMargin={5}
+              />
+              <YAxis
+                axisLine={false}
+                label={{
+                  value: truncateLabel(model.yLabel, expanded ? 68 : 44),
+                  angle: -90,
+                  position: "insideLeft",
+                  style: {
+                    textAnchor: "middle",
+                    fontSize: 12,
+                    fontWeight: 600,
+                  },
+                }}
+                tick={{ fontSize: 11 }}
+                tickFormatter={(value) =>
+                  formatNumber(toNumericValue(value) ?? 0, model.unit)
+                }
+                tickLine={false}
+                width={88}
+              />
+              <Tooltip content={<CustomTooltip unit={model.unit} />} />
+
+              {visibleSeries.map((series) => (
+                <Line
+                  animationDuration={520}
+                  dataKey={series.key}
+                  dot={{ r: 2.5 }}
+                  isAnimationActive={true}
+                  key={series.key}
+                  name={series.label}
+                  stroke={series.color}
+                  strokeWidth={2.2}
+                  type="monotone"
+                />
+              ))}
+
+              {brushEnabled && (
+                <Brush
+                  dataKey="x"
+                  endIndex={endIndex}
+                  height={24}
+                  onChange={(range) =>
+                    onZoomRangeChange(getBrushRange(range, totalPoints))
+                  }
+                  startIndex={startIndex}
+                  stroke="#94a3b8"
+                  travellerWidth={10}
+                />
+              )}
+            </LineChart>
+          ) : (
+            <AreaChart
+              data={model.rows}
+              margin={{ top: 16, right: 16, bottom: 24, left: 16 }}
+            >
+              <CartesianGrid
+                opacity={0.35}
+                strokeDasharray="4 4"
+                vertical={false}
+              />
+              <XAxis
+                axisLine={true}
+                dataKey="x"
+                height={48}
+                interval="preserveStartEnd"
+                label={{
+                  value: truncateLabel(model.xLabel, expanded ? 68 : 44),
+                  position: "insideBottom",
+                  offset: -2,
+                  style: { fontSize: 12, fontWeight: 600 },
+                }}
+                minTickGap={14}
+                tick={{ fontSize: 11 }}
+                tickLine={false}
+                tickMargin={5}
+              />
+              <YAxis
+                axisLine={false}
+                label={{
+                  value: truncateLabel(model.yLabel, expanded ? 68 : 44),
+                  angle: -90,
+                  position: "insideLeft",
+                  style: {
+                    textAnchor: "middle",
+                    fontSize: 12,
+                    fontWeight: 600,
+                  },
+                }}
+                tick={{ fontSize: 11 }}
+                tickFormatter={(value) =>
+                  formatNumber(toNumericValue(value) ?? 0, model.unit)
+                }
+                tickLine={false}
+                width={88}
+              />
+              <Tooltip content={<CustomTooltip unit={model.unit} />} />
+
+              {visibleSeries.map((series) => (
+                <Area
+                  animationDuration={520}
+                  dataKey={series.key}
+                  fill={series.color}
+                  fillOpacity={0.22}
+                  isAnimationActive={true}
+                  key={series.key}
+                  name={series.label}
+                  stroke={series.color}
+                  strokeWidth={2}
+                  type="monotone"
+                />
+              ))}
+
+              {brushEnabled && (
+                <Brush
+                  dataKey="x"
+                  endIndex={endIndex}
+                  height={24}
+                  onChange={(range) =>
+                    onZoomRangeChange(getBrushRange(range, totalPoints))
+                  }
+                  startIndex={startIndex}
+                  stroke="#94a3b8"
+                  travellerWidth={10}
+                />
+              )}
+            </AreaChart>
+          )}
+        </ResponsiveContainer>
+      </div>
+
+      <SeriesLegend
+        hidden={hiddenSeries}
+        items={model.series.map((series) => ({
+          key: series.key,
+          label: series.label,
+          color: series.color,
+        }))}
+        onToggle={onToggleSeries}
+      />
     </div>
   );
 }
@@ -772,8 +898,11 @@ export function ChartRenderer({
 }: ChartRendererProps) {
   const [isExpanded, setIsExpanded] = useState(false);
   const [isCopied, setIsCopied] = useState(false);
-  const inlineSvgRef = useRef<SVGSVGElement | null>(null);
-  const expandedSvgRef = useRef<SVGSVGElement | null>(null);
+  const [hiddenSeries, setHiddenSeries] = useState<Record<string, boolean>>({});
+  const [zoomRange, setZoomRange] = useState<ZoomRange | null>(null);
+
+  const inlineChartRef = useRef<HTMLDivElement | null>(null);
+  const expandedChartRef = useRef<HTMLDivElement | null>(null);
 
   const parsedSpec = useMemo(
     () => (chartSpec ? chartSpecSchema.safeParse(chartSpec) : null),
@@ -781,28 +910,74 @@ export function ChartRenderer({
   );
 
   const validSpec = parsedSpec?.success ? parsedSpec.data : null;
+
+  const chartModel = useMemo(() => {
+    if (!validSpec) {
+      return null;
+    }
+
+    return buildChartModel(validSpec);
+  }, [validSpec]);
+
+  const modelResetKey = useMemo(
+    () => (validSpec ? JSON.stringify(validSpec) : "none"),
+    [validSpec]
+  );
+  const previousModelResetKey = useRef<string | null>(null);
+
+  useEffect(() => {
+    if (previousModelResetKey.current === modelResetKey) {
+      return;
+    }
+
+    previousModelResetKey.current = modelResetKey;
+    setHiddenSeries({});
+    setZoomRange(null);
+  }, [modelResetKey]);
+
   const parsedWarning =
     parsedSpec && !parsedSpec.success
       ? "Nao foi possivel renderizar o grafico desta resposta."
       : null;
+
   const resolvedWarning = chartWarning ?? parsedWarning;
 
+  const isZoomed =
+    chartModel?.kind === "cartesian" &&
+    zoomRange !== null &&
+    (zoomRange.startIndex > 0 ||
+      zoomRange.endIndex < chartModel.rows.length - 1);
+
+  const handleToggleSeries = (seriesKey: string) => {
+    setHiddenSeries((current) => ({
+      ...current,
+      [seriesKey]: current[seriesKey] !== true,
+    }));
+  };
+
+  const getExportNode = () => {
+    if (isExpanded && expandedChartRef.current) {
+      return expandedChartRef.current;
+    }
+
+    return inlineChartRef.current;
+  };
+
   const handleDownload = async () => {
-    const svg = expandedSvgRef.current ?? inlineSvgRef.current;
-    if (!svg || !validSpec) {
+    const node = getExportNode();
+
+    if (!node || !validSpec) {
       return;
     }
 
     try {
-      const pngBlob = await svgToPngBlob(svg);
-      const url = URL.createObjectURL(pngBlob);
+      const dataUrl = await toPng(node, EXPORT_OPTIONS);
       const anchor = document.createElement("a");
       const baseName = slugifyTitle(validSpec.title ?? "grafico");
 
-      anchor.href = url;
+      anchor.href = dataUrl;
       anchor.download = `${baseName || "grafico"}.png`;
       anchor.click();
-      URL.revokeObjectURL(url);
     } catch (error) {
       const message =
         error instanceof Error ? error.message : "Falha ao baixar grafico.";
@@ -811,8 +986,9 @@ export function ChartRenderer({
   };
 
   const handleCopy = async () => {
-    const svg = expandedSvgRef.current ?? inlineSvgRef.current;
-    if (!svg) {
+    const node = getExportNode();
+
+    if (!node) {
       return;
     }
 
@@ -822,23 +998,29 @@ export function ChartRenderer({
     }
 
     try {
-      const pngBlob = await svgToPngBlob(svg);
+      const blob = await toBlob(node, EXPORT_OPTIONS);
+
+      if (!blob) {
+        throw new Error("Falha ao gerar imagem do grafico.");
+      }
+
       await navigator.clipboard.write([
         new ClipboardItem({
-          [pngBlob.type]: pngBlob,
+          [blob.type]: blob,
         }),
       ]);
+
       setIsCopied(true);
       setTimeout(() => setIsCopied(false), 1300);
-      toast.success("Gráfico copiado.");
+      toast.success("Grafico copiado.");
     } catch (error) {
       const message =
-        error instanceof Error ? error.message : "Falha ao copiar gráfico.";
+        error instanceof Error ? error.message : "Falha ao copiar grafico.";
       toast.error(message);
     }
   };
 
-  if (!validSpec && !resolvedWarning) {
+  if (!chartModel && !resolvedWarning) {
     return null;
   }
 
@@ -846,7 +1028,7 @@ export function ChartRenderer({
     <div className={cn("flex w-full flex-col gap-2", className)}>
       {resolvedWarning && <ChartWarning text={resolvedWarning} />}
 
-      {validSpec && (
+      {chartModel && validSpec && (
         <div className="rounded-xl border bg-card p-3 md:p-4">
           <div className="mb-3 flex flex-wrap items-start justify-between gap-2">
             <div className="min-w-0">
@@ -861,6 +1043,18 @@ export function ChartRenderer({
             </div>
 
             <div className="flex items-center gap-1">
+              {chartModel.kind === "cartesian" && isZoomed && (
+                <Button
+                  onClick={() => setZoomRange(null)}
+                  size="icon-sm"
+                  title="Resetar zoom"
+                  type="button"
+                  variant="ghost"
+                >
+                  <RotateCcw className="size-4" />
+                </Button>
+              )}
+
               <Button
                 onClick={() => setIsExpanded(true)}
                 size="icon-sm"
@@ -895,25 +1089,36 @@ export function ChartRenderer({
             </div>
           </div>
 
-          <ChartSvg spec={validSpec} svgRef={inlineSvgRef} />
+          <ChartViewport
+            chartContainerRef={inlineChartRef}
+            hiddenSeries={hiddenSeries}
+            model={chartModel}
+            onToggleSeries={handleToggleSeries}
+            onZoomRangeChange={setZoomRange}
+            zoomRange={zoomRange}
+          />
         </div>
       )}
 
-      {validSpec && (
+      {chartModel && validSpec && (
         <Dialog onOpenChange={setIsExpanded} open={isExpanded}>
           <DialogContent className="max-h-[92vh] max-w-[96vw] overflow-hidden p-4 md:max-w-6xl">
             <DialogHeader>
               <DialogTitle>{validSpec.title ?? "Grafico"}</DialogTitle>
               <DialogDescription>
-                Visualizacao expandida do grafico da resposta.
+                Visualização expandida do gráfico da resposta.
               </DialogDescription>
             </DialogHeader>
 
             <div className="overflow-auto pb-2">
-              <ChartSvg
+              <ChartViewport
+                chartContainerRef={expandedChartRef}
                 expanded={true}
-                spec={validSpec}
-                svgRef={expandedSvgRef}
+                hiddenSeries={hiddenSeries}
+                model={chartModel}
+                onToggleSeries={handleToggleSeries}
+                onZoomRangeChange={setZoomRange}
+                zoomRange={zoomRange}
               />
             </div>
           </DialogContent>
