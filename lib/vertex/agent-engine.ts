@@ -1,3 +1,5 @@
+import { sanitizeText } from "@/lib/utils";
+
 export const AGENT_ENGINE_PROVIDER_ID = "google-agent-engine";
 export const VERTEX_PROJECT_ID = process.env.VERTEX_PROJECT_ID || "";
 export const VERTEX_LOCATION = process.env.VERTEX_LOCATION || "us-central1";
@@ -14,6 +16,22 @@ function extractTextFromContent(content: unknown): string | null {
   }
   if (typeof content === "string") {
     return content.trim() ? content : null;
+  }
+  if (Array.isArray(content)) {
+    const texts: string[] = [];
+
+    for (const item of content) {
+      const itemText = extractTextFromContent(item);
+      if (itemText) {
+        texts.push(itemText);
+      }
+    }
+
+    if (texts.length > 0) {
+      return texts.join("");
+    }
+
+    return null;
   }
   if (typeof content !== "object") {
     return null;
@@ -271,97 +289,6 @@ function parseVertexResponseText(responseText: string): string[] {
   return allTexts;
 }
 
-function isTerminalVertexEvent(data: Record<string, unknown>): boolean {
-  const terminalValues = new Set([
-    "done",
-    "completed",
-    "complete",
-    "finished",
-    "finish",
-    "end",
-    "ended",
-    "succeeded",
-    "success",
-  ]);
-
-  const isTerminalValue = (value: unknown): boolean => {
-    if (value === true) {
-      return true;
-    }
-
-    if (typeof value === "string") {
-      return terminalValues.has(value.toLowerCase());
-    }
-
-    return false;
-  };
-
-  const checkNode = (node: unknown, depth = 0): boolean => {
-    if (!node || depth > 4) {
-      return false;
-    }
-
-    if (typeof node !== "object") {
-      return false;
-    }
-
-    if (Array.isArray(node)) {
-      for (const item of node) {
-        if (checkNode(item, depth + 1)) {
-          return true;
-        }
-      }
-      return false;
-    }
-
-    const record = node as Record<string, unknown>;
-
-    for (const key of [
-      "done",
-      "isDone",
-      "is_done",
-      "completed",
-      "isComplete",
-      "is_complete",
-      "finish",
-      "finished",
-      "status",
-      "state",
-      "event",
-      "type",
-    ]) {
-      if (!(key in record)) {
-        continue;
-      }
-
-      if (isTerminalValue(record[key])) {
-        return true;
-      }
-    }
-
-    for (const key of [
-      "response",
-      "output",
-      "result",
-      "event",
-      "events",
-      "data",
-    ]) {
-      if (!(key in record)) {
-        continue;
-      }
-
-      if (checkNode(record[key], depth + 1)) {
-        return true;
-      }
-    }
-
-    return false;
-  };
-
-  return checkNode(data);
-}
-
 function stripContextBlock(text: string, tagName: string): string {
   const tag = tagName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   const blockRegex = new RegExp(
@@ -382,7 +309,8 @@ function stripContextBlock(text: string, tagName: string): string {
 }
 
 function stripContextBlocksForStream(text: string): string {
-  return stripContextBlock(text, "BQ_CONTEXT").trimEnd();
+  const withoutBqAndMarkers = sanitizeText(text);
+  return stripContextBlock(withoutBqAndMarkers, "CHART_CONTEXT").trimEnd();
 }
 
 async function* parseJsonStream(
@@ -391,15 +319,14 @@ async function* parseJsonStream(
   const reader = stream.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
-  let receivedDoneMarker = false;
-  let eventDataLines: string[] = [];
+  let parsedCount = 0;
+  const rawPayloadSamples: string[] = [];
 
   const parsePayload = (payload: string): Record<string, unknown>[] => {
     if (!payload) {
       return [];
     }
     if (payload === "[DONE]") {
-      receivedDoneMarker = true;
       return [];
     }
 
@@ -416,41 +343,13 @@ async function* parseJsonStream(
         return [parsed as Record<string, unknown>];
       }
     } catch {
+      if (rawPayloadSamples.length < 3) {
+        rawPayloadSamples.push(payload.slice(0, 2000));
+      }
       return [];
     }
 
     return [];
-  };
-
-  const parseAndYield = function* (
-    payload: string
-  ): Generator<Record<string, unknown>, void, void> {
-    for (const parsed of parsePayload(payload)) {
-      yield parsed;
-
-      if (isTerminalVertexEvent(parsed)) {
-        receivedDoneMarker = true;
-      }
-    }
-  };
-
-  const flushEvent = function* (): Generator<
-    Record<string, unknown>,
-    void,
-    void
-  > {
-    if (eventDataLines.length === 0) {
-      return;
-    }
-
-    const payload = eventDataLines.join("\n").trim();
-    eventDataLines = [];
-
-    if (!payload) {
-      return;
-    }
-
-    yield* parseAndYield(payload);
   };
 
   try {
@@ -465,67 +364,50 @@ async function* parseJsonStream(
       let newlineIndex = buffer.indexOf("\n");
 
       while (newlineIndex !== -1) {
-        const line = buffer.slice(0, newlineIndex).replace(/\r$/, "");
+        const line = buffer.slice(0, newlineIndex).replace(/\r$/, "").trim();
         buffer = buffer.slice(newlineIndex + 1);
 
-        if (line.trim() === "") {
-          for (const parsed of flushEvent()) {
-            yield parsed;
-          }
-
-          if (receivedDoneMarker) {
-            return;
-          }
-
+        if (!line) {
           newlineIndex = buffer.indexOf("\n");
           continue;
         }
 
-        if (line.startsWith("data:")) {
-          eventDataLines.push(line.replace(/^data:\s?/, ""));
-          newlineIndex = buffer.indexOf("\n");
-          continue;
-        }
+        const payload = line.startsWith("data:")
+          ? line.replace(/^data:\s*/, "")
+          : line;
 
-        if (line.startsWith(":")) {
-          newlineIndex = buffer.indexOf("\n");
-          continue;
-        }
-
-        if (line.includes(":")) {
-          newlineIndex = buffer.indexOf("\n");
-          continue;
-        }
-
-        for (const parsed of parseAndYield(line.trim())) {
-          yield parsed;
-        }
-
-        if (receivedDoneMarker) {
+        if (payload === "[DONE]") {
           return;
+        }
+
+        for (const parsed of parsePayload(payload)) {
+          parsedCount += 1;
+          yield parsed;
         }
 
         newlineIndex = buffer.indexOf("\n");
       }
     }
 
-    if (buffer.trim()) {
-      const tailLine = buffer.replace(/\r$/, "");
-      if (tailLine.startsWith("data:")) {
-        eventDataLines.push(tailLine.replace(/^data:\s?/, ""));
-      } else if (!tailLine.startsWith(":") && !tailLine.includes(":")) {
-        for (const parsed of parseAndYield(tailLine.trim())) {
+    const tail = buffer.trim();
+    if (tail) {
+      const payload = tail.startsWith("data:")
+        ? tail.replace(/^data:\s*/, "")
+        : tail;
+
+      if (payload !== "[DONE]") {
+        for (const parsed of parsePayload(payload)) {
+          parsedCount += 1;
           yield parsed;
         }
       }
     }
 
-    for (const parsed of flushEvent()) {
-      yield parsed;
-    }
-
-    if (receivedDoneMarker) {
-      return;
+    if (parsedCount === 0 && rawPayloadSamples.length > 0) {
+      console.warn(
+        "Vertex stream raw payload sample (no JSON parsed):",
+        rawPayloadSamples
+      );
     }
   } finally {
     reader.releaseLock();
@@ -673,6 +555,13 @@ export async function* streamVertexQuery({
     const responseText = await response.text();
     const texts = parseVertexResponseText(responseText);
 
+    if (texts.length === 0 && responseText.trim()) {
+      console.warn(
+        "Vertex streamQuery (no body) raw response sample:",
+        responseText.slice(0, 2000)
+      );
+    }
+
     for (const text of texts) {
       const nextRawText = computeNextRawText(text, accumulatedRawText);
       const { delta, nextVisibleText } = extractVisibleDelta(
@@ -695,12 +584,17 @@ export async function* streamVertexQuery({
     return;
   }
 
+  const rawSamples: string[] = [];
+
   for await (const data of parseJsonStream(response.body)) {
-    const isTerminalEvent = isTerminalVertexEvent(data);
     const text = extractTextFromVertexResponse(data);
     if (!text) {
-      if (isTerminalEvent) {
-        break;
+      if (rawSamples.length < 3) {
+        try {
+          rawSamples.push(JSON.stringify(data).slice(0, 2000));
+        } catch {
+          rawSamples.push(String(data).slice(0, 2000));
+        }
       }
       continue;
     }
@@ -717,13 +611,15 @@ export async function* streamVertexQuery({
     if (delta) {
       yield delta;
     }
-
-    if (isTerminalEvent) {
-      break;
-    }
   }
 
   if (!accumulatedVisibleText.trim()) {
+    if (rawSamples.length > 0) {
+      console.warn(
+        "Vertex stream payload sample (no text extracted):",
+        rawSamples
+      );
+    }
     throw new Error("Vertex AI returned an empty response");
   }
 }

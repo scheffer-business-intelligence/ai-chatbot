@@ -104,7 +104,7 @@ export function SidebarUserNav({ user }: { user: User }) {
                 }}
                 type="button"
               >
-                {isGuest ? "Faça login na sua conta." : "Sair"}
+                {isGuest ? "Faça login na sua conta" : "Sair"}
               </button>
             </DropdownMenuItem>
           </DropdownMenuContent>

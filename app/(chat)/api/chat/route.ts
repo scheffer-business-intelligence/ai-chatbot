@@ -331,6 +331,7 @@ export async function POST(request: Request) {
           originalMessages: isToolApprovalFlow ? uiMessages : undefined,
           execute: async ({ writer: dataStream }) => {
             const textPartId = generateUUID();
+            let hasVisibleOutput = false;
             dataStream.write({ type: "start" });
             dataStream.write({ type: "text-start", id: textPartId });
 
@@ -345,11 +346,22 @@ export async function POST(request: Request) {
                 continue;
               }
 
+              if (!delta.trim()) {
+                continue;
+              }
+
               dataStream.write({
                 type: "text-delta",
                 id: textPartId,
                 delta,
               });
+              hasVisibleOutput = true;
+            }
+
+            if (!hasVisibleOutput) {
+              throw new Error(
+                "Scheffer Agente Engine retornou resposta vazia."
+              );
             }
 
             dataStream.write({ type: "text-end", id: textPartId });
@@ -364,10 +376,11 @@ export async function POST(request: Request) {
           generateId: generateUUID,
           onFinish: handleOnFinish,
           onError: (error) => {
+            console.error("Agent Engine stream error:", error);
             if (error instanceof Error) {
-              return error.message;
+              return `Não consegui obter resposta do Scheffer Agente Engine: ${error.message}`;
             }
-            return "Oops, an error occurred!";
+            return "Não consegui obter resposta do Scheffer Agente Engine.";
           },
         });
       } catch (error) {
