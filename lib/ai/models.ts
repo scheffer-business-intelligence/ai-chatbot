@@ -32,6 +32,12 @@ export const chatModels: ChatModel[] = [
     provider: "openai",
     description: "Direct OpenAI API model",
   },
+  {
+    id: "openai/gpt-4o-mini",
+    name: "GPT-4o Mini",
+    provider: "openai",
+    description: "Direct OpenAI API model",
+  },
 ];
 
 // Group models by provider for UI
