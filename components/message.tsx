@@ -49,8 +49,30 @@ const PurePreviewMessage = ({
   const attachmentsFromMessage = message.parts.filter(
     (part) => part.type === "file"
   );
+  const hasVisibleAssistantContent =
+    message.role !== "assistant" ||
+    attachmentsFromMessage.length > 0 ||
+    message.parts.some((part) => {
+      if (part.type === "text") {
+        return sanitizeText(part.text).trim().length > 0;
+      }
+
+      if (part.type === "reasoning") {
+        return part.text.trim().length > 0;
+      }
+
+      if (part.type.startsWith("tool-")) {
+        return true;
+      }
+
+      return part.type === "file";
+    });
 
   useDataStream();
+
+  if (!hasVisibleAssistantContent) {
+    return null;
+  }
 
   return (
     <div
@@ -379,7 +401,7 @@ export const ThinkingMessage = () => {
 
         <div className="flex w-full flex-col gap-2 md:gap-4">
           <div className="flex items-center gap-1 p-0 text-muted-foreground text-sm">
-            <span className="animate-pulse">Thinking</span>
+            <span className="animate-pulse">Pensando</span>
             <span className="inline-flex">
               <span className="animate-bounce [animation-delay:0ms]">.</span>
               <span className="animate-bounce [animation-delay:150ms]">.</span>

@@ -33,6 +33,27 @@ export const chat = pgTable("Chat", {
 
 export type Chat = InferSelectModel<typeof chat>;
 
+export const chatProviderSession = pgTable(
+  "ChatProviderSession",
+  {
+    chatId: uuid("chatId")
+      .notNull()
+      .references(() => chat.id),
+    provider: varchar("provider", { length: 64 }).notNull(),
+    sessionId: text("sessionId").notNull(),
+    userId: uuid("userId")
+      .notNull()
+      .references(() => user.id),
+    createdAt: timestamp("createdAt").notNull(),
+    updatedAt: timestamp("updatedAt").notNull(),
+  },
+  (table) => ({
+    pk: primaryKey({ columns: [table.chatId, table.provider] }),
+  })
+);
+
+export type ChatProviderSession = InferSelectModel<typeof chatProviderSession>;
+
 // DEPRECATED: The following schema is deprecated and will be removed in the future.
 // Read the migration guide at https://chat-sdk.dev/docs/migration-guides/message-parts
 export const messageDeprecated = pgTable("Message", {

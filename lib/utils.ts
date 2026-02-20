@@ -94,7 +94,42 @@ export function getTrailingMessageId({
 }
 
 export function sanitizeText(text: string) {
-  return text.replace('<has_function_call>', '');
+  const bqContextOpenTag = '[BQ_CONTEXT]';
+  const bqContextCloseTag = '[/BQ_CONTEXT]';
+
+  const getTrailingTagPrefixLength = (value: string, tag: string) => {
+    const maxLength = Math.min(value.length, tag.length - 1);
+
+    for (let length = maxLength; length > 0; length -= 1) {
+      if (value.endsWith(tag.slice(0, length))) {
+        return length;
+      }
+    }
+
+    return 0;
+  };
+
+  const stripTrailingPartialTag = (value: string, tag: string) => {
+    const partialLength = getTrailingTagPrefixLength(value, tag);
+    if (partialLength === 0) {
+      return value;
+    }
+
+    return value.slice(0, value.length - partialLength);
+  };
+
+  const withoutContextBlocks = text
+    .replace(/\[BQ_CONTEXT\][\s\S]*?\[\/BQ_CONTEXT\]/g, '')
+    .replace(/\[BQ_CONTEXT\][\s\S]*$/g, '')
+    .replace(/\[\/BQ_CONTEXT\]/g, '');
+
+  return stripTrailingPartialTag(
+    stripTrailingPartialTag(
+      withoutContextBlocks.replace('<has_function_call>', ''),
+      bqContextOpenTag,
+    ),
+    bqContextCloseTag,
+  );
 }
 
 export function convertToUIMessages(messages: DBMessage[]): ChatMessage[] {

@@ -21,6 +21,7 @@ import { generateUUID } from "../utils";
 import {
   type Chat,
   chat,
+  chatProviderSession,
   type DBMessage,
   document,
   message,
@@ -107,6 +108,9 @@ export async function deleteChatById({ id }: { id: string }) {
   try {
     await db.delete(vote).where(eq(vote.chatId, id));
     await db.delete(message).where(eq(message.chatId, id));
+    await db
+      .delete(chatProviderSession)
+      .where(eq(chatProviderSession.chatId, id));
     await db.delete(stream).where(eq(stream.chatId, id));
 
     const [chatsDeleted] = await db
@@ -137,6 +141,9 @@ export async function deleteAllChatsByUserId({ userId }: { userId: string }) {
 
     await db.delete(vote).where(inArray(vote.chatId, chatIds));
     await db.delete(message).where(inArray(message.chatId, chatIds));
+    await db
+      .delete(chatProviderSession)
+      .where(inArray(chatProviderSession.chatId, chatIds));
     await db.delete(stream).where(inArray(stream.chatId, chatIds));
 
     const deletedChats = await db
@@ -239,6 +246,68 @@ export async function getChatById({ id }: { id: string }) {
     return selectedChat;
   } catch (_error) {
     throw new ChatSDKError("bad_request:database", "Failed to get chat by id");
+  }
+}
+
+export async function getProviderSessionByChatId({
+  chatId,
+  provider,
+}: {
+  chatId: string;
+  provider: string;
+}) {
+  try {
+    const [selectedSession] = await db
+      .select()
+      .from(chatProviderSession)
+      .where(
+        and(
+          eq(chatProviderSession.chatId, chatId),
+          eq(chatProviderSession.provider, provider)
+        )
+      )
+      .limit(1);
+
+    return selectedSession ?? null;
+  } catch (_error) {
+    throw new ChatSDKError(
+      "bad_request:database",
+      "Failed to get provider session by chat id"
+    );
+  }
+}
+
+export async function upsertProviderSession({
+  chatId,
+  provider,
+  sessionId,
+  userId,
+}: {
+  chatId: string;
+  provider: string;
+  sessionId: string;
+  userId: string;
+}) {
+  try {
+    return await db
+      .insert(chatProviderSession)
+      .values({
+        chatId,
+        provider,
+        sessionId,
+        userId,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      })
+      .onConflictDoUpdate({
+        target: [chatProviderSession.chatId, chatProviderSession.provider],
+        set: { sessionId, userId, updatedAt: new Date() },
+      });
+  } catch (_error) {
+    throw new ChatSDKError(
+      "bad_request:database",
+      "Failed to upsert provider session"
+    );
   }
 }
 

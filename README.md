@@ -36,15 +36,13 @@
 
 ## Model Providers
 
-This template uses the [Vercel AI Gateway](https://vercel.com/docs/ai-gateway) to access multiple AI models through a unified interface. The default configuration includes [xAI](https://x.ai) models (`grok-2-vision-1212`, `grok-3-mini`) routed through the gateway.
+This project supports three model paths in the same UI:
 
-### AI Gateway Authentication
+- `google/scheffer-agent-engine` via Vertex AI Agent Engine (service account auth).
+- Gemini models via direct Google API (`GOOGLE_GENERATIVE_AI_API_KEY`).
+- GPT models via direct OpenAI API (`OPENAI_API_KEY`).
 
-**For Vercel deployments**: Authentication is handled automatically via OIDC tokens.
-
-**For non-Vercel deployments**: You need to provide an AI Gateway API key by setting the `AI_GATEWAY_API_KEY` environment variable in your `.env.local` file.
-
-With the [AI SDK](https://ai-sdk.dev/docs/introduction), you can also switch to direct LLM providers like [OpenAI](https://openai.com), [Anthropic](https://anthropic.com), [Cohere](https://cohere.com/), and [many more](https://ai-sdk.dev/providers/ai-sdk-providers) with just a few lines of code.
+`AI_GATEWAY_API_KEY` is optional and only needed if you decide to use Vercel AI Gateway-routed models.
 
 ## Deploy Your Own
 
@@ -55,6 +53,22 @@ You can deploy your own version of the Next.js AI Chatbot to Vercel with one cli
 ## Running locally
 
 You will need to use the environment variables [defined in `.env.example`](.env.example) to run Next.js AI Chatbot. It's recommended you use [Vercel Environment Variables](https://vercel.com/docs/projects/environment-variables) for this, but a `.env` file is all that is necessary.
+
+### Google ADK Agent Engine model
+
+To use the `Scheffer Agent Engine` model in the UI, also configure:
+
+- `GOOGLE_SERVICE_ACCOUNT_KEY_FILE` (for example `bi-scheffer.json`)
+- `VERTEX_PROJECT_ID`
+- `VERTEX_LOCATION`
+- `VERTEX_REASONING_ENGINE`
+
+The backend uses the service account file to obtain the Vertex access token.
+
+To use direct Gemini and GPT models in the selector, also configure:
+
+- `GOOGLE_GENERATIVE_AI_API_KEY`
+- `OPENAI_API_KEY`
 
 > Note: You should not commit your `.env` file or it will expose secrets that will allow others to control access to your various AI and authentication provider accounts.
 

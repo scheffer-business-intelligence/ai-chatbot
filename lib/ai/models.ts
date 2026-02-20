@@ -1,5 +1,5 @@
-// Curated list of top models from Vercel AI Gateway
-export const DEFAULT_CHAT_MODEL = "google/gemini-2.5-flash-lite";
+export const AGENT_ENGINE_CHAT_MODEL = "google/scheffer-agent-engine";
+export const DEFAULT_CHAT_MODEL = AGENT_ENGINE_CHAT_MODEL;
 
 export type ChatModel = {
   id: string;
@@ -9,19 +9,28 @@ export type ChatModel = {
 };
 
 export const chatModels: ChatModel[] = [
-  // OpenAI
+  // Scheffer
   {
-    id: "openai/gpt-5.2",
-    name: "GPT-5.2",
-    provider: "openai",
-    description: "Most capable OpenAI model",
+    id: AGENT_ENGINE_CHAT_MODEL,
+    name: "Scheffer Agente Engine",
+    provider: "google",
+    description: "Google ADK agent deployed on Vertex AI Agent Engine",
   },
+
   // Google
   {
-    id: "google/gemini-3-pro-preview",
-    name: "Gemini 3 Pro",
+    id: "google/gemini-3.1-pro-preview",
+    name: "Gemini 3.1 Pro",
     provider: "google",
-    description: "Most capable Google model",
+    description: "Direct Gemini API model",
+  },
+
+  // OpenAI
+  {
+    id: "openai/gpt-5.2-pro",
+    name: "GPT-5.2 Pro",
+    provider: "openai",
+    description: "Direct OpenAI API model",
   },
 ];
 

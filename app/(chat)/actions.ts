@@ -12,6 +12,15 @@ import {
 } from "@/lib/db/queries";
 import { getTextFromMessage } from "@/lib/utils";
 
+function createFallbackTitle(input: string) {
+  const normalized = input.replace(/\s+/g, " ").trim();
+  if (!normalized) {
+    return "New chat";
+  }
+
+  return normalized.slice(0, 80);
+}
+
 export async function saveChatModelAsCookie(model: string) {
   const cookieStore = await cookies();
   cookieStore.set("chat-model", model);
@@ -22,15 +31,25 @@ export async function generateTitleFromUserMessage({
 }: {
   message: UIMessage;
 }) {
-  const { text } = await generateText({
-    model: getTitleModel(),
-    system: titlePrompt,
-    prompt: getTextFromMessage(message),
-  });
-  return text
-    .replace(/^[#*"\s]+/, "")
-    .replace(/["]+$/, "")
-    .trim();
+  const prompt = getTextFromMessage(message);
+
+  try {
+    const { text } = await generateText({
+      model: getTitleModel(),
+      system: titlePrompt,
+      prompt,
+    });
+
+    const sanitizedTitle = text
+      .replace(/^[#*"\s]+/, "")
+      .replace(/["]+$/, "")
+      .trim();
+
+    return sanitizedTitle || createFallbackTitle(prompt);
+  } catch (error) {
+    console.warn("Title generation failed; using fallback title.", error);
+    return createFallbackTitle(prompt);
+  }
 }
 
 export async function deleteTrailingMessages({ id }: { id: string }) {

@@ -36,6 +36,7 @@ yarn-error.log*
 .env
 .vercel
 .env*.local
+bi-scheffer.json
 
 # Playwright
 /test-results/

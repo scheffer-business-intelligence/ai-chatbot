@@ -5,6 +5,7 @@ import { memo } from "react";
 import { useMessages } from "@/hooks/use-messages";
 import type { Vote } from "@/lib/db/schema";
 import type { ChatMessage } from "@/lib/types";
+import { sanitizeText } from "@/lib/utils";
 import type { UIArtifact } from "./artifact";
 import { PreviewMessage, ThinkingMessage } from "./message";
 
@@ -40,6 +41,45 @@ function PureArtifactMessages({
     status,
   });
 
+  const hasToolApprovalResponse = messages.some((msg) =>
+    msg.parts?.some(
+      (part) => "state" in part && part.state === "approval-responded"
+    )
+  );
+
+  const hasVisibleStreamingAssistantContent =
+    status === "streaming" &&
+    (() => {
+      const lastMessage = messages.at(-1);
+
+      if (!lastMessage || lastMessage.role !== "assistant") {
+        return false;
+      }
+
+      return (
+        lastMessage.parts?.some((part) => {
+          if (part.type === "text") {
+            return sanitizeText(part.text).trim().length > 0;
+          }
+
+          if (part.type === "reasoning") {
+            return part.text.trim().length > 0;
+          }
+
+          if (part.type.startsWith("tool-")) {
+            return true;
+          }
+
+          return part.type === "file";
+        }) ?? false
+      );
+    })();
+
+  const shouldShowThinkingMessage =
+    !hasToolApprovalResponse &&
+    (status === "submitted" ||
+      (status === "streaming" && !hasVisibleStreamingAssistantContent));
+
   return (
     <div
       className="flex h-full flex-col items-center gap-4 overflow-y-scroll px-4 pt-20"
@@ -67,12 +107,7 @@ function PureArtifactMessages({
       ))}
 
       <AnimatePresence mode="wait">
-        {status === "submitted" &&
-          !messages.some((msg) =>
-            msg.parts?.some(
-              (part) => "state" in part && part.state === "approval-responded"
-            )
-          ) && <ThinkingMessage key="thinking" />}
+        {shouldShowThinkingMessage && <ThinkingMessage key="thinking" />}
       </AnimatePresence>
 
       <motion.div

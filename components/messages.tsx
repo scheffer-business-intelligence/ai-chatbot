@@ -3,6 +3,7 @@ import { ArrowDownIcon } from "lucide-react";
 import { useMessages } from "@/hooks/use-messages";
 import type { Vote } from "@/lib/db/schema";
 import type { ChatMessage } from "@/lib/types";
+import { sanitizeText } from "@/lib/utils";
 import { useDataStream } from "./data-stream-provider";
 import { Greeting } from "./greeting";
 import { PreviewMessage, ThinkingMessage } from "./message";
@@ -43,6 +44,45 @@ function PureMessages({
 
   useDataStream();
 
+  const hasToolApprovalResponse = messages.some((msg) =>
+    msg.parts?.some(
+      (part) => "state" in part && part.state === "approval-responded"
+    )
+  );
+
+  const hasVisibleStreamingAssistantContent =
+    status === "streaming" &&
+    (() => {
+      const lastMessage = messages.at(-1);
+
+      if (!lastMessage || lastMessage.role !== "assistant") {
+        return false;
+      }
+
+      return (
+        lastMessage.parts?.some((part) => {
+          if (part.type === "text") {
+            return sanitizeText(part.text).trim().length > 0;
+          }
+
+          if (part.type === "reasoning") {
+            return part.text.trim().length > 0;
+          }
+
+          if (part.type.startsWith("tool-")) {
+            return true;
+          }
+
+          return part.type === "file";
+        }) ?? false
+      );
+    })();
+
+  const shouldShowThinkingMessage =
+    !hasToolApprovalResponse &&
+    (status === "submitted" ||
+      (status === "streaming" && !hasVisibleStreamingAssistantContent));
+
   return (
     <div className="relative flex-1">
       <div
@@ -75,12 +115,7 @@ function PureMessages({
             />
           ))}
 
-          {status === "submitted" &&
-            !messages.some((msg) =>
-              msg.parts?.some(
-                (part) => "state" in part && part.state === "approval-responded"
-              )
-            ) && <ThinkingMessage />}
+          {shouldShowThinkingMessage && <ThinkingMessage />}
 
           <div
             className="min-h-[24px] min-w-[24px] shrink-0"

@@ -71,7 +71,7 @@ export function MessageEditor({
           }}
           variant="outline"
         >
-          Cancel
+          Cancelar
         </Button>
         <Button
           className="h-fit px-3 py-2"
@@ -104,7 +104,7 @@ export function MessageEditor({
           }}
           variant="default"
         >
-          {isSubmitting ? "Sending..." : "Send"}
+          {isSubmitting ? "Enviando..." : "Enviar"}
         </Button>
       </div>
     </div>

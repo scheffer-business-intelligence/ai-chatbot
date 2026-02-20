@@ -16,7 +16,8 @@ export type Surface =
   | "vote"
   | "document"
   | "suggestions"
-  | "activate_gateway";
+  | "activate_gateway"
+  | "agent_engine";
 
 export type ErrorCode = `${ErrorType}:${Surface}`;
 
@@ -33,6 +34,7 @@ export const visibilityBySurface: Record<Surface, ErrorVisibility> = {
   document: "response",
   suggestions: "response",
   activate_gateway: "response",
+  agent_engine: "response",
 };
 
 export class ChatSDKError extends Error {
@@ -86,6 +88,11 @@ export function getMessageByErrorCode(errorCode: ErrorCode): string {
 
     case "bad_request:activate_gateway":
       return "AI Gateway requires a valid credit card on file to service requests. Please visit https://vercel.com/d?to=%2F%5Bteam%5D%2F%7E%2Fai%3Fmodal%3Dadd-credit-card to add a card and unlock your free credits.";
+
+    case "bad_request:agent_engine":
+      return "The Agent Engine request failed. Please verify your Google/Vertex configuration and try again.";
+    case "forbidden:agent_engine":
+      return "Your account does not have access to the Scheffer Agent Engine model.";
 
     case "unauthorized:auth":
       return "You need to sign in before continuing.";
