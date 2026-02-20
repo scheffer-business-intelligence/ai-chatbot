@@ -54,7 +54,7 @@ import {
 import { generateTitleFromUserMessage } from "../../actions";
 import { type PostRequestBody, postRequestBodySchema } from "./schema";
 
-export const maxDuration = 60;
+export const maxDuration = 300;
 
 function isAgentEngineModel(modelId: string) {
   return modelId === AGENT_ENGINE_CHAT_MODEL;
@@ -74,7 +74,7 @@ function getLatestUserMessage(messages: ChatMessage[]) {
 function createLocalChatTitle(message: ChatMessage) {
   const normalized = getTextFromMessage(message).replace(/\s+/g, " ").trim();
   if (!normalized) {
-    return "New chat";
+    return "Nova Conversa";
   }
   return normalized.slice(0, 80);
 }
@@ -414,6 +414,7 @@ export async function POST(request: Request) {
         generateId: generateUUID,
         onFinish: handleOnFinish,
         onError: (error) => {
+          console.error("Direct provider stream error:", error);
           if (error instanceof Error) {
             return error.message;
           }

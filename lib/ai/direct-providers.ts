@@ -60,6 +60,28 @@ async function* parseSSEPayloads(
   const reader = stream.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
+  let dataLines: string[] = [];
+  let receivedDone = false;
+
+  const flushEvent = function* (): Generator<string, void, void> {
+    if (dataLines.length === 0) {
+      return;
+    }
+
+    const payload = dataLines.join("\n").trim();
+    dataLines = [];
+
+    if (!payload) {
+      return;
+    }
+
+    if (payload === "[DONE]") {
+      receivedDone = true;
+      return;
+    }
+
+    yield payload;
+  };
 
   try {
     while (true) {
@@ -72,25 +94,54 @@ async function* parseSSEPayloads(
 
       let newlineIndex = buffer.indexOf("\n");
       while (newlineIndex !== -1) {
-        const line = buffer.slice(0, newlineIndex).replace(/\r$/, "").trim();
+        const line = buffer.slice(0, newlineIndex).replace(/\r$/, "");
         buffer = buffer.slice(newlineIndex + 1);
 
-        if (line.startsWith("data:")) {
-          const payload = line.replace(/^data:\s*/, "");
-          if (!payload) {
-            newlineIndex = buffer.indexOf("\n");
-            continue;
+        if (line.trim() === "") {
+          for (const payload of flushEvent()) {
+            yield payload;
           }
 
-          if (payload === "[DONE]") {
+          if (receivedDone) {
             return;
           }
 
-          yield payload;
+          newlineIndex = buffer.indexOf("\n");
+          continue;
         }
 
+        if (line.startsWith("data:")) {
+          dataLines.push(line.replace(/^data:\s?/, ""));
+          newlineIndex = buffer.indexOf("\n");
+          continue;
+        }
+
+        if (line.startsWith(":")) {
+          newlineIndex = buffer.indexOf("\n");
+          continue;
+        }
+
+        if (line.includes(":")) {
+          newlineIndex = buffer.indexOf("\n");
+          continue;
+        }
+
+        dataLines.push(line);
         newlineIndex = buffer.indexOf("\n");
       }
+    }
+
+    if (buffer.trim()) {
+      const tailLine = buffer.replace(/\r$/, "");
+      if (tailLine.startsWith("data:")) {
+        dataLines.push(tailLine.replace(/^data:\s?/, ""));
+      } else if (!tailLine.startsWith(":") && !tailLine.includes(":")) {
+        dataLines.push(tailLine);
+      }
+    }
+
+    for (const payload of flushEvent()) {
+      yield payload;
     }
   } finally {
     reader.releaseLock();
@@ -143,6 +194,43 @@ function getErrorMessage(error: unknown): string {
   return String(error);
 }
 
+type OpenAIReasoningEffort = "minimal" | "low" | "medium" | "high";
+
+function shouldPreferOpenAIResponses(model: string): boolean {
+  const normalizedModel = normalizeOpenAIModelName(model).toLowerCase();
+
+  return (
+    normalizedModel.startsWith("gpt-5") ||
+    normalizedModel.startsWith("o1") ||
+    normalizedModel.startsWith("o3") ||
+    normalizedModel.startsWith("o4")
+  );
+}
+
+function getOpenAIReasoningEffort(
+  model: string
+): OpenAIReasoningEffort | undefined {
+  const configured = process.env.OPENAI_REASONING_EFFORT?.trim().toLowerCase();
+
+  if (
+    configured &&
+    (configured === "minimal" ||
+      configured === "low" ||
+      configured === "medium" ||
+      configured === "high")
+  ) {
+    return configured;
+  }
+
+  const normalizedModel = normalizeOpenAIModelName(model).toLowerCase();
+
+  if (normalizedModel.startsWith("gpt-5") && normalizedModel.includes("pro")) {
+    return "medium";
+  }
+
+  return undefined;
+}
+
 async function* streamOpenAIChatCompletions({
   apiKey,
   models,
@@ -157,6 +245,8 @@ async function* streamOpenAIChatCompletions({
   let fallbackError: Error | null = null;
 
   for (const [index, model] of models.entries()) {
+    let hasOutput = false;
+
     const response = await fetch("https://api.openai.com/v1/chat/completions", {
       method: "POST",
       headers: {
@@ -209,11 +299,16 @@ async function* streamOpenAIChatCompletions({
           parsed.choices?.[0]?.message?.content;
 
         if (delta) {
+          hasOutput = true;
           yield delta;
         }
       } catch {
         // Ignore malformed chunks.
       }
+    }
+
+    if (!hasOutput) {
+      throw new Error(`OpenAI chat/completions produced no text (${model}).`);
     }
 
     return;
@@ -266,6 +361,74 @@ function extractTextFromOpenAIResponseObject(data: unknown): string {
   return texts.join("");
 }
 
+type OpenAIResponsesInputContent =
+  | { type: "input_text"; text: string }
+  | { type: "output_text"; text: string };
+
+type OpenAIResponsesInputItem = {
+  role: OpenAIMessage["role"];
+  content: OpenAIResponsesInputContent[];
+};
+
+function toOpenAIResponsesInput(
+  requestMessages: OpenAIMessage[]
+): OpenAIResponsesInputItem[] {
+  return requestMessages.map((message) => ({
+    role: message.role,
+    content: [
+      {
+        type: message.role === "assistant" ? "output_text" : "input_text",
+        text: message.content,
+      },
+    ],
+  }));
+}
+
+async function requestOpenAIResponsesWithoutStream({
+  apiKey,
+  model,
+  input,
+  reasoningEffort,
+  signal,
+}: {
+  apiKey: string;
+  model: string;
+  input: OpenAIResponsesInputItem[];
+  reasoningEffort?: OpenAIReasoningEffort;
+  signal?: AbortSignal;
+}) {
+  const response = await fetch("https://api.openai.com/v1/responses", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      "Content-Type": "application/json",
+    },
+    signal,
+    body: JSON.stringify({
+      model,
+      stream: false,
+      input,
+      ...(reasoningEffort ? { reasoning: { effort: reasoningEffort } } : {}),
+    }),
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(
+      `OpenAI responses fallback error (${model}): ${response.status} - ${errorText}`
+    );
+  }
+
+  const data = (await response.json()) as unknown;
+  const text = extractTextFromOpenAIResponseObject(data);
+
+  if (!text.trim()) {
+    throw new Error(`OpenAI responses fallback produced no text (${model}).`);
+  }
+
+  return text;
+}
+
 async function* streamOpenAIResponses({
   apiKey,
   models,
@@ -280,10 +443,9 @@ async function* streamOpenAIResponses({
   let fallbackError: Error | null = null;
 
   for (const [index, model] of models.entries()) {
-    const input = requestMessages.map((message) => ({
-      role: message.role,
-      content: [{ type: "input_text", text: message.content }],
-    }));
+    let hasOutput = false;
+    const reasoningEffort = getOpenAIReasoningEffort(model);
+    const input = toOpenAIResponsesInput(requestMessages);
 
     const response = await fetch("https://api.openai.com/v1/responses", {
       method: "POST",
@@ -296,6 +458,7 @@ async function* streamOpenAIResponses({
         model,
         stream: true,
         input,
+        ...(reasoningEffort ? { reasoning: { effort: reasoningEffort } } : {}),
       }),
     });
 
@@ -334,6 +497,7 @@ async function* streamOpenAIResponses({
           typeof parsed.delta === "string"
         ) {
           accumulated += parsed.delta;
+          hasOutput = true;
           yield parsed.delta;
           continue;
         }
@@ -346,10 +510,12 @@ async function* streamOpenAIResponses({
             const delta = parsed.text.slice(accumulated.length);
             if (delta) {
               accumulated = parsed.text;
+              hasOutput = true;
               yield delta;
             }
           } else if (parsed.text) {
             accumulated += parsed.text;
+            hasOutput = true;
             yield parsed.text;
           }
           continue;
@@ -364,16 +530,43 @@ async function* streamOpenAIResponses({
             const delta = completedText.slice(accumulated.length);
             if (delta) {
               accumulated = completedText;
+              hasOutput = true;
               yield delta;
             }
           } else if (completedText) {
             accumulated += completedText;
+            hasOutput = true;
             yield completedText;
           }
         }
       } catch {
         // Ignore malformed chunks.
       }
+    }
+
+    if (!hasOutput) {
+      try {
+        const fallbackText = await requestOpenAIResponsesWithoutStream({
+          apiKey,
+          model,
+          input,
+          reasoningEffort,
+          signal,
+        });
+
+        hasOutput = true;
+        yield fallbackText;
+      } catch (fallbackError) {
+        throw new Error(
+          `OpenAI responses produced no streamed text (${model}). Fallback failed: ${getErrorMessage(
+            fallbackError
+          )}`
+        );
+      }
+    }
+
+    if (!hasOutput) {
+      throw new Error(`OpenAI responses produced no text (${model}).`);
     }
 
     return;
@@ -406,6 +599,43 @@ async function* streamOpenAIChat({
   const model = modelNameFromId(modelId);
   const models = getOpenAIModelCandidates(model);
   const requestMessages = buildOpenAIRequestMessages(messages, system);
+  const shouldStartWithResponses = shouldPreferOpenAIResponses(model);
+
+  if (shouldStartWithResponses) {
+    let responsesError: unknown;
+
+    try {
+      for await (const delta of streamOpenAIResponses({
+        apiKey,
+        models,
+        requestMessages,
+        signal,
+      })) {
+        yield delta;
+      }
+      return;
+    } catch (error) {
+      responsesError = error;
+    }
+
+    try {
+      for await (const delta of streamOpenAIChatCompletions({
+        apiKey,
+        models,
+        requestMessages,
+        signal,
+      })) {
+        yield delta;
+      }
+      return;
+    } catch (chatCompletionsError) {
+      throw new Error(
+        `OpenAI request failed. responses: ${getErrorMessage(
+          responsesError
+        )} | chat/completions: ${getErrorMessage(chatCompletionsError)}`
+      );
+    }
+  }
 
   let chatCompletionsError: unknown;
 
@@ -531,6 +761,7 @@ async function* streamGoogleGemini({
   }
 
   let accumulated = "";
+  let hasOutput = false;
 
   for await (const payload of parseSSEPayloads(response.body)) {
     try {
@@ -544,15 +775,21 @@ async function* streamGoogleGemini({
         const delta = text.slice(accumulated.length);
         if (delta) {
           accumulated = text;
+          hasOutput = true;
           yield delta;
         }
       } else {
         accumulated += text;
+        hasOutput = true;
         yield text;
       }
     } catch {
       // Ignore malformed chunks.
     }
+  }
+
+  if (!hasOutput) {
+    throw new Error(`Gemini stream produced no text (${model}).`);
   }
 }
 

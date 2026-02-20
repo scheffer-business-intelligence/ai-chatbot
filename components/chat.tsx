@@ -149,7 +149,18 @@ export function Chat({
             description: error.message,
           });
         }
+        return;
       }
+
+      const description =
+        error instanceof Error && error.message
+          ? error.message
+          : "Falha ao obter resposta do modelo selecionado.";
+
+      toast({
+        type: "error",
+        description,
+      });
     },
   });
 
