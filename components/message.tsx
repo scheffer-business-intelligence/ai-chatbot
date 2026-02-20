@@ -31,7 +31,9 @@ const PurePreviewMessage = ({
   isLoading,
   setMessages,
   regenerate,
+  onRegenerate,
   isReadonly,
+  canRegenerate,
   requiresScrollPadding: _requiresScrollPadding,
 }: {
   addToolApprovalResponse: UseChatHelpers<ChatMessage>["addToolApprovalResponse"];
@@ -41,7 +43,9 @@ const PurePreviewMessage = ({
   isLoading: boolean;
   setMessages: UseChatHelpers<ChatMessage>["setMessages"];
   regenerate: UseChatHelpers<ChatMessage>["regenerate"];
+  onRegenerate?: () => Promise<void>;
   isReadonly: boolean;
+  canRegenerate?: boolean;
   requiresScrollPadding: boolean;
 }) => {
   const [mode, setMode] = useState<"view" | "edit">("view");
@@ -369,10 +373,12 @@ const PurePreviewMessage = ({
 
           {!isReadonly && (
             <MessageActions
+              canRegenerate={canRegenerate}
               chatId={chatId}
               isLoading={isLoading}
               key={`action-${message.id}`}
               message={message}
+              regenerate={onRegenerate ?? regenerate}
               setMode={setMode}
               vote={vote}
             />

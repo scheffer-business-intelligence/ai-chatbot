@@ -11,6 +11,7 @@ import {
   inArray,
   lt,
   type SQL,
+  sql,
 } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/postgres-js";
 import postgres from "postgres";
@@ -313,8 +314,27 @@ export async function upsertProviderSession({
 
 export async function saveMessages({ messages }: { messages: DBMessage[] }) {
   try {
-    return await db.insert(message).values(messages);
-  } catch (_error) {
+    const dedupedMessages = Array.from(
+      new Map(
+        messages.map((currentMessage) => [currentMessage.id, currentMessage])
+      ).values()
+    );
+
+    return await db
+      .insert(message)
+      .values(dedupedMessages)
+      .onConflictDoUpdate({
+        target: message.id,
+        set: {
+          chatId: sql`excluded."chatId"`,
+          role: sql`excluded."role"`,
+          parts: sql`excluded."parts"`,
+          attachments: sql`excluded."attachments"`,
+          createdAt: sql`excluded."createdAt"`,
+        },
+      });
+  } catch (error) {
+    console.error("saveMessages error:", error);
     throw new ChatSDKError("bad_request:database", "Failed to save messages");
   }
 }

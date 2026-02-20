@@ -1,5 +1,6 @@
 import type { UseChatHelpers } from "@ai-sdk/react";
 import { ArrowDownIcon } from "lucide-react";
+import { deleteTrailingMessages } from "@/app/(chat)/actions";
 import { useMessages } from "@/hooks/use-messages";
 import type { Vote } from "@/lib/db/schema";
 import type { ChatMessage } from "@/lib/types";
@@ -83,6 +84,36 @@ function PureMessages({
     (status === "submitted" ||
       (status === "streaming" && !hasVisibleStreamingAssistantContent));
 
+  const createRegenerateHandler = (assistantMessageIndex: number) => {
+    return async () => {
+      const userMessage = [...messages]
+        .slice(0, assistantMessageIndex)
+        .reverse()
+        .find((candidate) => candidate.role === "user");
+
+      if (!userMessage) {
+        await regenerate();
+        return;
+      }
+
+      await deleteTrailingMessages({ id: userMessage.id });
+
+      setMessages((currentMessages) => {
+        const userIndex = currentMessages.findIndex(
+          (currentMessage) => currentMessage.id === userMessage.id
+        );
+
+        if (userIndex === -1) {
+          return currentMessages;
+        }
+
+        return currentMessages.slice(0, userIndex + 1);
+      });
+
+      await regenerate();
+    };
+  };
+
   return (
     <div className="relative flex-1">
       <div
@@ -95,6 +126,9 @@ function PureMessages({
           {messages.map((message, index) => (
             <PreviewMessage
               addToolApprovalResponse={addToolApprovalResponse}
+              canRegenerate={
+                message.role === "assistant" && index === messages.length - 1
+              }
               chatId={chatId}
               isLoading={
                 status === "streaming" && messages.length - 1 === index
@@ -102,6 +136,7 @@ function PureMessages({
               isReadonly={isReadonly}
               key={message.id}
               message={message}
+              onRegenerate={createRegenerateHandler(index)}
               regenerate={regenerate}
               requiresScrollPadding={
                 hasSentMessage && index === messages.length - 1

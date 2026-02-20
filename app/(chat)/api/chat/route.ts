@@ -226,7 +226,7 @@ export async function POST(request: Request) {
       country,
     };
 
-    if (message?.role === "user") {
+    if (message?.role === "user" && !isToolApprovalFlow) {
       await saveMessages({
         messages: [
           {

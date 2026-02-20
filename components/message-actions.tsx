@@ -1,28 +1,28 @@
 import equal from "fast-deep-equal";
 import { memo } from "react";
 import { toast } from "sonner";
-import { useSWRConfig } from "swr";
 import { useCopyToClipboard } from "usehooks-ts";
 import type { Vote } from "@/lib/db/schema";
 import type { ChatMessage } from "@/lib/types";
 import { sanitizeText } from "@/lib/utils";
 import { Action, Actions } from "./elements/actions";
-import { CopyIcon, PencilEditIcon, ThumbDownIcon, ThumbUpIcon } from "./icons";
+import { CopyIcon, PencilEditIcon, RedoIcon } from "./icons";
 
 export function PureMessageActions({
-  chatId,
   message,
-  vote,
   isLoading,
   setMode,
+  regenerate,
+  canRegenerate,
 }: {
   chatId: string;
   message: ChatMessage;
   vote: Vote | undefined;
   isLoading: boolean;
   setMode?: (mode: "view" | "edit") => void;
+  regenerate?: () => void;
+  canRegenerate?: boolean;
 }) {
-  const { mutate } = useSWRConfig();
   const [_, copyToClipboard] = useCopyToClipboard();
 
   if (isLoading) {
@@ -70,6 +70,16 @@ export function PureMessageActions({
 
   return (
     <Actions className="-ml-0.5">
+      {canRegenerate && regenerate && (
+        <Action
+          onClick={async () => {
+            await regenerate();
+          }}
+          tooltip="Gerar novamente"
+        >
+          <RedoIcon />
+        </Action>
+      )}
       <Action onClick={handleCopy} tooltip="Copiar">
         <CopyIcon />
       </Action>

@@ -2,6 +2,7 @@ import type { UseChatHelpers } from "@ai-sdk/react";
 import equal from "fast-deep-equal";
 import { AnimatePresence, motion } from "framer-motion";
 import { memo } from "react";
+import { deleteTrailingMessages } from "@/app/(chat)/actions";
 import { useMessages } from "@/hooks/use-messages";
 import type { Vote } from "@/lib/db/schema";
 import type { ChatMessage } from "@/lib/types";
@@ -80,6 +81,36 @@ function PureArtifactMessages({
     (status === "submitted" ||
       (status === "streaming" && !hasVisibleStreamingAssistantContent));
 
+  const createRegenerateHandler = (assistantMessageIndex: number) => {
+    return async () => {
+      const userMessage = [...messages]
+        .slice(0, assistantMessageIndex)
+        .reverse()
+        .find((candidate) => candidate.role === "user");
+
+      if (!userMessage) {
+        await regenerate();
+        return;
+      }
+
+      await deleteTrailingMessages({ id: userMessage.id });
+
+      setMessages((currentMessages) => {
+        const userIndex = currentMessages.findIndex(
+          (currentMessage) => currentMessage.id === userMessage.id
+        );
+
+        if (userIndex === -1) {
+          return currentMessages;
+        }
+
+        return currentMessages.slice(0, userIndex + 1);
+      });
+
+      await regenerate();
+    };
+  };
+
   return (
     <div
       className="flex h-full flex-col items-center gap-4 overflow-y-scroll px-4 pt-20"
@@ -88,11 +119,15 @@ function PureArtifactMessages({
       {messages.map((message, index) => (
         <PreviewMessage
           addToolApprovalResponse={addToolApprovalResponse}
+          canRegenerate={
+            message.role === "assistant" && index === messages.length - 1
+          }
           chatId={chatId}
           isLoading={status === "streaming" && index === messages.length - 1}
           isReadonly={isReadonly}
           key={message.id}
           message={message}
+          onRegenerate={createRegenerateHandler(index)}
           regenerate={regenerate}
           requiresScrollPadding={
             hasSentMessage && index === messages.length - 1
