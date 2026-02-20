@@ -41,7 +41,7 @@ export function PureMessageActions({
     }
 
     await copyToClipboard(textFromParts);
-    toast.success("Copied to clipboard!");
+    toast.success("Copiado para a área de transferência!");
   };
 
   // User messages get edit (on hover) and copy actions
