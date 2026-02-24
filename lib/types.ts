@@ -7,6 +7,7 @@ import type { requestSuggestions } from "./ai/tools/request-suggestions";
 import type { updateDocument } from "./ai/tools/update-document";
 import { type ChartSpecV1, chartSpecSchema } from "./charts/schema";
 import type { Suggestion } from "./db/schema";
+import type { ExportContextSheet } from "./export-context";
 
 export type DataPart = { type: "append-message"; message: string };
 
@@ -47,6 +48,7 @@ export type CustomUIDataTypes = {
   "chat-title": string;
   "chart-spec": ChartSpecV1;
   "chart-warning": string;
+  "export-context": ExportContextSheet[];
 };
 
 export type ChatMessage = UIMessage<

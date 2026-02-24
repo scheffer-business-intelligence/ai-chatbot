@@ -3,6 +3,11 @@ import { ArrowDownIcon } from "lucide-react";
 import { deleteTrailingMessages } from "@/app/(chat)/actions";
 import { useMessages } from "@/hooks/use-messages";
 import type { Vote } from "@/lib/db/schema";
+import {
+  type ExportContextSheet,
+  extractContextSheets,
+  parseExportAwareText,
+} from "@/lib/export-context";
 import type { ChatMessage } from "@/lib/types";
 import { sanitizeText } from "@/lib/utils";
 import { useDataStream } from "./data-stream-provider";
@@ -21,6 +26,35 @@ type MessagesProps = {
   isArtifactVisible: boolean;
   selectedModelId: string;
 };
+
+function getContextSheetsFromMessage(
+  message: ChatMessage
+): ExportContextSheet[] {
+  const contextFromParts = extractContextSheets(
+    (
+      message.parts.find((part) => part.type === "data-export-context") as
+        | { type: "data-export-context"; data?: unknown }
+        | undefined
+    )?.data
+  );
+
+  if (contextFromParts.length > 0) {
+    return contextFromParts;
+  }
+
+  for (const part of message.parts) {
+    if (part.type !== "text") {
+      continue;
+    }
+
+    const parsedText = parseExportAwareText(part.text);
+    if (parsedText.contextSheets.length > 0) {
+      return parsedText.contextSheets;
+    }
+  }
+
+  return [];
+}
 
 function PureMessages({
   addToolApprovalResponse,
@@ -63,7 +97,11 @@ function PureMessages({
       return (
         lastMessage.parts?.some((part) => {
           if (part.type === "text") {
-            return sanitizeText(part.text).trim().length > 0;
+            const parsedText = parseExportAwareText(part.text);
+            return (
+              sanitizeText(parsedText.cleanText).trim().length > 0 ||
+              parsedText.exportData !== null
+            );
           }
 
           if (part.type === "reasoning") {
@@ -78,6 +116,10 @@ function PureMessages({
             part.type === "data-chart-spec" ||
             part.type === "data-chart-warning"
           ) {
+            return true;
+          }
+
+          if (part.type === "data-export-context") {
             return true;
           }
 
@@ -130,32 +172,50 @@ function PureMessages({
         <div className="mx-auto flex min-w-0 max-w-4xl flex-col gap-4 px-2 py-4 md:gap-6 md:px-4">
           {messages.length === 0 && <Greeting />}
 
-          {messages.map((message, index) => (
-            <PreviewMessage
-              addToolApprovalResponse={addToolApprovalResponse}
-              canRegenerate={
-                message.role === "assistant" && index === messages.length - 1
+          {(() => {
+            let latestAssistantContext: ExportContextSheet[] = [];
+
+            return messages.map((message, index) => {
+              let inheritedContext = latestAssistantContext;
+
+              if (message.role === "assistant") {
+                const messageContext = getContextSheetsFromMessage(message);
+                if (messageContext.length > 0) {
+                  latestAssistantContext = messageContext;
+                  inheritedContext = messageContext;
+                }
               }
-              chatId={chatId}
-              isLoading={
-                status === "streaming" && messages.length - 1 === index
-              }
-              isReadonly={isReadonly}
-              key={message.id}
-              message={message}
-              onRegenerate={createRegenerateHandler(index)}
-              regenerate={regenerate}
-              requiresScrollPadding={
-                hasSentMessage && index === messages.length - 1
-              }
-              setMessages={setMessages}
-              vote={
-                votes
-                  ? votes.find((vote) => vote.messageId === message.id)
-                  : undefined
-              }
-            />
-          ))}
+
+              return (
+                <PreviewMessage
+                  addToolApprovalResponse={addToolApprovalResponse}
+                  canRegenerate={
+                    message.role === "assistant" &&
+                    index === messages.length - 1
+                  }
+                  chatId={chatId}
+                  inheritedExportContextSheets={inheritedContext}
+                  isLoading={
+                    status === "streaming" && messages.length - 1 === index
+                  }
+                  isReadonly={isReadonly}
+                  key={message.id}
+                  message={message}
+                  onRegenerate={createRegenerateHandler(index)}
+                  regenerate={regenerate}
+                  requiresScrollPadding={
+                    hasSentMessage && index === messages.length - 1
+                  }
+                  setMessages={setMessages}
+                  vote={
+                    votes
+                      ? votes.find((vote) => vote.messageId === message.id)
+                      : undefined
+                  }
+                />
+              );
+            });
+          })()}
 
           {shouldShowThinkingMessage && <ThinkingMessage />}
 

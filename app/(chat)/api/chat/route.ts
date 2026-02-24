@@ -332,6 +332,7 @@ export async function POST(request: Request) {
       chartSpec: null,
       chartError: null,
       hasChartContext: false,
+      contextSheets: [],
     };
 
     const handleOnFinish = async ({
@@ -500,6 +501,13 @@ export async function POST(request: Request) {
               dataStream.write({
                 type: "data-chart-warning",
                 data: extractedContext.chartError,
+              });
+            }
+
+            if (extractedContext.contextSheets.length > 0) {
+              dataStream.write({
+                type: "data-export-context",
+                data: extractedContext.contextSheets,
               });
             }
 

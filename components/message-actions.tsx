@@ -3,6 +3,7 @@ import { memo } from "react";
 import { toast } from "sonner";
 import { useCopyToClipboard } from "usehooks-ts";
 import type { Vote } from "@/lib/db/schema";
+import { parseExportAwareText } from "@/lib/export-context";
 import type { ChatMessage } from "@/lib/types";
 import { sanitizeText } from "@/lib/utils";
 import { Action, Actions } from "./elements/actions";
@@ -31,7 +32,10 @@ export function PureMessageActions({
 
   const textFromParts = message.parts
     ?.filter((part) => part.type === "text")
-    .map((part) => sanitizeText(part.text))
+    .map((part) => {
+      const parsedText = parseExportAwareText(part.text);
+      return sanitizeText(parsedText.cleanText);
+    })
     .join("\n")
     .trim();
 

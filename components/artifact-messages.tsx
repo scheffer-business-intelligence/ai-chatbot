@@ -5,6 +5,11 @@ import { memo } from "react";
 import { deleteTrailingMessages } from "@/app/(chat)/actions";
 import { useMessages } from "@/hooks/use-messages";
 import type { Vote } from "@/lib/db/schema";
+import {
+  type ExportContextSheet,
+  extractContextSheets,
+  parseExportAwareText,
+} from "@/lib/export-context";
 import type { ChatMessage } from "@/lib/types";
 import { sanitizeText } from "@/lib/utils";
 import type { UIArtifact } from "./artifact";
@@ -21,6 +26,35 @@ type ArtifactMessagesProps = {
   isReadonly: boolean;
   artifactStatus: UIArtifact["status"];
 };
+
+function getContextSheetsFromMessage(
+  message: ChatMessage
+): ExportContextSheet[] {
+  const contextFromParts = extractContextSheets(
+    (
+      message.parts.find((part) => part.type === "data-export-context") as
+        | { type: "data-export-context"; data?: unknown }
+        | undefined
+    )?.data
+  );
+
+  if (contextFromParts.length > 0) {
+    return contextFromParts;
+  }
+
+  for (const part of message.parts) {
+    if (part.type !== "text") {
+      continue;
+    }
+
+    const parsedText = parseExportAwareText(part.text);
+    if (parsedText.contextSheets.length > 0) {
+      return parsedText.contextSheets;
+    }
+  }
+
+  return [];
+}
 
 function PureArtifactMessages({
   addToolApprovalResponse,
@@ -60,7 +94,11 @@ function PureArtifactMessages({
       return (
         lastMessage.parts?.some((part) => {
           if (part.type === "text") {
-            return sanitizeText(part.text).trim().length > 0;
+            const parsedText = parseExportAwareText(part.text);
+            return (
+              sanitizeText(parsedText.cleanText).trim().length > 0 ||
+              parsedText.exportData !== null
+            );
           }
 
           if (part.type === "reasoning") {
@@ -75,6 +113,10 @@ function PureArtifactMessages({
             part.type === "data-chart-spec" ||
             part.type === "data-chart-warning"
           ) {
+            return true;
+          }
+
+          if (part.type === "data-export-context") {
             return true;
           }
 
@@ -123,30 +165,49 @@ function PureArtifactMessages({
       className="flex h-full flex-col items-center gap-4 overflow-y-scroll px-4 pt-20"
       ref={messagesContainerRef}
     >
-      {messages.map((message, index) => (
-        <PreviewMessage
-          addToolApprovalResponse={addToolApprovalResponse}
-          canRegenerate={
-            message.role === "assistant" && index === messages.length - 1
+      {(() => {
+        let latestAssistantContext: ExportContextSheet[] = [];
+
+        return messages.map((message, index) => {
+          let inheritedContext = latestAssistantContext;
+
+          if (message.role === "assistant") {
+            const messageContext = getContextSheetsFromMessage(message);
+            if (messageContext.length > 0) {
+              latestAssistantContext = messageContext;
+              inheritedContext = messageContext;
+            }
           }
-          chatId={chatId}
-          isLoading={status === "streaming" && index === messages.length - 1}
-          isReadonly={isReadonly}
-          key={message.id}
-          message={message}
-          onRegenerate={createRegenerateHandler(index)}
-          regenerate={regenerate}
-          requiresScrollPadding={
-            hasSentMessage && index === messages.length - 1
-          }
-          setMessages={setMessages}
-          vote={
-            votes
-              ? votes.find((vote) => vote.messageId === message.id)
-              : undefined
-          }
-        />
-      ))}
+
+          return (
+            <PreviewMessage
+              addToolApprovalResponse={addToolApprovalResponse}
+              canRegenerate={
+                message.role === "assistant" && index === messages.length - 1
+              }
+              chatId={chatId}
+              inheritedExportContextSheets={inheritedContext}
+              isLoading={
+                status === "streaming" && index === messages.length - 1
+              }
+              isReadonly={isReadonly}
+              key={message.id}
+              message={message}
+              onRegenerate={createRegenerateHandler(index)}
+              regenerate={regenerate}
+              requiresScrollPadding={
+                hasSentMessage && index === messages.length - 1
+              }
+              setMessages={setMessages}
+              vote={
+                votes
+                  ? votes.find((vote) => vote.messageId === message.id)
+                  : undefined
+              }
+            />
+          );
+        });
+      })()}
 
       <AnimatePresence mode="wait">
         {shouldShowThinkingMessage && <ThinkingMessage key="thinking" />}

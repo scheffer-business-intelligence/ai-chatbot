@@ -2,6 +2,12 @@
 import type { UseChatHelpers } from "@ai-sdk/react";
 import { useState } from "react";
 import type { Vote } from "@/lib/db/schema";
+import {
+  DATA_FROM_CONTEXT_MARKER,
+  type ExportContextSheet,
+  extractContextSheets,
+  parseExportAwareText,
+} from "@/lib/export-context";
 import type { ChatMessage } from "@/lib/types";
 import { cn, sanitizeText } from "@/lib/utils";
 import { ChartRenderer } from "./charts/chart-renderer";
@@ -17,6 +23,7 @@ import {
   ToolInput,
   ToolOutput,
 } from "./elements/tool";
+import { ExportButton } from "./export-button";
 import { SparklesIcon } from "./icons";
 import { MessageActions } from "./message-actions";
 import { MessageEditor } from "./message-editor";
@@ -35,6 +42,7 @@ const PurePreviewMessage = ({
   onRegenerate,
   isReadonly,
   canRegenerate,
+  inheritedExportContextSheets = [],
   requiresScrollPadding: _requiresScrollPadding,
 }: {
   addToolApprovalResponse: UseChatHelpers<ChatMessage>["addToolApprovalResponse"];
@@ -47,6 +55,7 @@ const PurePreviewMessage = ({
   onRegenerate?: () => Promise<void>;
   isReadonly: boolean;
   canRegenerate?: boolean;
+  inheritedExportContextSheets?: ExportContextSheet[];
   requiresScrollPadding: boolean;
 }) => {
   const [mode, setMode] = useState<"view" | "edit">("view");
@@ -64,6 +73,11 @@ const PurePreviewMessage = ({
       | { type: "data-chart-warning"; data?: unknown }
       | undefined
   )?.data;
+  const exportContextFromParts = (
+    message.parts.find((part) => part.type === "data-export-context") as
+      | { type: "data-export-context"; data?: unknown }
+      | undefined
+  )?.data;
   const chartSpec = chartSpecFromParts ?? message.metadata?.chartSpec ?? null;
   const chartWarning =
     (typeof chartWarningFromParts === "string"
@@ -71,6 +85,19 @@ const PurePreviewMessage = ({
       : null) ??
     message.metadata?.chartError ??
     null;
+  const exportContextSheetsFromParts = extractContextSheets(
+    exportContextFromParts
+  );
+  const hasTextOrExportParts =
+    message.parts?.some((part) => {
+      if (part.type !== "text") {
+        return false;
+      }
+
+      const parsedText = parseExportAwareText(part.text);
+      const visibleText = sanitizeText(parsedText.cleanText).trim();
+      return visibleText.length > 0 || parsedText.exportData !== null;
+    }) ?? false;
   const hasVisibleAssistantContent =
     message.role !== "assistant" ||
     attachmentsFromMessage.length > 0 ||
@@ -78,7 +105,11 @@ const PurePreviewMessage = ({
     typeof chartWarning === "string" ||
     message.parts.some((part) => {
       if (part.type === "text") {
-        return sanitizeText(part.text).trim().length > 0;
+        const parsedText = parseExportAwareText(part.text);
+        return (
+          sanitizeText(parsedText.cleanText).trim().length > 0 ||
+          parsedText.exportData !== null
+        );
       }
 
       if (part.type === "reasoning") {
@@ -93,6 +124,10 @@ const PurePreviewMessage = ({
         part.type === "data-chart-spec" ||
         part.type === "data-chart-warning"
       ) {
+        return true;
+      }
+
+      if (part.type === "data-export-context") {
         return true;
       }
 
@@ -125,14 +160,10 @@ const PurePreviewMessage = ({
 
         <div
           className={cn("flex flex-col", {
-            "gap-2 md:gap-4": message.parts?.some(
-              (p) => p.type === "text" && p.text?.trim()
-            ),
+            "gap-2 md:gap-4": hasTextOrExportParts,
             "w-full":
               (message.role === "assistant" &&
-                (message.parts?.some(
-                  (p) => p.type === "text" && p.text?.trim()
-                ) ||
+                (hasTextOrExportParts ||
                   message.parts?.some((p) => p.type.startsWith("tool-")) ||
                   chartSpec !== null ||
                   typeof chartWarning === "string")) ||
@@ -178,25 +209,52 @@ const PurePreviewMessage = ({
             }
 
             if (type === "text") {
+              const parsedText = parseExportAwareText(part.text);
+              const visibleText = sanitizeText(parsedText.cleanText);
+              const contextSheets =
+                exportContextSheetsFromParts.length > 0
+                  ? exportContextSheetsFromParts
+                  : parsedText.contextSheets.length > 0
+                    ? parsedText.contextSheets
+                    : inheritedExportContextSheets;
+              const exportData =
+                parsedText.exportData === null
+                  ? null
+                  : {
+                      ...parsedText.exportData,
+                      query: DATA_FROM_CONTEXT_MARKER,
+                      contextSheets,
+                    };
+
               if (mode === "view") {
+                if (!visibleText.trim() && !exportData) {
+                  return null;
+                }
+
                 return (
                   <div key={key}>
-                    <MessageContent
-                      className={cn({
-                        "wrap-break-word w-fit rounded-2xl px-3 py-2 text-right text-white":
-                          message.role === "user",
-                        "bg-transparent px-0 py-0 text-left":
-                          message.role === "assistant",
-                      })}
-                      data-testid="message-content"
-                      style={
-                        message.role === "user"
-                          ? { backgroundColor: "#006cff" }
-                          : undefined
-                      }
-                    >
-                      <Response>{sanitizeText(part.text)}</Response>
-                    </MessageContent>
+                    {visibleText.trim().length > 0 && (
+                      <MessageContent
+                        className={cn({
+                          "wrap-break-word w-fit rounded-2xl px-3 py-2 text-right text-white":
+                            message.role === "user",
+                          "bg-transparent px-0 py-0 text-left":
+                            message.role === "assistant",
+                        })}
+                        data-testid="message-content"
+                        style={
+                          message.role === "user"
+                            ? { backgroundColor: "#006cff" }
+                            : undefined
+                        }
+                      >
+                        <Response>{visibleText}</Response>
+                      </MessageContent>
+                    )}
+
+                    {message.role === "assistant" && exportData && (
+                      <ExportButton exportData={exportData} />
+                    )}
                   </div>
                 );
               }

@@ -1,5 +1,9 @@
 import { parseChartContextFromText } from "@/lib/charts/context";
 import type { ChartSpecV1 } from "@/lib/charts/schema";
+import {
+  type ExportContextSheet,
+  parseBqContextFromText,
+} from "@/lib/export-context";
 import { sanitizeText } from "@/lib/utils";
 
 export const AGENT_ENGINE_PROVIDER_ID = "google-agent-engine";
@@ -12,6 +16,7 @@ export type VertexExtractedContext = {
   chartSpec: ChartSpecV1 | null;
   chartError: string | null;
   hasChartContext: boolean;
+  contextSheets: ExportContextSheet[];
 };
 
 function getBaseVertexUrl(engineId: string) {
@@ -581,9 +586,11 @@ export async function* streamVertexQuery({
       return;
     }
     const parsedContext = parseChartContextFromText(rawText);
+    const parsedBqContext = parseBqContextFromText(rawText);
     extractedContext.chartSpec = parsedContext.chartSpec;
     extractedContext.chartError = parsedContext.chartError;
     extractedContext.hasChartContext = parsedContext.hasChartContext;
+    extractedContext.contextSheets = parsedBqContext.contextSheets;
   };
 
   if (!response.body) {
