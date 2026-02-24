@@ -56,6 +56,32 @@ import { generateTitleFromUserMessage } from "../../actions";
 import { type PostRequestBody, postRequestBodySchema } from "./schema";
 
 export const maxDuration = 300;
+const DEFAULT_AGENT_ENGINE_MAX_INLINE_FILE_BYTES = 5 * 1024 * 1024;
+const AGENT_ENGINE_INLINE_XLSX_MIME_TYPE =
+  "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
+
+function getAgentEngineMaxInlineFileBytes() {
+  const configuredLimit = process.env.AGENT_ENGINE_MAX_INLINE_FILE_BYTES;
+
+  if (!configuredLimit) {
+    return DEFAULT_AGENT_ENGINE_MAX_INLINE_FILE_BYTES;
+  }
+
+  const parsedLimit = Number.parseInt(configuredLimit, 10);
+  if (!Number.isFinite(parsedLimit) || parsedLimit <= 0) {
+    return DEFAULT_AGENT_ENGINE_MAX_INLINE_FILE_BYTES;
+  }
+
+  return parsedLimit;
+}
+
+function isAllowedInlineAttachmentMimeType(mediaType: string) {
+  return (
+    mediaType === "application/pdf" ||
+    mediaType === AGENT_ENGINE_INLINE_XLSX_MIME_TYPE ||
+    mediaType.startsWith("image/")
+  );
+}
 
 function isAgentEngineModel(modelId: string) {
   return modelId === AGENT_ENGINE_CHAT_MODEL;
@@ -85,6 +111,7 @@ async function buildVertexMessageFromUserMessage(
   signal?: AbortSignal
 ): Promise<string | { role: "user"; parts: Record<string, unknown>[] }> {
   const parts: Record<string, unknown>[] = [];
+  const maxInlineFileBytes = getAgentEngineMaxInlineFileBytes();
   let hasInlineData = false;
 
   for (const part of message.parts ?? []) {
@@ -100,7 +127,32 @@ async function buildVertexMessageFromUserMessage(
         "name" in part && typeof part.name === "string"
           ? part.name
           : "uploaded_file";
-      const fileResponse = await fetch(part.url, { signal });
+      const fileUrl =
+        "url" in part && typeof part.url === "string" ? part.url : "";
+      const mediaType =
+        "mediaType" in part && typeof part.mediaType === "string"
+          ? part.mediaType
+          : "application/octet-stream";
+
+      if (!fileUrl) {
+        throw new Error(`Attachment ${displayName} is missing a URL.`);
+      }
+
+      if (!isAllowedInlineAttachmentMimeType(mediaType)) {
+        throw new Error(
+          `Attachment ${displayName} has unsupported media type for Agent Engine: ${mediaType}`
+        );
+      }
+
+      let fileResponse: Response;
+      try {
+        fileResponse = await fetch(fileUrl, { signal });
+      } catch (error) {
+        const reason = error instanceof Error ? error.message : "Unknown error";
+        throw new Error(
+          `Failed to fetch attachment ${displayName} from ${fileUrl}: ${reason}`
+        );
+      }
 
       if (!fileResponse.ok) {
         const errorText = await fileResponse.text();
@@ -109,13 +161,44 @@ async function buildVertexMessageFromUserMessage(
         );
       }
 
+      const contentLengthHeader = fileResponse.headers.get("content-length");
+      if (contentLengthHeader) {
+        const contentLength = Number.parseInt(contentLengthHeader, 10);
+        if (
+          Number.isFinite(contentLength) &&
+          contentLength > maxInlineFileBytes
+        ) {
+          const attachmentKind =
+            mediaType === "application/pdf"
+              ? "PDF"
+              : mediaType === AGENT_ENGINE_INLINE_XLSX_MIME_TYPE
+                ? "Spreadsheet"
+                : "File";
+          throw new Error(
+            `${attachmentKind} ${displayName} is too large for Agent Engine inline upload. Maximum allowed size is ${maxInlineFileBytes} bytes.`
+          );
+        }
+      }
+
       const arrayBuffer = await fileResponse.arrayBuffer();
+      if (arrayBuffer.byteLength > maxInlineFileBytes) {
+        const attachmentKind =
+          mediaType === "application/pdf"
+            ? "PDF"
+            : mediaType === AGENT_ENGINE_INLINE_XLSX_MIME_TYPE
+              ? "Spreadsheet"
+              : "File";
+        throw new Error(
+          `${attachmentKind} ${displayName} is too large for Agent Engine inline upload. Maximum allowed size is ${maxInlineFileBytes} bytes.`
+        );
+      }
+
       const base64Data = Buffer.from(arrayBuffer).toString("base64");
 
       parts.push({
         inline_data: {
           data: base64Data,
-          mime_type: part.mediaType || "application/octet-stream",
+          mime_type: mediaType,
           display_name: displayName,
         },
       });
@@ -127,12 +210,13 @@ async function buildVertexMessageFromUserMessage(
     return "";
   }
 
-  if (
-    !hasInlineData &&
-    parts.length === 1 &&
-    typeof parts[0].text === "string"
-  ) {
-    return parts[0].text as string;
+  if (!hasInlineData) {
+    return parts
+      .map((part) =>
+        typeof part.text === "string" ? part.text.trim() : undefined
+      )
+      .filter((text): text is string => Boolean(text))
+      .join("\n\n");
   }
 
   return {
@@ -199,7 +283,7 @@ export async function POST(request: Request) {
       await saveChat({
         id,
         userId: session.user.id,
-        title: "New chat",
+        title: "Nova Conversa",
         visibility: selectedVisibilityType,
       });
       if (

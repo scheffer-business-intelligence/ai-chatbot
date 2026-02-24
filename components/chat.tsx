@@ -144,9 +144,12 @@ export function Chat({
         ) {
           setShowCreditCardAlert(true);
         } else {
+          const errorCause =
+            typeof error.cause === "string" ? error.cause.trim() : "";
+
           toast({
             type: "error",
-            description: error.message,
+            description: errorCause || error.message,
           });
         }
         return;

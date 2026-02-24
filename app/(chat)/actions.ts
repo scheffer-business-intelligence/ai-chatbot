@@ -15,7 +15,7 @@ import { getTextFromMessage } from "@/lib/utils";
 function createFallbackTitle(input: string) {
   const normalized = input.replace(/\s+/g, " ").trim();
   if (!normalized) {
-    return "New chat";
+    return "Nova Conversa";
   }
 
   return normalized.slice(0, 80);

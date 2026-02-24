@@ -4,16 +4,48 @@ import { z } from "zod";
 
 import { auth } from "@/app/(auth)/auth";
 
+const XLSX_MIME_TYPE =
+  "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
+const ALLOWED_MIME_TYPES = [
+  "image/jpeg",
+  "image/png",
+  "application/pdf",
+  XLSX_MIME_TYPE,
+];
+const PLACEHOLDER_BLOB_TOKEN = "****";
+const FILE_EXTENSION_TO_MIME_TYPE: Record<string, string> = {
+  ".jpg": "image/jpeg",
+  ".jpeg": "image/jpeg",
+  ".png": "image/png",
+  ".pdf": "application/pdf",
+  ".xlsx": XLSX_MIME_TYPE,
+};
+
+function getFileExtension(filename: string) {
+  const dotIndex = filename.lastIndexOf(".");
+  if (dotIndex === -1) {
+    return "";
+  }
+  return filename.slice(dotIndex).toLowerCase();
+}
+
+function resolveSupportedMediaType(file: Blob, filename: string) {
+  const mediaType = file.type.toLowerCase();
+  if (ALLOWED_MIME_TYPES.includes(mediaType)) {
+    return mediaType;
+  }
+
+  const extension = getFileExtension(filename);
+  return FILE_EXTENSION_TO_MIME_TYPE[extension] ?? null;
+}
+
 // Use Blob instead of File since File is not available in Node.js environment
 const FileSchema = z.object({
-  file: z
-    .instanceof(Blob)
-    .refine((file) => file.size <= 5 * 1024 * 1024, {
-      message: "File size should be less than 5MB",
-    })
-    // Update the file type based on the kind of files you want to accept
-    .refine((file) => ["image/jpeg", "image/png"].includes(file.type), {
-      message: "File type should be JPEG or PNG",
+  file: z.instanceof(Blob),
+  mediaType: z
+    .string()
+    .refine((mediaType) => ALLOWED_MIME_TYPES.includes(mediaType), {
+      message: "O tipo de arquivo deve ser JPEG, PNG, PDF ou XLSX",
     }),
 });
 
@@ -29,14 +61,36 @@ export async function POST(request: Request) {
   }
 
   try {
-    const formData = await request.formData();
-    const file = formData.get("file") as Blob;
+    const blobToken = process.env.BLOB_READ_WRITE_TOKEN?.trim();
 
-    if (!file) {
+    if (blobToken === PLACEHOLDER_BLOB_TOKEN) {
+      return NextResponse.json(
+        {
+          error:
+            "BLOB_READ_WRITE_TOKEN is using a placeholder value in .env.local. Configure a real Vercel Blob read/write token.",
+        },
+        { status: 500 }
+      );
+    }
+
+    const formData = await request.formData();
+    const fileFromFormData = formData.get("file");
+
+    if (!(fileFromFormData instanceof Blob)) {
       return NextResponse.json({ error: "No file uploaded" }, { status: 400 });
     }
 
-    const validatedFile = FileSchema.safeParse({ file });
+    const file = fileFromFormData;
+    const originalFilename =
+      fileFromFormData instanceof File
+        ? fileFromFormData.name
+        : `upload-${Date.now()}`;
+    const resolvedMediaType = resolveSupportedMediaType(file, originalFilename);
+
+    const validatedFile = FileSchema.safeParse({
+      file,
+      mediaType: resolvedMediaType ?? "",
+    });
 
     if (!validatedFile.success) {
       const errorMessage = validatedFile.error.errors
@@ -46,18 +100,21 @@ export async function POST(request: Request) {
       return NextResponse.json({ error: errorMessage }, { status: 400 });
     }
 
-    // Get filename from formData since Blob doesn't have name property
-    const filename = (formData.get("file") as File).name;
-    const fileBuffer = await file.arrayBuffer();
-
     try {
-      const data = await put(`${filename}`, fileBuffer, {
+      const data = await put(originalFilename, file, {
         access: "public",
+        addRandomSuffix: true,
+        contentType: resolvedMediaType || undefined,
+        token: blobToken,
       });
 
       return NextResponse.json(data);
-    } catch (_error) {
-      return NextResponse.json({ error: "Upload failed" }, { status: 500 });
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : "Unknown error";
+      return NextResponse.json(
+        { error: `Upload failed: ${reason}` },
+        { status: 500 }
+      );
     }
   } catch (_error) {
     return NextResponse.json(

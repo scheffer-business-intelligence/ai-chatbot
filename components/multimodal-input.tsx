@@ -206,7 +206,7 @@ function PureMultimodalInput({
       const { error } = await response.json();
       toast.error(error);
     } catch (_error) {
-      toast.error("Failed to upload file, please try again!");
+      toast.error("Não foi possível enviar o arquivo. Tente novamente!");
     }
   }, []);
 
@@ -276,7 +276,7 @@ function PureMultimodalInput({
         ]);
       } catch (error) {
         console.error("Error uploading pasted images:", error);
-        toast.error("Failed to upload pasted image(s)");
+        toast.error("Falha ao carregar a(s) imagem(ns) colada(s).");
       } finally {
         setUploadQueue([]);
       }
@@ -308,6 +308,7 @@ function PureMultimodalInput({
         )}
 
       <input
+        accept="image/jpeg,image/png,application/pdf,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,.xlsx"
         className="pointer-events-none fixed -top-4 -left-4 size-0.5 opacity-0"
         multiple
         onChange={handleFileChange}

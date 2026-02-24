@@ -441,17 +441,26 @@ export async function createVertexSession(
 
   const engineId = getReasoningEngineId();
   const url = `${getBaseVertexUrl(engineId)}:query`;
-  const response = await fetch(url, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${accessToken}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      class_method: "create_session",
-      input: { user_id: userId },
-    }),
-  });
+  let response: Response;
+
+  try {
+    response = await fetch(url, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        class_method: "create_session",
+        input: { user_id: userId },
+      }),
+    });
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : "Unknown error";
+    throw new Error(
+      `Failed to reach Vertex create_session (${url}): ${reason}`
+    );
+  }
 
   if (!response.ok) {
     const errorText = await response.text();
@@ -534,24 +543,31 @@ export async function* streamVertexQuery({
   const engineId = getReasoningEngineId();
   const url = `${getBaseVertexUrl(engineId)}:streamQuery?alt=sse`;
 
-  const response = await fetch(url, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${accessToken}`,
-      "Content-Type": "application/json",
-      Accept: "text/event-stream",
-    },
-    signal,
-    body: JSON.stringify({
-      class_method: "stream_query",
-      input: {
-        user_id: userId,
-        session_id: sessionId,
-        message,
-        run_config: { streaming_mode: "sse" },
+  let response: Response;
+
+  try {
+    response = await fetch(url, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        "Content-Type": "application/json",
+        Accept: "text/event-stream",
       },
-    }),
-  });
+      signal,
+      body: JSON.stringify({
+        class_method: "stream_query",
+        input: {
+          user_id: userId,
+          session_id: sessionId,
+          message,
+          run_config: { streaming_mode: "sse" },
+        },
+      }),
+    });
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : "Unknown error";
+    throw new Error(`Failed to reach Vertex stream_query (${url}): ${reason}`);
+  }
 
   if (!response.ok) {
     const errorText = await response.text();

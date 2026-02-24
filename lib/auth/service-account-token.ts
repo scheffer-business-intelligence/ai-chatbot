@@ -90,20 +90,30 @@ function buildSignedJwt({
 
 async function requestAccessToken(): Promise<AccessTokenCache> {
   const key = await loadServiceAccountKey();
+  const tokenUri = key.token_uri || DEFAULT_TOKEN_URI;
   const assertion = buildSignedJwt({
     clientEmail: key.client_email,
     privateKey: key.private_key,
-    tokenUri: key.token_uri || DEFAULT_TOKEN_URI,
+    tokenUri,
   });
 
-  const response = await fetch(key.token_uri || DEFAULT_TOKEN_URI, {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: new URLSearchParams({
-      grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer",
-      assertion,
-    }),
-  });
+  let response: Response;
+
+  try {
+    response = await fetch(tokenUri, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer",
+        assertion,
+      }),
+    });
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : "Unknown error";
+    throw new Error(
+      `Failed to reach service-account token endpoint (${tokenUri}): ${reason}`
+    );
+  }
 
   if (!response.ok) {
     const errorText = await response.text();
