@@ -52,7 +52,7 @@ export function AppSidebar({ user }: { user: User | undefined }) {
         setShowDeleteAllDialog(false);
         router.replace("/");
         router.refresh();
-        return "All chats deleted successfully";
+        return "Todas as conversas foram apagadas com sucesso";
       },
       error: "Failed to delete all chats",
     });

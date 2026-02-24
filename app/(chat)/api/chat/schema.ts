@@ -15,6 +15,9 @@ const filePartSchema = z.object({
   ]),
   name: z.string().min(1).max(100),
   url: z.string().url(),
+  fileId: z.string().optional(),
+  gcsUrl: z.string().startsWith("gs://").optional(),
+  objectPath: z.string().optional(),
 });
 
 const partSchema = z.union([textPartSchema, filePartSchema]);

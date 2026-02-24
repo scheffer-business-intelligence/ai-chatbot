@@ -2,14 +2,15 @@
 
 import { generateText, type UIMessage } from "ai";
 import { cookies } from "next/headers";
+import { auth } from "@/app/(auth)/auth";
 import type { VisibilityType } from "@/components/visibility-selector";
 import { titlePrompt } from "@/lib/ai/prompts";
 import { getTitleModel } from "@/lib/ai/providers";
 import {
-  deleteMessagesByChatIdAfterTimestamp,
-  getMessageById,
-  updateChatVisibilityById,
-} from "@/lib/db/queries";
+  deleteTrailingMessagesByTimestamp,
+  findMessageReferenceById,
+} from "@/lib/chat-store";
+import { updateChatVisibilityById } from "@/lib/db/queries";
 import { getTextFromMessage } from "@/lib/utils";
 
 function createFallbackTitle(input: string) {
@@ -53,11 +54,25 @@ export async function generateTitleFromUserMessage({
 }
 
 export async function deleteTrailingMessages({ id }: { id: string }) {
-  const [message] = await getMessageById({ id });
+  const session = await auth();
 
-  await deleteMessagesByChatIdAfterTimestamp({
-    chatId: message.chatId,
-    timestamp: message.createdAt,
+  if (!session?.user) {
+    return;
+  }
+
+  const messageReference = await findMessageReferenceById({
+    messageId: id,
+    userId: session.user.id,
+  });
+
+  if (!messageReference) {
+    return;
+  }
+
+  await deleteTrailingMessagesByTimestamp({
+    chatId: messageReference.chatId,
+    userId: session.user.id,
+    timestamp: messageReference.createdAt,
   });
 }
 

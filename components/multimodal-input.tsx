@@ -147,15 +147,20 @@ function PureMultimodalInput({
   const submitForm = useCallback(() => {
     window.history.pushState({}, "", `/chat/${chatId}`);
 
+    const fileParts = attachments.map((attachment) => ({
+      type: "file" as const,
+      url: attachment.url,
+      name: attachment.name,
+      mediaType: attachment.contentType,
+      fileId: attachment.fileId,
+      gcsUrl: attachment.gcsUrl,
+      objectPath: attachment.objectPath,
+    }));
+
     sendMessage({
       role: "user",
       parts: [
-        ...attachments.map((attachment) => ({
-          type: "file" as const,
-          url: attachment.url,
-          name: attachment.name,
-          mediaType: attachment.contentType,
-        })),
+        ...(fileParts as any[]),
         {
           type: "text",
           text: input,
@@ -183,32 +188,60 @@ function PureMultimodalInput({
     resetHeight,
   ]);
 
-  const uploadFile = useCallback(async (file: File) => {
-    const formData = new FormData();
-    formData.append("file", file);
+  const uploadFile = useCallback(
+    async (file: File) => {
+      const formData = new FormData();
+      formData.append("file", file);
+      formData.append("sessionId", chatId);
 
-    try {
-      const response = await fetch("/api/files/upload", {
-        method: "POST",
-        body: formData,
-      });
+      try {
+        const response = await fetch("/api/files/upload", {
+          method: "POST",
+          body: formData,
+        });
 
-      if (response.ok) {
-        const data = await response.json();
-        const { url, pathname, contentType } = data;
+        if (response.ok) {
+          const data = (await response.json()) as {
+            url?: string;
+            pathname?: string;
+            filename?: string;
+            contentType?: string;
+            fileId?: string;
+            gcsUrl?: string;
+            objectPath?: string;
+            files?: Array<{
+              url: string;
+              pathname?: string;
+              filename?: string;
+              contentType: string;
+              fileId?: string;
+              gcsUrl?: string;
+              objectPath?: string;
+            }>;
+          };
+          const uploadedFile = data.files?.[0] ?? data;
 
-        return {
-          url,
-          name: pathname,
-          contentType,
-        };
+          if (!uploadedFile.url || !uploadedFile.contentType) {
+            throw new Error("Resposta de upload inválida.");
+          }
+
+          return {
+            url: uploadedFile.url,
+            name: uploadedFile.pathname || uploadedFile.filename || file.name,
+            contentType: uploadedFile.contentType,
+            fileId: uploadedFile.fileId,
+            gcsUrl: uploadedFile.gcsUrl,
+            objectPath: uploadedFile.objectPath,
+          };
+        }
+        const { error } = await response.json();
+        toast.error(error);
+      } catch (_error) {
+        toast.error("Não foi possível enviar o arquivo. Tente novamente!");
       }
-      const { error } = await response.json();
-      toast.error(error);
-    } catch (_error) {
-      toast.error("Não foi possível enviar o arquivo. Tente novamente!");
-    }
-  }, []);
+    },
+    [chatId]
+  );
 
   const handleFileChange = useCallback(
     async (event: ChangeEvent<HTMLInputElement>) => {

@@ -168,7 +168,7 @@ const PurePreviewMessage = ({
                   chartSpec !== null ||
                   typeof chartWarning === "string")) ||
               mode === "edit",
-            "max-w-[calc(100%-2.5rem)] sm:max-w-[min(fit-content,80%)]":
+            "w-fit max-w-[calc(100%-2.5rem)] sm:max-w-[80%]":
               message.role === "user" && mode !== "edit",
           })}
         >

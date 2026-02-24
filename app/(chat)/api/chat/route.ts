@@ -24,13 +24,17 @@ import { getWeather } from "@/lib/ai/tools/get-weather";
 import { requestSuggestions } from "@/lib/ai/tools/request-suggestions";
 import { updateDocument } from "@/lib/ai/tools/update-document";
 import { getServiceAccountAccessToken } from "@/lib/auth/service-account-token";
+import {
+  countRecentUserMessages,
+  getChatMessagesByChatId,
+  persistMessageToBigQuery,
+  softDeleteSessionMessagesByChatId,
+} from "@/lib/chat-store";
 import { isProductionEnvironment } from "@/lib/constants";
 import {
   createStreamId,
   deleteChatById,
   getChatById,
-  getMessageCountByUserId,
-  getMessagesByChatId,
   getProviderSessionByChatId,
   saveChat,
   saveMessages,
@@ -38,14 +42,10 @@ import {
   updateMessage,
   upsertProviderSession,
 } from "@/lib/db/queries";
-import type { DBMessage } from "@/lib/db/schema";
 import { ChatSDKError } from "@/lib/errors";
+import { generateSignedUrl } from "@/lib/gcp/storage";
 import type { ChatMessage } from "@/lib/types";
-import {
-  convertToUIMessages,
-  generateUUID,
-  getTextFromMessage,
-} from "@/lib/utils";
+import { generateUUID, getTextFromMessage } from "@/lib/utils";
 import {
   AGENT_ENGINE_PROVIDER_ID,
   createVertexSession,
@@ -124,17 +124,27 @@ async function buildVertexMessageFromUserMessage(
 
     if (part.type === "file") {
       const displayName =
-        "name" in part && typeof part.name === "string"
-          ? part.name
-          : "uploaded_file";
+        ("name" in part && typeof part.name === "string" && part.name) ||
+        ("filename" in part &&
+          typeof part.filename === "string" &&
+          part.filename) ||
+        "uploaded_file";
+      const gcsUrl =
+        "gcsUrl" in part && typeof part.gcsUrl === "string" ? part.gcsUrl : "";
       const fileUrl =
         "url" in part && typeof part.url === "string" ? part.url : "";
       const mediaType =
         "mediaType" in part && typeof part.mediaType === "string"
           ? part.mediaType
           : "application/octet-stream";
+      const downloadUrl =
+        gcsUrl.trim().length > 0
+          ? gcsUrl
+          : fileUrl.startsWith("gs://")
+            ? fileUrl
+            : fileUrl;
 
-      if (!fileUrl) {
+      if (!downloadUrl) {
         throw new Error(`Attachment ${displayName} is missing a URL.`);
       }
 
@@ -146,11 +156,14 @@ async function buildVertexMessageFromUserMessage(
 
       let fileResponse: Response;
       try {
-        fileResponse = await fetch(fileUrl, { signal });
+        const fetchUrl = downloadUrl.startsWith("gs://")
+          ? await generateSignedUrl(downloadUrl)
+          : downloadUrl;
+        fileResponse = await fetch(fetchUrl, { signal });
       } catch (error) {
         const reason = error instanceof Error ? error.message : "Unknown error";
         throw new Error(
-          `Failed to fetch attachment ${displayName} from ${fileUrl}: ${reason}`
+          `Failed to fetch attachment ${displayName} from ${downloadUrl}: ${reason}`
         );
       }
 
@@ -233,8 +246,6 @@ function getStreamContext() {
   }
 }
 
-export { getStreamContext };
-
 export async function POST(request: Request) {
   let requestBody: PostRequestBody;
 
@@ -257,8 +268,8 @@ export async function POST(request: Request) {
 
     const userType: UserType = session.user.type;
 
-    const messageCount = await getMessageCountByUserId({
-      id: session.user.id,
+    const messageCount = await countRecentUserMessages({
+      userId: session.user.id,
       differenceInHours: 24,
     });
 
@@ -269,7 +280,7 @@ export async function POST(request: Request) {
     const isToolApprovalFlow = Boolean(messages);
 
     const chat = await getChatById({ id });
-    let messagesFromDb: DBMessage[] = [];
+    let messageHistory: ChatMessage[] = [];
     let titlePromise: Promise<string> | null = null;
 
     if (chat) {
@@ -277,7 +288,10 @@ export async function POST(request: Request) {
         return new ChatSDKError("forbidden:chat").toResponse();
       }
       if (!isToolApprovalFlow) {
-        messagesFromDb = await getMessagesByChatId({ id });
+        messageHistory = await getChatMessagesByChatId({
+          chatId: id,
+          userId: session.user.id,
+        });
       }
     } else if (message?.role === "user") {
       await saveChat({
@@ -300,7 +314,7 @@ export async function POST(request: Request) {
 
     const uiMessages = isToolApprovalFlow
       ? (messages as ChatMessage[])
-      : [...convertToUIMessages(messagesFromDb), message as ChatMessage];
+      : [...messageHistory, message as ChatMessage];
 
     const { longitude, latitude, city, country } = geolocation(request);
 
@@ -325,6 +339,13 @@ export async function POST(request: Request) {
             createdAt: new Date(),
           },
         ],
+      });
+
+      await persistMessageToBigQuery({
+        chatId: id,
+        userId: session.user.id,
+        message: message as ChatMessage,
+        visibility: selectedVisibilityType,
       });
     }
 
@@ -406,6 +427,26 @@ export async function POST(request: Request) {
                 : null,
             chatId: id,
           })),
+        });
+      }
+
+      for (const finishedMessage of finishedMessages) {
+        const shouldPersistChartContext =
+          isAgentEngineModel(selectedChatModel) &&
+          finishedMessage.role === "assistant" &&
+          finishedMessage.id === lastAssistantMessageId;
+
+        await persistMessageToBigQuery({
+          chatId: id,
+          userId: session.user.id,
+          message: finishedMessage,
+          visibility: selectedVisibilityType,
+          chartSpec: shouldPersistChartContext
+            ? extractedContext.chartSpec
+            : undefined,
+          chartError: shouldPersistChartContext
+            ? extractedContext.chartError
+            : undefined,
         });
       }
     };
@@ -698,6 +739,11 @@ export async function DELETE(request: Request) {
   if (chat?.userId !== session.user.id) {
     return new ChatSDKError("forbidden:chat").toResponse();
   }
+
+  await softDeleteSessionMessagesByChatId({
+    chatId: id,
+    userId: session.user.id,
+  });
 
   const deletedChat = await deleteChatById({ id });
 
