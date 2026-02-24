@@ -5,14 +5,12 @@ import { DocumentSkeleton } from "@/components/document-skeleton";
 import {
   ClockRewind,
   CopyIcon,
-  MessageIcon,
   PenIcon,
   RedoIcon,
   UndoIcon,
 } from "@/components/icons";
 import { Editor } from "@/components/text-editor";
 import type { Suggestion } from "@/lib/db/schema";
-import { getSuggestions } from "../actions";
 
 type TextArtifactMetadata = {
   suggestions: Suggestion[];
@@ -21,22 +19,12 @@ type TextArtifactMetadata = {
 export const textArtifact = new Artifact<"text", TextArtifactMetadata>({
   kind: "text",
   description: "Useful for text content, like drafting essays and emails.",
-  initialize: async ({ documentId, setMetadata }) => {
-    const suggestions = await getSuggestions({ documentId });
-
+  initialize: ({ setMetadata }) => {
     setMetadata({
-      suggestions,
+      suggestions: [],
     });
   },
-  onStreamPart: ({ streamPart, setMetadata, setArtifact }) => {
-    if (streamPart.type === "data-suggestion") {
-      setMetadata((metadata) => {
-        return {
-          suggestions: [...metadata.suggestions, streamPart.data],
-        };
-      });
-    }
-
+  onStreamPart: ({ streamPart, setArtifact }) => {
     if (streamPart.type === "data-textDelta") {
       setArtifact((draftArtifact) => {
         return {
@@ -155,21 +143,6 @@ export const textArtifact = new Artifact<"text", TextArtifactMetadata>({
             {
               type: "text",
               text: "Please add final polish and check for grammar, add section titles for better structure, and ensure everything reads smoothly.",
-            },
-          ],
-        });
-      },
-    },
-    {
-      icon: <MessageIcon />,
-      description: "Request suggestions",
-      onClick: ({ sendMessage }) => {
-        sendMessage({
-          role: "user",
-          parts: [
-            {
-              type: "text",
-              text: "Please add suggestions you have that could improve the writing.",
             },
           ],
         });

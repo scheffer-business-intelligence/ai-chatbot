@@ -130,8 +130,8 @@ export function AppSidebar({ user }: { user: User | undefined }) {
           <AlertDialogHeader>
             <AlertDialogTitle>Apagar todas as conversas?</AlertDialogTitle>
             <AlertDialogDescription>
-              Esta ação não pode ser desfeita. Isso excluirá permanentemente todos
-              os seus chats e os removerá de nossos servidores.
+              Esta ação não pode ser desfeita. Isso excluirá permanentemente
+              todos os seus chats e os removerá de nossos servidores.
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>

@@ -3,13 +3,10 @@ import {
   convertToModelMessages,
   createUIMessageStream,
   createUIMessageStreamResponse,
-  generateId,
   stepCountIs,
   streamText,
   type UIMessageChunk,
 } from "ai";
-import { after } from "next/server";
-import { createResumableStreamContext } from "resumable-stream";
 import { auth, type UserType } from "@/app/(auth)/auth";
 import {
   isDirectProviderModel,
@@ -21,7 +18,6 @@ import { type RequestHints, systemPrompt } from "@/lib/ai/prompts";
 import { getLanguageModel } from "@/lib/ai/providers";
 import { createDocument } from "@/lib/ai/tools/create-document";
 import { getWeather } from "@/lib/ai/tools/get-weather";
-import { requestSuggestions } from "@/lib/ai/tools/request-suggestions";
 import { updateDocument } from "@/lib/ai/tools/update-document";
 import { getServiceAccountAccessToken } from "@/lib/auth/service-account-token";
 import {
@@ -32,7 +28,6 @@ import {
 } from "@/lib/chat-store";
 import { isProductionEnvironment } from "@/lib/constants";
 import {
-  createStreamId,
   deleteChatById,
   getChatById,
   getProviderSessionByChatId,
@@ -236,14 +231,6 @@ async function buildVertexMessageFromUserMessage(
     role: "user",
     parts,
   };
-}
-
-function getStreamContext() {
-  try {
-    return createResumableStreamContext({ waitUntil: after });
-  } catch (_) {
-    return null;
-  }
 }
 
 export async function POST(request: Request) {
@@ -639,12 +626,7 @@ export async function POST(request: Request) {
             stopWhen: stepCountIs(5),
             experimental_activeTools: isReasoningModel
               ? []
-              : [
-                  "getWeather",
-                  "createDocument",
-                  "updateDocument",
-                  "requestSuggestions",
-                ],
+              : ["getWeather", "createDocument", "updateDocument"],
             providerOptions: isReasoningModel
               ? {
                   anthropic: {
@@ -656,7 +638,6 @@ export async function POST(request: Request) {
               getWeather,
               createDocument: createDocument({ session, dataStream }),
               updateDocument: updateDocument({ session, dataStream }),
-              requestSuggestions: requestSuggestions({ session, dataStream }),
             },
             experimental_telemetry: {
               isEnabled: isProductionEnvironment,
@@ -678,27 +659,7 @@ export async function POST(request: Request) {
       });
     }
 
-    return createUIMessageStreamResponse({
-      stream,
-      async consumeSseStream({ stream: sseStream }) {
-        if (!process.env.REDIS_URL) {
-          return;
-        }
-        try {
-          const streamContext = getStreamContext();
-          if (streamContext) {
-            const streamId = generateId();
-            await createStreamId({ streamId, chatId: id });
-            await streamContext.createNewResumableStream(
-              streamId,
-              () => sseStream
-            );
-          }
-        } catch (_) {
-          // ignore redis errors
-        }
-      },
-    });
+    return createUIMessageStreamResponse({ stream });
   } catch (error) {
     const vercelId = request.headers.get("x-vercel-id");
 

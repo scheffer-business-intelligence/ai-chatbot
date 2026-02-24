@@ -31,10 +31,6 @@ This is a guide for using artifacts tools: \`createDocument\` and \`updateDocume
 
 Do not update document right after creating it. Wait for user feedback or request to update it.
 
-**Using \`requestSuggestions\`:**
-- ONLY use when the user explicitly asks for suggestions on an existing document
-- Requires a valid document ID from a previously created document
-- Never use for general questions or information requests
 `;
 
 export const regularPrompt = `You are a friendly assistant! Keep your responses concise and helpful.

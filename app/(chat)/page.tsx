@@ -27,7 +27,6 @@ async function NewChatPage() {
     return (
       <>
         <Chat
-          autoResume={false}
           id={id}
           initialChatModel={DEFAULT_CHAT_MODEL}
           initialMessages={[]}
@@ -43,7 +42,6 @@ async function NewChatPage() {
   return (
     <>
       <Chat
-        autoResume={false}
         id={id}
         initialChatModel={selectedModelId}
         initialMessages={[]}

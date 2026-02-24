@@ -1,51 +1,739 @@
 import "server-only";
 
-import {
-  and,
-  asc,
-  count,
-  desc,
-  eq,
-  gt,
-  gte,
-  inArray,
-  lt,
-  type SQL,
-  sql,
-} from "drizzle-orm";
-import { drizzle } from "drizzle-orm/postgres-js";
-import postgres from "postgres";
 import type { ArtifactKind } from "@/components/artifact";
 import type { VisibilityType } from "@/components/visibility-selector";
+import { getServiceAccountAccessToken } from "@/lib/auth/service-account-token";
+import type { BigQueryChatMessageRow } from "@/lib/gcp/bigquery";
+import { upsertChatMessageRow } from "@/lib/gcp/bigquery";
 import { ChatSDKError } from "../errors";
 import { generateUUID } from "../utils";
-import {
-  type Chat,
-  chat,
-  chatProviderSession,
-  type DBMessage,
-  document,
-  message,
-  type Suggestion,
-  stream,
-  suggestion,
-  type User,
-  user,
-  vote,
+import type {
+  Chat,
+  ChatProviderSession,
+  DBMessage,
+  Document,
+  User,
+  Vote,
 } from "./schema";
 import { generateHashedPassword } from "./utils";
 
-// Optionally, if not using email/pass login, you can
-// use the Drizzle adapter for Auth.js / NextAuth
-// https://authjs.dev/reference/adapter/drizzle
+const BQ_PROJECT_ID =
+  process.env.BQ_PROJECT_ID || process.env.PROJECT_ID || "bi-scheffer";
+const BQ_DATASET = process.env.BQ_DATASET || "scheffer_agente";
+const BQ_BASE_URL = "https://bigquery.googleapis.com/bigquery/v2";
+const BQ_MESSAGES_TABLE = process.env.BQ_MESSAGES_TABLE || "chat_messages";
+const BQ_FILES_TABLE = process.env.BQ_FILES_TABLE || "chat_files";
+const BQ_AUTO_CREATE_TABLES = process.env.BQ_AUTO_CREATE_TABLES !== "false";
 
-// biome-ignore lint: Forbidden non-null assertion.
-const client = postgres(process.env.POSTGRES_URL!);
-const db = drizzle(client);
+const MESSAGES_TABLE_REF = `${BQ_PROJECT_ID}.${BQ_DATASET}.${BQ_MESSAGES_TABLE}`;
+const FILES_TABLE_REF = `${BQ_PROJECT_ID}.${BQ_DATASET}.${BQ_FILES_TABLE}`;
+
+const META_SESSION_PREFIX = "__meta__";
+const META_USERS_SESSION = `${META_SESSION_PREFIX}users`;
+const META_CHATS_SESSION = `${META_SESSION_PREFIX}chats`;
+const META_PROVIDER_SESSION = `${META_SESSION_PREFIX}providers`;
+const META_DOCUMENTS_SESSION = `${META_SESSION_PREFIX}documents`;
+
+type BigQueryParameterType = "STRING" | "INT64" | "BOOL";
+
+type BigQueryQueryParameter = {
+  name: string;
+  parameterType: { type: BigQueryParameterType };
+  parameterValue: { value: string };
+};
+
+type BigQuerySchema = {
+  fields: Array<{ name: string }>;
+};
+
+type BigQueryRow = {
+  f: Array<{ v: string | null }>;
+};
+
+type GenericBigQueryRow = Record<string, string | null>;
+
+type QueryParameter = {
+  name: string;
+  type: BigQueryParameterType;
+  value: string | number | boolean;
+};
+
+type MetaChatPayload = {
+  chatId: string;
+  userId: string;
+  title: string;
+  visibility: VisibilityType;
+  createdAt: string;
+  updatedAt: string;
+};
+
+type MetaProviderPayload = {
+  chatId: string;
+  provider: string;
+  sessionId: string;
+  userId: string;
+  createdAt: string;
+  updatedAt: string;
+};
+
+type MetaDocumentPayload = {
+  id: string;
+  title: string;
+  kind: ArtifactKind;
+  content: string;
+  userId: string;
+  createdAt: string;
+};
+
+const TABLE_DDL_STATEMENTS = [
+  `
+    CREATE TABLE IF NOT EXISTS \`${MESSAGES_TABLE_REF}\` (
+      message_id STRING,
+      session_id STRING,
+      user_id STRING,
+      role STRING,
+      content STRING,
+      created_at STRING,
+      updated_at STRING,
+      parts_json STRING,
+      attachments_json STRING,
+      chart_spec_json STRING,
+      chart_error STRING,
+      answered_in INT64,
+      visibility STRING,
+      is_deleted BOOL
+    )
+  `,
+  `
+    CREATE TABLE IF NOT EXISTS \`${FILES_TABLE_REF}\` (
+      file_id STRING,
+      session_id STRING,
+      user_id STRING,
+      chat_id STRING,
+      message_id STRING,
+      filename STRING,
+      content_type STRING,
+      file_size INT64,
+      gcs_url STRING,
+      object_path STRING,
+      created_at STRING,
+      is_deleted BOOL
+    )
+  `,
+];
+
+let ensureTablesPromise: Promise<void> | null = null;
+let tablesEnsured = false;
+let autoCreateDisabled = false;
+
+function buildQueryParameters(
+  params: QueryParameter[]
+): BigQueryQueryParameter[] {
+  return params.map((param) => ({
+    name: param.name,
+    parameterType: { type: param.type },
+    parameterValue: { value: String(param.value) },
+  }));
+}
+
+function mapRows(
+  rows: BigQueryRow[] | undefined,
+  schema: BigQuerySchema | undefined
+): GenericBigQueryRow[] {
+  if (!rows || !schema) {
+    return [];
+  }
+
+  return rows.map((row) => {
+    const mapped: GenericBigQueryRow = {};
+
+    row.f.forEach((cell, index) => {
+      const fieldName = schema.fields[index]?.name;
+      if (fieldName) {
+        mapped[fieldName] = cell.v ?? null;
+      }
+    });
+
+    return mapped;
+  });
+}
+
+function mapResponseRows(
+  response: Record<string, unknown>
+): GenericBigQueryRow[] {
+  return mapRows(
+    response.rows as BigQueryRow[] | undefined,
+    response.schema as BigQuerySchema | undefined
+  );
+}
+
+function parseIntOrZero(value: string | null | undefined): number {
+  if (!value) {
+    return 0;
+  }
+
+  const parsed = Number.parseInt(value, 10);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function parseDate(value: string | null | undefined): Date {
+  if (!value) {
+    return new Date();
+  }
+
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) {
+    return new Date();
+  }
+
+  return parsed;
+}
+
+function toIsoString(date: Date | string): string {
+  if (date instanceof Date) {
+    return Number.isNaN(date.getTime())
+      ? new Date().toISOString()
+      : date.toISOString();
+  }
+
+  const parsed = new Date(date);
+  if (Number.isNaN(parsed.getTime())) {
+    return new Date().toISOString();
+  }
+
+  return parsed.toISOString();
+}
+
+function normalizeVisibility(value: string | null | undefined): VisibilityType {
+  return value === "public" ? "public" : "private";
+}
+
+function parseJsonOrFallback<T>(
+  value: string | null | undefined,
+  fallback: T
+): T {
+  if (!value) {
+    return fallback;
+  }
+
+  try {
+    return JSON.parse(value) as T;
+  } catch {
+    return fallback;
+  }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value && typeof value === "object" && !Array.isArray(value));
+}
+
+function isMetaSessionId(sessionId: string | null | undefined): boolean {
+  return (sessionId ?? "").startsWith(META_SESSION_PREFIX);
+}
+
+function extractTextFromParts(parts: DBMessage["parts"]): string {
+  if (!Array.isArray(parts)) {
+    return "";
+  }
+
+  return parts
+    .filter((part): part is { type?: unknown; text?: unknown } =>
+      Boolean(part && typeof part === "object")
+    )
+    .filter((part) => part.type === "text" && typeof part.text === "string")
+    .map((part) => (typeof part.text === "string" ? part.text.trim() : ""))
+    .filter((part) => part.length > 0)
+    .join("\n");
+}
+
+function stripPrefix(value: string | null | undefined, prefix: string): string {
+  if (!value) {
+    return "";
+  }
+
+  return value.startsWith(prefix) ? value.slice(prefix.length) : value;
+}
+
+function buildMetaRow({
+  messageId,
+  sessionId,
+  userId,
+  content,
+  payload,
+  createdAt,
+  updatedAt,
+  visibility,
+}: {
+  messageId: string;
+  sessionId: string;
+  userId: string;
+  content: string;
+  payload: Record<string, unknown>;
+  createdAt: string;
+  updatedAt?: string;
+  visibility?: VisibilityType | null;
+}): BigQueryChatMessageRow {
+  return {
+    message_id: messageId,
+    session_id: sessionId,
+    user_id: userId,
+    role: "system",
+    content,
+    created_at: createdAt,
+    updated_at: updatedAt ?? new Date().toISOString(),
+    parts_json: JSON.stringify(payload),
+    attachments_json: "[]",
+    chart_spec_json: null,
+    chart_error: null,
+    answered_in: null,
+    visibility: visibility ?? null,
+    is_deleted: false,
+  };
+}
+
+function mapMessageRowToDbMessage(row: GenericBigQueryRow): DBMessage {
+  const fallbackParts = row.content
+    ? ([{ type: "text", text: row.content }] as DBMessage["parts"])
+    : ([] as DBMessage["parts"]);
+
+  const parts = parseJsonOrFallback<DBMessage["parts"]>(
+    row.parts_json,
+    fallbackParts
+  );
+
+  return {
+    id: row.message_id ?? "",
+    chatId: row.session_id ?? "",
+    role: (row.role ?? "assistant") as DBMessage["role"],
+    parts,
+    attachments: parseJsonOrFallback<DBMessage["attachments"]>(
+      row.attachments_json,
+      [] as DBMessage["attachments"]
+    ),
+    chartSpec: parseJsonOrFallback<DBMessage["chartSpec"]>(
+      row.chart_spec_json,
+      null as DBMessage["chartSpec"]
+    ),
+    chartError: row.chart_error,
+    createdAt: parseDate(row.created_at),
+  };
+}
+
+function toBigQueryMessageRow({
+  message,
+  userId,
+  visibility,
+}: {
+  message: DBMessage;
+  userId: string;
+  visibility: VisibilityType;
+}): BigQueryChatMessageRow {
+  const createdAt = toIsoString(message.createdAt);
+
+  return {
+    message_id: message.id,
+    session_id: message.chatId,
+    user_id: userId,
+    role: message.role,
+    content: extractTextFromParts(message.parts),
+    created_at: createdAt,
+    updated_at: new Date().toISOString(),
+    parts_json: JSON.stringify(message.parts ?? []),
+    attachments_json: JSON.stringify(message.attachments ?? []),
+    chart_spec_json:
+      message.chartSpec === null || message.chartSpec === undefined
+        ? null
+        : JSON.stringify(message.chartSpec),
+    chart_error: message.chartError ?? null,
+    answered_in: null,
+    visibility,
+    is_deleted: false,
+  };
+}
+
+function mapChatMetaRowToChat(row: GenericBigQueryRow): Chat | null {
+  const rawPayload = parseJsonOrFallback<unknown>(row.parts_json, {});
+  const payload = isRecord(rawPayload)
+    ? (rawPayload as Partial<MetaChatPayload>)
+    : {};
+
+  const id =
+    (typeof payload.chatId === "string" && payload.chatId) ||
+    stripPrefix(row.message_id, "chat:");
+  const userId =
+    (typeof payload.userId === "string" && payload.userId) || row.user_id || "";
+
+  if (!id || !userId) {
+    return null;
+  }
+
+  const title =
+    (typeof payload.title === "string" && payload.title) ||
+    row.content ||
+    "Nova Conversa";
+  const visibility =
+    typeof payload.visibility === "string"
+      ? normalizeVisibility(payload.visibility)
+      : normalizeVisibility(row.visibility);
+  const createdAt =
+    typeof payload.createdAt === "string"
+      ? parseDate(payload.createdAt)
+      : parseDate(row.created_at);
+
+  return {
+    id,
+    userId,
+    title,
+    visibility,
+    createdAt,
+  };
+}
+
+async function bigQueryRequest(
+  accessToken: string,
+  path: string,
+  body: Record<string, unknown>
+): Promise<Record<string, unknown>> {
+  const response = await fetch(`${BQ_BASE_URL}/${path}`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(body),
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(`BigQuery error: ${response.status} - ${errorText}`);
+  }
+
+  return (await response.json()) as Record<string, unknown>;
+}
+
+async function runQueryRaw(
+  accessToken: string,
+  query: string,
+  params: QueryParameter[] = []
+): Promise<Record<string, unknown>> {
+  return await bigQueryRequest(
+    accessToken,
+    `projects/${BQ_PROJECT_ID}/queries`,
+    {
+      query,
+      useLegacySql: false,
+      ...(params.length > 0
+        ? {
+            parameterMode: "NAMED",
+            queryParameters: buildQueryParameters(params),
+          }
+        : {}),
+    }
+  );
+}
+
+async function ensureBigQueryTables(accessToken?: string) {
+  if (!BQ_AUTO_CREATE_TABLES || tablesEnsured || autoCreateDisabled) {
+    return;
+  }
+
+  if (!ensureTablesPromise) {
+    ensureTablesPromise = (async () => {
+      const token = accessToken ?? (await getServiceAccountAccessToken());
+
+      for (const ddl of TABLE_DDL_STATEMENTS) {
+        await runQueryRaw(token, ddl);
+      }
+
+      tablesEnsured = true;
+    })();
+  }
+
+  try {
+    await ensureTablesPromise;
+  } catch (error) {
+    autoCreateDisabled = true;
+    console.warn(
+      "BigQuery auto-create tables disabled after failure. Ensure tables exist manually.",
+      error
+    );
+  } finally {
+    ensureTablesPromise = null;
+  }
+}
+
+async function runQuery(
+  query: string,
+  params: QueryParameter[] = []
+): Promise<Record<string, unknown>> {
+  const accessToken = await getServiceAccountAccessToken();
+  await ensureBigQueryTables(accessToken);
+  return await runQueryRaw(accessToken, query, params);
+}
+
+async function queryRows(
+  query: string,
+  params: QueryParameter[] = [],
+  fallbackQuery?: string
+): Promise<GenericBigQueryRow[]> {
+  try {
+    const response = await runQuery(query, params);
+    return mapResponseRows(response);
+  } catch (error) {
+    if (!fallbackQuery) {
+      throw error;
+    }
+
+    const response = await runQuery(fallbackQuery, params);
+    return mapResponseRows(response);
+  }
+}
+
+async function upsertMetaMessage(row: BigQueryChatMessageRow) {
+  const accessToken = await getServiceAccountAccessToken();
+  await ensureBigQueryTables(accessToken);
+  await upsertChatMessageRow(accessToken, row);
+}
+
+async function getChatMetaById(chatId: string): Promise<Chat | null> {
+  const rows = await queryRows(
+    `
+      SELECT
+        message_id,
+        user_id,
+        content,
+        parts_json,
+        visibility,
+        created_at
+      FROM \`${MESSAGES_TABLE_REF}\`
+      WHERE session_id = @session_id
+        AND message_id = @message_id
+        AND (is_deleted IS NULL OR is_deleted = FALSE)
+      LIMIT 1
+    `,
+    [
+      { name: "session_id", type: "STRING", value: META_CHATS_SESSION },
+      { name: "message_id", type: "STRING", value: `chat:${chatId}` },
+    ],
+    `
+      SELECT
+        message_id,
+        user_id,
+        content,
+        parts_json,
+        visibility,
+        created_at
+      FROM \`${MESSAGES_TABLE_REF}\`
+      WHERE session_id = @session_id
+        AND message_id = @message_id
+      LIMIT 1
+    `
+  );
+
+  const mapped = rows[0] ? mapChatMetaRowToChat(rows[0]) : null;
+  return mapped;
+}
+
+async function getFallbackChatFromMessages(
+  chatId: string
+): Promise<Chat | null> {
+  const rows = await queryRows(
+    `
+      SELECT
+        session_id,
+        ANY_VALUE(user_id) AS user_id,
+        MIN(created_at) AS created_at,
+        ANY_VALUE(visibility) AS visibility,
+        ARRAY_AGG(
+          IF(role = 'user', content, NULL)
+          IGNORE NULLS
+          ORDER BY TIMESTAMP(created_at)
+          LIMIT 1
+        )[SAFE_OFFSET(0)] AS title
+      FROM \`${MESSAGES_TABLE_REF}\`
+      WHERE session_id = @chat_id
+        AND (is_deleted IS NULL OR is_deleted = FALSE)
+      GROUP BY session_id
+      LIMIT 1
+    `,
+    [{ name: "chat_id", type: "STRING", value: chatId }],
+    `
+      SELECT
+        session_id,
+        ANY_VALUE(user_id) AS user_id,
+        MIN(created_at) AS created_at,
+        ANY_VALUE(visibility) AS visibility,
+        ARRAY_AGG(
+          IF(role = 'user', content, NULL)
+          IGNORE NULLS
+          ORDER BY created_at
+          LIMIT 1
+        )[SAFE_OFFSET(0)] AS title
+      FROM \`${MESSAGES_TABLE_REF}\`
+      WHERE session_id = @chat_id
+      GROUP BY session_id
+      LIMIT 1
+    `
+  );
+
+  const row = rows[0];
+
+  if (!row?.session_id || isMetaSessionId(row.session_id)) {
+    return null;
+  }
+
+  return {
+    id: row.session_id,
+    userId: row.user_id ?? "",
+    title: row.title ?? "Nova Conversa",
+    visibility: normalizeVisibility(row.visibility),
+    createdAt: parseDate(row.created_at),
+  };
+}
+
+async function getSessionMetadata(chatId: string) {
+  const chat = await getChatById({ id: chatId });
+
+  if (chat) {
+    return {
+      userId: chat.userId,
+      visibility: chat.visibility,
+    };
+  }
+
+  const rows = await queryRows(
+    `
+      SELECT
+        user_id,
+        visibility
+      FROM \`${MESSAGES_TABLE_REF}\`
+      WHERE session_id = @chat_id
+        AND (is_deleted IS NULL OR is_deleted = FALSE)
+      ORDER BY TIMESTAMP(created_at) DESC
+      LIMIT 1
+    `,
+    [{ name: "chat_id", type: "STRING", value: chatId }],
+    `
+      SELECT
+        user_id,
+        visibility
+      FROM \`${MESSAGES_TABLE_REF}\`
+      WHERE session_id = @chat_id
+      ORDER BY created_at DESC
+      LIMIT 1
+    `
+  );
+
+  const row = rows[0];
+  if (!row?.user_id) {
+    return null;
+  }
+
+  return {
+    userId: row.user_id,
+    visibility: normalizeVisibility(row.visibility),
+  };
+}
+
+function mapDocumentRow(row: GenericBigQueryRow): Document | null {
+  const rawPayload = parseJsonOrFallback<unknown>(row.parts_json, {});
+  const payload = isRecord(rawPayload)
+    ? (rawPayload as Partial<MetaDocumentPayload>)
+    : {};
+
+  const id =
+    (typeof payload.id === "string" && payload.id) ||
+    stripPrefix(row.message_id, "doc:").split(":")[0] ||
+    "";
+  const userId =
+    (typeof payload.userId === "string" && payload.userId) || row.user_id || "";
+
+  if (!id || !userId) {
+    return null;
+  }
+
+  const title =
+    (typeof payload.title === "string" && payload.title) ||
+    row.content ||
+    "Documento";
+  const kind = (typeof payload.kind === "string" && payload.kind) || "text";
+  const content =
+    (typeof payload.content === "string" && payload.content) || "";
+  const createdAt =
+    typeof payload.createdAt === "string"
+      ? parseDate(payload.createdAt)
+      : parseDate(row.created_at);
+
+  return {
+    id,
+    createdAt,
+    title,
+    content,
+    kind: kind as ArtifactKind,
+    userId,
+  };
+}
 
 export async function getUser(email: string): Promise<User[]> {
   try {
-    return await db.select().from(user).where(eq(user.email, email));
+    const rows = await queryRows(
+      `
+        SELECT
+          message_id,
+          user_id,
+          content,
+          parts_json
+        FROM \`${MESSAGES_TABLE_REF}\`
+        WHERE session_id = @session_id
+          AND role = 'system'
+          AND content = @email
+          AND (is_deleted IS NULL OR is_deleted = FALSE)
+        ORDER BY TIMESTAMP(created_at) DESC
+      `,
+      [
+        { name: "session_id", type: "STRING", value: META_USERS_SESSION },
+        { name: "email", type: "STRING", value: email },
+      ],
+      `
+        SELECT
+          message_id,
+          user_id,
+          content,
+          parts_json
+        FROM \`${MESSAGES_TABLE_REF}\`
+        WHERE session_id = @session_id
+          AND role = 'system'
+          AND content = @email
+        ORDER BY created_at DESC
+      `
+    );
+
+    const users: User[] = [];
+
+    for (const row of rows) {
+      const payload = parseJsonOrFallback<Record<string, unknown>>(
+        row.parts_json,
+        {}
+      );
+
+      const id =
+        row.user_id ||
+        (typeof payload.userId === "string" ? payload.userId : "") ||
+        stripPrefix(row.message_id, "user:");
+
+      if (!id || !row.content) {
+        continue;
+      }
+
+      users.push({
+        id,
+        email: row.content,
+        password:
+          typeof payload.password === "string" ? payload.password : null,
+      });
+    }
+
+    return users;
   } catch (_error) {
     throw new ChatSDKError(
       "bad_request:database",
@@ -55,24 +743,59 @@ export async function getUser(email: string): Promise<User[]> {
 }
 
 export async function createUser(email: string, password: string) {
+  const userId = generateUUID();
+  const now = new Date().toISOString();
   const hashedPassword = generateHashedPassword(password);
 
   try {
-    return await db.insert(user).values({ email, password: hashedPassword });
+    await upsertMetaMessage(
+      buildMetaRow({
+        messageId: `user:${userId}`,
+        sessionId: META_USERS_SESSION,
+        userId,
+        content: email,
+        payload: {
+          userId,
+          email,
+          password: hashedPassword,
+          createdAt: now,
+          updatedAt: now,
+        },
+        createdAt: now,
+      })
+    );
+
+    return [{ id: userId, email }];
   } catch (_error) {
     throw new ChatSDKError("bad_request:database", "Failed to create user");
   }
 }
 
 export async function createGuestUser() {
+  const userId = generateUUID();
   const email = `guest-${Date.now()}`;
   const password = generateHashedPassword(generateUUID());
+  const now = new Date().toISOString();
 
   try {
-    return await db.insert(user).values({ email, password }).returning({
-      id: user.id,
-      email: user.email,
-    });
+    await upsertMetaMessage(
+      buildMetaRow({
+        messageId: `user:${userId}`,
+        sessionId: META_USERS_SESSION,
+        userId,
+        content: email,
+        payload: {
+          userId,
+          email,
+          password,
+          createdAt: now,
+          updatedAt: now,
+        },
+        createdAt: now,
+      })
+    );
+
+    return [{ id: userId, email }];
   } catch (_error) {
     throw new ChatSDKError(
       "bad_request:database",
@@ -92,14 +815,32 @@ export async function saveChat({
   title: string;
   visibility: VisibilityType;
 }) {
+  const now = new Date().toISOString();
+
   try {
-    return await db.insert(chat).values({
-      id,
-      createdAt: new Date(),
+    const existingChat = await getChatMetaById(id);
+
+    const payload: MetaChatPayload = {
+      chatId: id,
       userId,
       title,
       visibility,
-    });
+      createdAt: existingChat ? toIsoString(existingChat.createdAt) : now,
+      updatedAt: now,
+    };
+
+    await upsertMetaMessage(
+      buildMetaRow({
+        messageId: `chat:${id}`,
+        sessionId: META_CHATS_SESSION,
+        userId,
+        content: title,
+        payload,
+        createdAt: payload.createdAt,
+        updatedAt: payload.updatedAt,
+        visibility,
+      })
+    );
   } catch (_error) {
     throw new ChatSDKError("bad_request:database", "Failed to save chat");
   }
@@ -107,18 +848,45 @@ export async function saveChat({
 
 export async function deleteChatById({ id }: { id: string }) {
   try {
-    await db.delete(vote).where(eq(vote.chatId, id));
-    await db.delete(message).where(eq(message.chatId, id));
-    await db
-      .delete(chatProviderSession)
-      .where(eq(chatProviderSession.chatId, id));
-    await db.delete(stream).where(eq(stream.chatId, id));
+    const chat = await getChatById({ id });
 
-    const [chatsDeleted] = await db
-      .delete(chat)
-      .where(eq(chat.id, id))
-      .returning();
-    return chatsDeleted;
+    await runQuery(
+      `
+        DELETE FROM \`${MESSAGES_TABLE_REF}\`
+        WHERE session_id = @chat_id
+      `,
+      [{ name: "chat_id", type: "STRING", value: id }]
+    );
+
+    await runQuery(
+      `
+        DELETE FROM \`${MESSAGES_TABLE_REF}\`
+        WHERE session_id = @provider_session
+          AND JSON_VALUE(parts_json, '$.chatId') = @chat_id
+      `,
+      [
+        {
+          name: "provider_session",
+          type: "STRING",
+          value: META_PROVIDER_SESSION,
+        },
+        { name: "chat_id", type: "STRING", value: id },
+      ]
+    );
+
+    await runQuery(
+      `
+        DELETE FROM \`${MESSAGES_TABLE_REF}\`
+        WHERE session_id = @chats_session
+          AND message_id = @message_id
+      `,
+      [
+        { name: "chats_session", type: "STRING", value: META_CHATS_SESSION },
+        { name: "message_id", type: "STRING", value: `chat:${id}` },
+      ]
+    );
+
+    return chat;
   } catch (_error) {
     throw new ChatSDKError(
       "bad_request:database",
@@ -129,30 +897,41 @@ export async function deleteChatById({ id }: { id: string }) {
 
 export async function deleteAllChatsByUserId({ userId }: { userId: string }) {
   try {
-    const userChats = await db
-      .select({ id: chat.id })
-      .from(chat)
-      .where(eq(chat.userId, userId));
+    const rows = await queryRows(
+      `
+        SELECT
+          message_id
+        FROM \`${MESSAGES_TABLE_REF}\`
+        WHERE session_id = @session_id
+          AND user_id = @user_id
+          AND (is_deleted IS NULL OR is_deleted = FALSE)
+      `,
+      [
+        { name: "session_id", type: "STRING", value: META_CHATS_SESSION },
+        { name: "user_id", type: "STRING", value: userId },
+      ],
+      `
+        SELECT
+          message_id
+        FROM \`${MESSAGES_TABLE_REF}\`
+        WHERE session_id = @session_id
+          AND user_id = @user_id
+      `
+    );
 
-    if (userChats.length === 0) {
+    const chatIds = rows
+      .map((row) => stripPrefix(row.message_id, "chat:"))
+      .filter((chatId) => chatId.length > 0);
+
+    if (chatIds.length === 0) {
       return { deletedCount: 0 };
     }
 
-    const chatIds = userChats.map((c) => c.id);
+    for (const chatId of chatIds) {
+      await deleteChatById({ id: chatId });
+    }
 
-    await db.delete(vote).where(inArray(vote.chatId, chatIds));
-    await db.delete(message).where(inArray(message.chatId, chatIds));
-    await db
-      .delete(chatProviderSession)
-      .where(inArray(chatProviderSession.chatId, chatIds));
-    await db.delete(stream).where(inArray(stream.chatId, chatIds));
-
-    const deletedChats = await db
-      .delete(chat)
-      .where(eq(chat.userId, userId))
-      .returning();
-
-    return { deletedCount: deletedChats.length };
+    return { deletedCount: chatIds.length };
   } catch (_error) {
     throw new ChatSDKError(
       "bad_request:database",
@@ -175,61 +954,169 @@ export async function getChatsByUserId({
   try {
     const extendedLimit = limit + 1;
 
-    const query = (whereCondition?: SQL<any>) =>
-      db
-        .select()
-        .from(chat)
-        .where(
-          whereCondition
-            ? and(whereCondition, eq(chat.userId, id))
-            : eq(chat.userId, id)
-        )
-        .orderBy(desc(chat.createdAt))
-        .limit(extendedLimit);
+    let cursorCreatedAt: string | null = null;
+    let cursorOperator: ">" | "<" | null = null;
 
-    let filteredChats: Chat[] = [];
+    if (startingAfter || endingBefore) {
+      const cursorId = startingAfter ?? endingBefore;
+      const cursorChat = await getChatById({ id: cursorId ?? "" });
 
-    if (startingAfter) {
-      const [selectedChat] = await db
-        .select()
-        .from(chat)
-        .where(eq(chat.id, startingAfter))
-        .limit(1);
-
-      if (!selectedChat) {
+      if (!cursorChat) {
         throw new ChatSDKError(
           "not_found:database",
-          `Chat with id ${startingAfter} not found`
+          `Chat with id ${cursorId} not found`
         );
       }
 
-      filteredChats = await query(gt(chat.createdAt, selectedChat.createdAt));
-    } else if (endingBefore) {
-      const [selectedChat] = await db
-        .select()
-        .from(chat)
-        .where(eq(chat.id, endingBefore))
-        .limit(1);
-
-      if (!selectedChat) {
-        throw new ChatSDKError(
-          "not_found:database",
-          `Chat with id ${endingBefore} not found`
-        );
-      }
-
-      filteredChats = await query(lt(chat.createdAt, selectedChat.createdAt));
-    } else {
-      filteredChats = await query();
+      cursorCreatedAt = cursorChat.createdAt.toISOString();
+      cursorOperator = startingAfter ? ">" : "<";
     }
 
-    const hasMore = filteredChats.length > limit;
+    const metaRows = await queryRows(
+      `
+        SELECT
+          message_id,
+          user_id,
+          content,
+          parts_json,
+          visibility,
+          created_at
+        FROM \`${MESSAGES_TABLE_REF}\`
+        WHERE session_id = @session_id
+          AND user_id = @user_id
+          AND (is_deleted IS NULL OR is_deleted = FALSE)
+          ${cursorOperator ? `AND TIMESTAMP(created_at) ${cursorOperator} TIMESTAMP(@cursor_created_at)` : ""}
+        ORDER BY TIMESTAMP(created_at) DESC
+        LIMIT @limit
+      `,
+      [
+        { name: "session_id", type: "STRING", value: META_CHATS_SESSION },
+        { name: "user_id", type: "STRING", value: id },
+        ...(cursorCreatedAt
+          ? [
+              {
+                name: "cursor_created_at",
+                type: "STRING" as const,
+                value: cursorCreatedAt,
+              },
+            ]
+          : []),
+        { name: "limit", type: "INT64", value: extendedLimit },
+      ],
+      `
+        SELECT
+          message_id,
+          user_id,
+          content,
+          parts_json,
+          visibility,
+          created_at
+        FROM \`${MESSAGES_TABLE_REF}\`
+        WHERE session_id = @session_id
+          AND user_id = @user_id
+          ${cursorOperator ? `AND created_at ${cursorOperator} @cursor_created_at` : ""}
+        ORDER BY created_at DESC
+        LIMIT @limit
+      `
+    );
+
+    const mappedMetaChats = metaRows
+      .map(mapChatMetaRowToChat)
+      .filter((chat): chat is Chat => Boolean(chat));
+
+    if (mappedMetaChats.length > 0) {
+      const hasMore = mappedMetaChats.length > limit;
+      return {
+        chats: hasMore ? mappedMetaChats.slice(0, limit) : mappedMetaChats,
+        hasMore,
+      };
+    }
+
+    const derivedRows = await queryRows(
+      `
+        SELECT
+          session_id AS id,
+          ANY_VALUE(user_id) AS user_id,
+          MIN(created_at) AS created_at,
+          ANY_VALUE(visibility) AS visibility,
+          ARRAY_AGG(
+            IF(role = 'user', content, NULL)
+            IGNORE NULLS
+            ORDER BY TIMESTAMP(created_at)
+            LIMIT 1
+          )[SAFE_OFFSET(0)] AS title
+        FROM \`${MESSAGES_TABLE_REF}\`
+        WHERE user_id = @user_id
+          AND NOT STARTS_WITH(session_id, @meta_prefix)
+          AND (is_deleted IS NULL OR is_deleted = FALSE)
+        GROUP BY session_id
+        ${cursorOperator ? `HAVING MIN(TIMESTAMP(created_at)) ${cursorOperator} TIMESTAMP(@cursor_created_at)` : ""}
+        ORDER BY MIN(TIMESTAMP(created_at)) DESC
+        LIMIT @limit
+      `,
+      [
+        { name: "user_id", type: "STRING", value: id },
+        { name: "meta_prefix", type: "STRING", value: META_SESSION_PREFIX },
+        ...(cursorCreatedAt
+          ? [
+              {
+                name: "cursor_created_at",
+                type: "STRING" as const,
+                value: cursorCreatedAt,
+              },
+            ]
+          : []),
+        { name: "limit", type: "INT64", value: extendedLimit },
+      ],
+      `
+        SELECT
+          session_id AS id,
+          ANY_VALUE(user_id) AS user_id,
+          MIN(created_at) AS created_at,
+          ANY_VALUE(visibility) AS visibility,
+          ARRAY_AGG(
+            IF(role = 'user', content, NULL)
+            IGNORE NULLS
+            ORDER BY created_at
+            LIMIT 1
+          )[SAFE_OFFSET(0)] AS title
+        FROM \`${MESSAGES_TABLE_REF}\`
+        WHERE user_id = @user_id
+          AND NOT STARTS_WITH(session_id, @meta_prefix)
+        GROUP BY session_id
+        ${cursorOperator ? `HAVING MIN(created_at) ${cursorOperator} @cursor_created_at` : ""}
+        ORDER BY MIN(created_at) DESC
+        LIMIT @limit
+      `
+    );
+
+    const derivedChats = derivedRows
+      .map((row) => {
+        if (!row.id || isMetaSessionId(row.id)) {
+          return null;
+        }
+
+        return {
+          id: row.id,
+          userId: row.user_id ?? "",
+          title: row.title ?? "Nova Conversa",
+          visibility: normalizeVisibility(row.visibility),
+          createdAt: parseDate(row.created_at),
+        } satisfies Chat;
+      })
+      .filter((chat): chat is Chat => Boolean(chat));
+
+    const hasMore = derivedChats.length > limit;
 
     return {
-      chats: hasMore ? filteredChats.slice(0, limit) : filteredChats,
+      chats: hasMore ? derivedChats.slice(0, limit) : derivedChats,
       hasMore,
     };
-  } catch (_error) {
+  } catch (error) {
+    if (error instanceof ChatSDKError) {
+      throw error;
+    }
+
     throw new ChatSDKError(
       "bad_request:database",
       "Failed to get chats by user id"
@@ -239,12 +1126,12 @@ export async function getChatsByUserId({
 
 export async function getChatById({ id }: { id: string }) {
   try {
-    const [selectedChat] = await db.select().from(chat).where(eq(chat.id, id));
-    if (!selectedChat) {
-      return null;
+    const metaChat = await getChatMetaById(id);
+    if (metaChat) {
+      return metaChat;
     }
 
-    return selectedChat;
+    return await getFallbackChatFromMessages(id);
   } catch (_error) {
     throw new ChatSDKError("bad_request:database", "Failed to get chat by id");
   }
@@ -256,20 +1143,81 @@ export async function getProviderSessionByChatId({
 }: {
   chatId: string;
   provider: string;
-}) {
+}): Promise<ChatProviderSession | null> {
   try {
-    const [selectedSession] = await db
-      .select()
-      .from(chatProviderSession)
-      .where(
-        and(
-          eq(chatProviderSession.chatId, chatId),
-          eq(chatProviderSession.provider, provider)
-        )
-      )
-      .limit(1);
+    const messageId = `provider:${chatId}:${encodeURIComponent(provider)}`;
 
-    return selectedSession ?? null;
+    const rows = await queryRows(
+      `
+        SELECT
+          message_id,
+          user_id,
+          content,
+          parts_json,
+          created_at,
+          updated_at
+        FROM \`${MESSAGES_TABLE_REF}\`
+        WHERE session_id = @session_id
+          AND message_id = @message_id
+          AND (is_deleted IS NULL OR is_deleted = FALSE)
+        LIMIT 1
+      `,
+      [
+        { name: "session_id", type: "STRING", value: META_PROVIDER_SESSION },
+        { name: "message_id", type: "STRING", value: messageId },
+      ],
+      `
+        SELECT
+          message_id,
+          user_id,
+          content,
+          parts_json,
+          created_at,
+          updated_at
+        FROM \`${MESSAGES_TABLE_REF}\`
+        WHERE session_id = @session_id
+          AND message_id = @message_id
+        LIMIT 1
+      `
+    );
+
+    const row = rows[0];
+    if (!row) {
+      return null;
+    }
+
+    const rawPayload = parseJsonOrFallback<unknown>(row.parts_json, {});
+    const payload = isRecord(rawPayload)
+      ? (rawPayload as Partial<MetaProviderPayload>)
+      : {};
+
+    const sessionId =
+      (typeof payload.sessionId === "string" && payload.sessionId) ||
+      row.content ||
+      "";
+    const userId =
+      (typeof payload.userId === "string" && payload.userId) ||
+      row.user_id ||
+      "";
+
+    if (!sessionId || !userId) {
+      return null;
+    }
+
+    return {
+      chatId,
+      provider,
+      sessionId,
+      userId,
+      createdAt:
+        typeof payload.createdAt === "string"
+          ? parseDate(payload.createdAt)
+          : parseDate(row.created_at),
+      updatedAt:
+        typeof payload.updatedAt === "string"
+          ? parseDate(payload.updatedAt)
+          : parseDate(row.updated_at ?? row.created_at),
+    };
   } catch (_error) {
     throw new ChatSDKError(
       "bad_request:database",
@@ -290,20 +1238,29 @@ export async function upsertProviderSession({
   userId: string;
 }) {
   try {
-    return await db
-      .insert(chatProviderSession)
-      .values({
-        chatId,
-        provider,
-        sessionId,
+    const now = new Date().toISOString();
+    const existing = await getProviderSessionByChatId({ chatId, provider });
+
+    const payload: MetaProviderPayload = {
+      chatId,
+      provider,
+      sessionId,
+      userId,
+      createdAt: existing ? toIsoString(existing.createdAt) : now,
+      updatedAt: now,
+    };
+
+    await upsertMetaMessage(
+      buildMetaRow({
+        messageId: `provider:${chatId}:${encodeURIComponent(provider)}`,
+        sessionId: META_PROVIDER_SESSION,
         userId,
-        createdAt: new Date(),
-        updatedAt: new Date(),
+        content: sessionId,
+        payload,
+        createdAt: payload.createdAt,
+        updatedAt: payload.updatedAt,
       })
-      .onConflictDoUpdate({
-        target: [chatProviderSession.chatId, chatProviderSession.provider],
-        set: { sessionId, userId, updatedAt: new Date() },
-      });
+    );
   } catch (_error) {
     throw new ChatSDKError(
       "bad_request:database",
@@ -320,23 +1277,43 @@ export async function saveMessages({ messages }: { messages: DBMessage[] }) {
       ).values()
     );
 
-    return await db
-      .insert(message)
-      .values(dedupedMessages)
-      .onConflictDoUpdate({
-        target: message.id,
-        set: {
-          chatId: sql`excluded."chatId"`,
-          role: sql`excluded."role"`,
-          parts: sql`excluded."parts"`,
-          attachments: sql`excluded."attachments"`,
-          chartSpec: sql`excluded."chartSpec"`,
-          chartError: sql`excluded."chartError"`,
-          createdAt: sql`excluded."createdAt"`,
-        },
+    const accessToken = await getServiceAccountAccessToken();
+    await ensureBigQueryTables(accessToken);
+
+    const metadataCache = new Map<
+      string,
+      Promise<{ userId: string; visibility: VisibilityType } | null>
+    >();
+
+    for (const message of dedupedMessages) {
+      if (!metadataCache.has(message.chatId)) {
+        metadataCache.set(message.chatId, getSessionMetadata(message.chatId));
+      }
+
+      const metadata = await metadataCache.get(message.chatId);
+
+      if (!metadata?.userId) {
+        throw new ChatSDKError(
+          "bad_request:database",
+          `Failed to resolve chat owner for chat ${message.chatId}`
+        );
+      }
+
+      const row = toBigQueryMessageRow({
+        message,
+        userId: metadata.userId,
+        visibility: metadata.visibility,
       });
+
+      await upsertChatMessageRow(accessToken, row);
+    }
   } catch (error) {
     console.error("saveMessages error:", error);
+
+    if (error instanceof ChatSDKError) {
+      throw error;
+    }
+
     throw new ChatSDKError("bad_request:database", "Failed to save messages");
   }
 }
@@ -352,18 +1329,55 @@ export async function updateMessage({
   chartSpec?: DBMessage["chartSpec"];
   chartError?: DBMessage["chartError"];
 }) {
+  const partsJson = JSON.stringify(parts ?? []);
+  const content = extractTextFromParts(parts);
+  const now = new Date().toISOString();
+
   try {
-    const nextValues: Partial<typeof message.$inferInsert> = { parts };
-
-    if (chartSpec !== undefined) {
-      nextValues.chartSpec = chartSpec;
-    }
-
-    if (chartError !== undefined) {
-      nextValues.chartError = chartError;
-    }
-
-    return await db.update(message).set(nextValues).where(eq(message.id, id));
+    await runQuery(
+      `
+        UPDATE \`${MESSAGES_TABLE_REF}\`
+        SET
+          parts_json = @parts_json,
+          content = @content,
+          updated_at = @updated_at,
+          chart_spec_json = IF(@set_chart_spec, NULLIF(@chart_spec_json, ''), chart_spec_json),
+          chart_error = IF(@set_chart_error, NULLIF(@chart_error, ''), chart_error)
+        WHERE message_id = @message_id
+      `,
+      [
+        { name: "parts_json", type: "STRING", value: partsJson },
+        { name: "content", type: "STRING", value: content },
+        { name: "updated_at", type: "STRING", value: now },
+        {
+          name: "set_chart_spec",
+          type: "BOOL",
+          value: chartSpec !== undefined,
+        },
+        {
+          name: "chart_spec_json",
+          type: "STRING",
+          value:
+            chartSpec === undefined
+              ? ""
+              : chartSpec === null
+                ? ""
+                : JSON.stringify(chartSpec),
+        },
+        {
+          name: "set_chart_error",
+          type: "BOOL",
+          value: chartError !== undefined,
+        },
+        {
+          name: "chart_error",
+          type: "STRING",
+          value:
+            chartError === undefined || chartError === null ? "" : chartError,
+        },
+        { name: "message_id", type: "STRING", value: id },
+      ]
+    );
   } catch (_error) {
     throw new ChatSDKError("bad_request:database", "Failed to update message");
   }
@@ -371,11 +1385,47 @@ export async function updateMessage({
 
 export async function getMessagesByChatId({ id }: { id: string }) {
   try {
-    return await db
-      .select()
-      .from(message)
-      .where(eq(message.chatId, id))
-      .orderBy(asc(message.createdAt));
+    const rows = await queryRows(
+      `
+        SELECT
+          message_id,
+          session_id,
+          role,
+          content,
+          created_at,
+          parts_json,
+          attachments_json,
+          chart_spec_json,
+          chart_error
+        FROM \`${MESSAGES_TABLE_REF}\`
+        WHERE session_id = @chat_id
+          AND NOT STARTS_WITH(session_id, @meta_prefix)
+          AND (is_deleted IS NULL OR is_deleted = FALSE)
+        ORDER BY TIMESTAMP(created_at) ASC
+      `,
+      [
+        { name: "chat_id", type: "STRING", value: id },
+        { name: "meta_prefix", type: "STRING", value: META_SESSION_PREFIX },
+      ],
+      `
+        SELECT
+          message_id,
+          session_id,
+          role,
+          content,
+          created_at,
+          parts_json,
+          attachments_json,
+          chart_spec_json,
+          chart_error
+        FROM \`${MESSAGES_TABLE_REF}\`
+        WHERE session_id = @chat_id
+          AND NOT STARTS_WITH(session_id, @meta_prefix)
+        ORDER BY created_at ASC
+      `
+    );
+
+    return rows.map(mapMessageRowToDbMessage);
   } catch (_error) {
     throw new ChatSDKError(
       "bad_request:database",
@@ -385,45 +1435,25 @@ export async function getMessagesByChatId({ id }: { id: string }) {
 }
 
 export async function voteMessage({
-  chatId,
-  messageId,
-  type,
+  chatId: _chatId,
+  messageId: _messageId,
+  type: _type,
 }: {
   chatId: string;
   messageId: string;
   type: "up" | "down";
 }) {
-  try {
-    const [existingVote] = await db
-      .select()
-      .from(vote)
-      .where(and(eq(vote.messageId, messageId)));
-
-    if (existingVote) {
-      return await db
-        .update(vote)
-        .set({ isUpvoted: type === "up" })
-        .where(and(eq(vote.messageId, messageId), eq(vote.chatId, chatId)));
-    }
-    return await db.insert(vote).values({
-      chatId,
-      messageId,
-      isUpvoted: type === "up",
-    });
-  } catch (_error) {
-    throw new ChatSDKError("bad_request:database", "Failed to vote message");
-  }
+  await Promise.resolve();
+  return;
 }
 
-export async function getVotesByChatId({ id }: { id: string }) {
-  try {
-    return await db.select().from(vote).where(eq(vote.chatId, id));
-  } catch (_error) {
-    throw new ChatSDKError(
-      "bad_request:database",
-      "Failed to get votes by chat id"
-    );
-  }
+export async function getVotesByChatId({
+  id: _id,
+}: {
+  id: string;
+}): Promise<Vote[]> {
+  await Promise.resolve();
+  return [];
 }
 
 export async function saveDocument({
@@ -439,32 +1469,86 @@ export async function saveDocument({
   content: string;
   userId: string;
 }) {
+  const now = new Date().toISOString();
+  const messageId = `doc:${id}:${Date.now()}:${generateUUID().slice(0, 8)}`;
+
   try {
-    return await db
-      .insert(document)
-      .values({
-        id,
-        title,
-        kind,
-        content,
+    const payload: MetaDocumentPayload = {
+      id,
+      title,
+      kind,
+      content,
+      userId,
+      createdAt: now,
+    };
+
+    await upsertMetaMessage(
+      buildMetaRow({
+        messageId,
+        sessionId: META_DOCUMENTS_SESSION,
         userId,
-        createdAt: new Date(),
+        content: title,
+        payload,
+        createdAt: now,
       })
-      .returning();
+    );
+
+    return [
+      {
+        id,
+        createdAt: parseDate(now),
+        title,
+        content,
+        kind,
+        userId,
+      } as Document,
+    ];
   } catch (_error) {
     throw new ChatSDKError("bad_request:database", "Failed to save document");
   }
 }
 
-export async function getDocumentsById({ id }: { id: string }) {
+export async function getDocumentsById({
+  id,
+}: {
+  id: string;
+}): Promise<Document[]> {
   try {
-    const documents = await db
-      .select()
-      .from(document)
-      .where(eq(document.id, id))
-      .orderBy(asc(document.createdAt));
+    const rows = await queryRows(
+      `
+        SELECT
+          message_id,
+          user_id,
+          content,
+          parts_json,
+          created_at
+        FROM \`${MESSAGES_TABLE_REF}\`
+        WHERE session_id = @session_id
+          AND JSON_VALUE(parts_json, '$.id') = @document_id
+          AND (is_deleted IS NULL OR is_deleted = FALSE)
+        ORDER BY TIMESTAMP(created_at) ASC
+      `,
+      [
+        { name: "session_id", type: "STRING", value: META_DOCUMENTS_SESSION },
+        { name: "document_id", type: "STRING", value: id },
+      ],
+      `
+        SELECT
+          message_id,
+          user_id,
+          content,
+          parts_json,
+          created_at
+        FROM \`${MESSAGES_TABLE_REF}\`
+        WHERE session_id = @session_id
+          AND JSON_VALUE(parts_json, '$.id') = @document_id
+        ORDER BY created_at ASC
+      `
+    );
 
-    return documents;
+    return rows
+      .map(mapDocumentRow)
+      .filter((document): document is Document => Boolean(document));
   } catch (_error) {
     throw new ChatSDKError(
       "bad_request:database",
@@ -475,13 +1559,45 @@ export async function getDocumentsById({ id }: { id: string }) {
 
 export async function getDocumentById({ id }: { id: string }) {
   try {
-    const [selectedDocument] = await db
-      .select()
-      .from(document)
-      .where(eq(document.id, id))
-      .orderBy(desc(document.createdAt));
+    const rows = await queryRows(
+      `
+        SELECT
+          message_id,
+          user_id,
+          content,
+          parts_json,
+          created_at
+        FROM \`${MESSAGES_TABLE_REF}\`
+        WHERE session_id = @session_id
+          AND JSON_VALUE(parts_json, '$.id') = @document_id
+          AND (is_deleted IS NULL OR is_deleted = FALSE)
+        ORDER BY TIMESTAMP(created_at) DESC
+        LIMIT 1
+      `,
+      [
+        { name: "session_id", type: "STRING", value: META_DOCUMENTS_SESSION },
+        { name: "document_id", type: "STRING", value: id },
+      ],
+      `
+        SELECT
+          message_id,
+          user_id,
+          content,
+          parts_json,
+          created_at
+        FROM \`${MESSAGES_TABLE_REF}\`
+        WHERE session_id = @session_id
+          AND JSON_VALUE(parts_json, '$.id') = @document_id
+        ORDER BY created_at DESC
+        LIMIT 1
+      `
+    );
 
-    return selectedDocument;
+    if (!rows[0]) {
+      return null;
+    }
+
+    return mapDocumentRow(rows[0]);
   } catch (_error) {
     throw new ChatSDKError(
       "bad_request:database",
@@ -498,19 +1614,58 @@ export async function deleteDocumentsByIdAfterTimestamp({
   timestamp: Date;
 }) {
   try {
-    await db
-      .delete(suggestion)
-      .where(
-        and(
-          eq(suggestion.documentId, id),
-          gt(suggestion.documentCreatedAt, timestamp)
-        )
-      );
+    const threshold = toIsoString(timestamp);
 
-    return await db
-      .delete(document)
-      .where(and(eq(document.id, id), gt(document.createdAt, timestamp)))
-      .returning();
+    const rowsToDelete = await queryRows(
+      `
+        SELECT
+          message_id,
+          user_id,
+          content,
+          parts_json,
+          created_at
+        FROM \`${MESSAGES_TABLE_REF}\`
+        WHERE session_id = @session_id
+          AND JSON_VALUE(parts_json, '$.id') = @document_id
+          AND TIMESTAMP(created_at) > TIMESTAMP(@threshold)
+          AND (is_deleted IS NULL OR is_deleted = FALSE)
+      `,
+      [
+        { name: "session_id", type: "STRING", value: META_DOCUMENTS_SESSION },
+        { name: "document_id", type: "STRING", value: id },
+        { name: "threshold", type: "STRING", value: threshold },
+      ],
+      `
+        SELECT
+          message_id,
+          user_id,
+          content,
+          parts_json,
+          created_at
+        FROM \`${MESSAGES_TABLE_REF}\`
+        WHERE session_id = @session_id
+          AND JSON_VALUE(parts_json, '$.id') = @document_id
+          AND created_at > @threshold
+      `
+    );
+
+    await runQuery(
+      `
+        DELETE FROM \`${MESSAGES_TABLE_REF}\`
+        WHERE session_id = @session_id
+          AND JSON_VALUE(parts_json, '$.id') = @document_id
+          AND TIMESTAMP(created_at) > TIMESTAMP(@threshold)
+      `,
+      [
+        { name: "session_id", type: "STRING", value: META_DOCUMENTS_SESSION },
+        { name: "document_id", type: "STRING", value: id },
+        { name: "threshold", type: "STRING", value: threshold },
+      ]
+    );
+
+    return rowsToDelete
+      .map(mapDocumentRow)
+      .filter((document): document is Document => Boolean(document));
   } catch (_error) {
     throw new ChatSDKError(
       "bad_request:database",
@@ -519,42 +1674,44 @@ export async function deleteDocumentsByIdAfterTimestamp({
   }
 }
 
-export async function saveSuggestions({
-  suggestions,
-}: {
-  suggestions: Suggestion[];
-}) {
-  try {
-    return await db.insert(suggestion).values(suggestions);
-  } catch (_error) {
-    throw new ChatSDKError(
-      "bad_request:database",
-      "Failed to save suggestions"
-    );
-  }
-}
-
-export async function getSuggestionsByDocumentId({
-  documentId,
-}: {
-  documentId: string;
-}) {
-  try {
-    return await db
-      .select()
-      .from(suggestion)
-      .where(eq(suggestion.documentId, documentId));
-  } catch (_error) {
-    throw new ChatSDKError(
-      "bad_request:database",
-      "Failed to get suggestions by document id"
-    );
-  }
-}
-
 export async function getMessageById({ id }: { id: string }) {
   try {
-    return await db.select().from(message).where(eq(message.id, id));
+    const rows = await queryRows(
+      `
+        SELECT
+          message_id,
+          session_id,
+          role,
+          content,
+          created_at,
+          parts_json,
+          attachments_json,
+          chart_spec_json,
+          chart_error
+        FROM \`${MESSAGES_TABLE_REF}\`
+        WHERE message_id = @message_id
+          AND (is_deleted IS NULL OR is_deleted = FALSE)
+        ORDER BY TIMESTAMP(created_at) ASC
+      `,
+      [{ name: "message_id", type: "STRING", value: id }],
+      `
+        SELECT
+          message_id,
+          session_id,
+          role,
+          content,
+          created_at,
+          parts_json,
+          attachments_json,
+          chart_spec_json,
+          chart_error
+        FROM \`${MESSAGES_TABLE_REF}\`
+        WHERE message_id = @message_id
+        ORDER BY created_at ASC
+      `
+    );
+
+    return rows.map(mapMessageRowToDbMessage);
   } catch (_error) {
     throw new ChatSDKError(
       "bad_request:database",
@@ -571,30 +1728,21 @@ export async function deleteMessagesByChatIdAfterTimestamp({
   timestamp: Date;
 }) {
   try {
-    const messagesToDelete = await db
-      .select({ id: message.id })
-      .from(message)
-      .where(
-        and(eq(message.chatId, chatId), gte(message.createdAt, timestamp))
-      );
+    const threshold = toIsoString(timestamp);
 
-    const messageIds = messagesToDelete.map(
-      (currentMessage) => currentMessage.id
+    await runQuery(
+      `
+        DELETE FROM \`${MESSAGES_TABLE_REF}\`
+        WHERE session_id = @chat_id
+          AND NOT STARTS_WITH(session_id, @meta_prefix)
+          AND TIMESTAMP(created_at) >= TIMESTAMP(@threshold)
+      `,
+      [
+        { name: "chat_id", type: "STRING", value: chatId },
+        { name: "meta_prefix", type: "STRING", value: META_SESSION_PREFIX },
+        { name: "threshold", type: "STRING", value: threshold },
+      ]
     );
-
-    if (messageIds.length > 0) {
-      await db
-        .delete(vote)
-        .where(
-          and(eq(vote.chatId, chatId), inArray(vote.messageId, messageIds))
-        );
-
-      return await db
-        .delete(message)
-        .where(
-          and(eq(message.chatId, chatId), inArray(message.id, messageIds))
-        );
-    }
   } catch (_error) {
     throw new ChatSDKError(
       "bad_request:database",
@@ -611,7 +1759,51 @@ export async function updateChatVisibilityById({
   visibility: "private" | "public";
 }) {
   try {
-    return await db.update(chat).set({ visibility }).where(eq(chat.id, chatId));
+    const chat = await getChatById({ id: chatId });
+
+    if (!chat) {
+      return;
+    }
+
+    const now = new Date().toISOString();
+    const payload: MetaChatPayload = {
+      chatId: chat.id,
+      userId: chat.userId,
+      title: chat.title,
+      visibility,
+      createdAt: toIsoString(chat.createdAt),
+      updatedAt: now,
+    };
+
+    await upsertMetaMessage(
+      buildMetaRow({
+        messageId: `chat:${chatId}`,
+        sessionId: META_CHATS_SESSION,
+        userId: chat.userId,
+        content: chat.title,
+        payload,
+        createdAt: payload.createdAt,
+        updatedAt: payload.updatedAt,
+        visibility,
+      })
+    );
+
+    await runQuery(
+      `
+        UPDATE \`${MESSAGES_TABLE_REF}\`
+        SET
+          visibility = @visibility,
+          updated_at = @updated_at
+        WHERE session_id = @chat_id
+          AND NOT STARTS_WITH(session_id, @meta_prefix)
+      `,
+      [
+        { name: "visibility", type: "STRING", value: visibility },
+        { name: "updated_at", type: "STRING", value: now },
+        { name: "chat_id", type: "STRING", value: chatId },
+        { name: "meta_prefix", type: "STRING", value: META_SESSION_PREFIX },
+      ]
+    );
   } catch (_error) {
     throw new ChatSDKError(
       "bad_request:database",
@@ -628,7 +1820,34 @@ export async function updateChatTitleById({
   title: string;
 }) {
   try {
-    return await db.update(chat).set({ title }).where(eq(chat.id, chatId));
+    const chat = await getChatById({ id: chatId });
+
+    if (!chat) {
+      return;
+    }
+
+    const now = new Date().toISOString();
+    const payload: MetaChatPayload = {
+      chatId: chat.id,
+      userId: chat.userId,
+      title,
+      visibility: chat.visibility,
+      createdAt: toIsoString(chat.createdAt),
+      updatedAt: now,
+    };
+
+    await upsertMetaMessage(
+      buildMetaRow({
+        messageId: `chat:${chatId}`,
+        sessionId: META_CHATS_SESSION,
+        userId: chat.userId,
+        content: title,
+        payload,
+        createdAt: payload.createdAt,
+        updatedAt: payload.updatedAt,
+        visibility: chat.visibility,
+      })
+    );
   } catch (error) {
     console.warn("Failed to update title for chat", chatId, error);
     return;
@@ -643,65 +1862,40 @@ export async function getMessageCountByUserId({
   differenceInHours: number;
 }) {
   try {
-    const twentyFourHoursAgo = new Date(
+    const threshold = new Date(
       Date.now() - differenceInHours * 60 * 60 * 1000
+    ).toISOString();
+
+    const rows = await queryRows(
+      `
+        SELECT COUNT(1) AS total
+        FROM \`${MESSAGES_TABLE_REF}\`
+        WHERE user_id = @user_id
+          AND role = 'user'
+          AND NOT STARTS_WITH(session_id, @meta_prefix)
+          AND (is_deleted IS NULL OR is_deleted = FALSE)
+          AND TIMESTAMP(created_at) >= TIMESTAMP(@threshold)
+      `,
+      [
+        { name: "user_id", type: "STRING", value: id },
+        { name: "meta_prefix", type: "STRING", value: META_SESSION_PREFIX },
+        { name: "threshold", type: "STRING", value: threshold },
+      ],
+      `
+        SELECT COUNT(1) AS total
+        FROM \`${MESSAGES_TABLE_REF}\`
+        WHERE user_id = @user_id
+          AND role = 'user'
+          AND NOT STARTS_WITH(session_id, @meta_prefix)
+          AND created_at >= @threshold
+      `
     );
 
-    const [stats] = await db
-      .select({ count: count(message.id) })
-      .from(message)
-      .innerJoin(chat, eq(message.chatId, chat.id))
-      .where(
-        and(
-          eq(chat.userId, id),
-          gte(message.createdAt, twentyFourHoursAgo),
-          eq(message.role, "user")
-        )
-      )
-      .execute();
-
-    return stats?.count ?? 0;
+    return parseIntOrZero(rows[0]?.total);
   } catch (_error) {
     throw new ChatSDKError(
       "bad_request:database",
       "Failed to get message count by user id"
-    );
-  }
-}
-
-export async function createStreamId({
-  streamId,
-  chatId,
-}: {
-  streamId: string;
-  chatId: string;
-}) {
-  try {
-    await db
-      .insert(stream)
-      .values({ id: streamId, chatId, createdAt: new Date() });
-  } catch (_error) {
-    throw new ChatSDKError(
-      "bad_request:database",
-      "Failed to create stream id"
-    );
-  }
-}
-
-export async function getStreamIdsByChatId({ chatId }: { chatId: string }) {
-  try {
-    const streamIds = await db
-      .select({ id: stream.id })
-      .from(stream)
-      .where(eq(stream.chatId, chatId))
-      .orderBy(asc(stream.createdAt))
-      .execute();
-
-    return streamIds.map(({ id }) => id);
-  } catch (_error) {
-    throw new ChatSDKError(
-      "bad_request:database",
-      "Failed to get stream ids by chat id"
     );
   }
 }
