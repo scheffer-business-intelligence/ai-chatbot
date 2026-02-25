@@ -1,31 +1,28 @@
 import { expect, test } from "@playwright/test";
 
 test.describe("Authentication Pages", () => {
-  test("login page renders correctly", async ({ page }) => {
+  test("login page renders google-only access", async ({ page }) => {
     await page.goto("/login");
-    await expect(page.getByPlaceholder("user@acme.com")).toBeVisible();
-    await expect(page.getByLabel("Password")).toBeVisible();
-    await expect(page.getByRole("button", { name: "Sign In" })).toBeVisible();
-    await expect(page.getByText("Don't have an account?")).toBeVisible();
+    await expect(
+      page.getByRole("button", { name: "Entrar com Google" })
+    ).toBeVisible();
+    await expect(
+      page.getByText("Somente emails @scheffer.agr.br.")
+    ).toBeVisible();
+    await expect(
+      page.getByAltText("Ilustração de inteligência artificial")
+    ).toBeVisible();
   });
 
-  test("register page renders correctly", async ({ page }) => {
+  test("login page shows access denied error", async ({ page }) => {
+    await page.goto("/login?error=AccessDenied");
+    await expect(
+      page.getByText("Acesso negado para este domínio.")
+    ).toBeVisible();
+  });
+
+  test("register route redirects to login", async ({ page }) => {
     await page.goto("/register");
-    await expect(page.getByPlaceholder("user@acme.com")).toBeVisible();
-    await expect(page.getByLabel("Password")).toBeVisible();
-    await expect(page.getByRole("button", { name: "Sign Up" })).toBeVisible();
-    await expect(page.getByText("Already have an account?")).toBeVisible();
-  });
-
-  test("can navigate from login to register", async ({ page }) => {
-    await page.goto("/login");
-    await page.getByRole("link", { name: "Sign up" }).click();
-    await expect(page).toHaveURL("/register");
-  });
-
-  test("can navigate from register to login", async ({ page }) => {
-    await page.goto("/register");
-    await page.getByRole("link", { name: "Sign in" }).click();
     await expect(page).toHaveURL("/login");
   });
 });

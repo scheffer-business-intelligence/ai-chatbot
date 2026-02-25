@@ -5,6 +5,9 @@ import { isDevelopmentEnvironment } from "./lib/constants";
 export async function proxy(request: NextRequest) {
   const { pathname } = request.nextUrl;
   const isAuthPage = ["/login", "/register"].includes(pathname);
+  const isPublicAssetRequest =
+    pathname.startsWith("/images/") ||
+    (!pathname.startsWith("/api/") && /\.[^/]+$/.test(pathname));
 
   /*
    * Playwright starts the dev server and requires a 200 status to
@@ -15,6 +18,10 @@ export async function proxy(request: NextRequest) {
   }
 
   if (pathname.startsWith("/api/auth")) {
+    return NextResponse.next();
+  }
+
+  if (isPublicAssetRequest) {
     return NextResponse.next();
   }
 
@@ -70,8 +77,9 @@ export const config = {
      * Match all request paths except for the ones starting with:
      * - _next/static (static files)
      * - _next/image (image optimization files)
+     * - images (public assets)
      * - favicon.ico, sitemap.xml, robots.txt (metadata files)
      */
-    "/((?!_next/static|_next/image|favicon.ico|sitemap.xml|robots.txt).*)",
+    "/((?!_next/static|_next/image|images/|favicon.ico|sitemap.xml|robots.txt).*)",
   ],
 };

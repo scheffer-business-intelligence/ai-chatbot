@@ -1,67 +1,129 @@
 "use client";
 
-import { Bot } from "lucide-react";
+import Image from "next/image";
+import Link from "next/link";
 import { useSearchParams } from "next/navigation";
 import { signIn } from "next-auth/react";
-import { Suspense } from "react";
+import { Suspense, useState } from "react";
 import { LogoGoogle } from "@/components/icons";
+import { Alert, AlertDescription } from "@/components/ui/alert";
+import { Button } from "@/components/ui/button";
+
+function getLoginErrorMessage(error: string | null) {
+  if (!error) {
+    return null;
+  }
+
+  if (error === "AccessDenied") {
+    return "Acesso negado para este domínio.";
+  }
+
+  if (error === "Configuration") {
+    return "Configuração OAuth inválida. Verifique AUTH_GOOGLE_ID e AUTH_GOOGLE_SECRET.";
+  }
+
+  return "Erro ao fazer login. Tente novamente.";
+}
 
 export default function Page() {
   return (
-    <Suspense fallback={<div className="flex min-h-screen bg-[#0f1117]" />}>
+    <Suspense fallback={<div className="min-h-svh bg-background" />}>
       <LoginPage />
     </Suspense>
   );
 }
 
 function LoginPage() {
+  const [isSubmitting, setIsSubmitting] = useState(false);
   const searchParams = useSearchParams();
   const error = searchParams.get("error");
   const callbackUrl = searchParams.get("callbackUrl") || "/";
+  const errorMessage = getLoginErrorMessage(error);
 
   const handleGoogleLogin = async () => {
-    await signIn("google", { callbackUrl });
+    if (isSubmitting) {
+      return;
+    }
+
+    setIsSubmitting(true);
+
+    try {
+      await signIn("google", { callbackUrl });
+    } catch {
+      setIsSubmitting(false);
+    }
   };
 
   return (
-    <div className="flex min-h-screen items-center justify-center bg-[#0f1117] text-gray-100">
-      <div className="w-full max-w-md px-4">
-        <div className="rounded-2xl border border-[#1f2230] bg-[#0f1117] p-8 shadow-2xl shadow-black/30">
-          <div className="mb-6 flex justify-center">
-            <div className="flex h-16 w-16 items-center justify-center rounded-full bg-[#1f2230]">
-              <Bot className="h-8 w-8 text-[#10a37f]" />
-            </div>
-          </div>
+    <div className="grid min-h-svh lg:grid-cols-2">
+      <div className="flex flex-col gap-4 p-6 md:p-10">
+        <div className="flex justify-center gap-2 md:justify-start">
+          <Link className="flex items-center gap-2 font-medium" href="/">
+            <Image
+              alt="Scheffer"
+              className="rounded-sm"
+              height={24}
+              priority
+              src="/images/scheffer-icon.png"
+              width={24}
+            />
+            <Image
+              alt="Scheffer Agente"
+              className="h-5 w-auto"
+              height={29}
+              priority
+              src="/images/scheffer-logo.png"
+              width={196}
+            />
+          </Link>
+        </div>
+        <div className="flex flex-1 items-center justify-center">
+          <div className="w-full max-w-xs">
+            <div className="flex flex-col gap-6">
+              <div className="flex flex-col items-center gap-2 text-center">
+                <h1 className="font-bold text-2xl">Entrar na sua conta</h1>
+                <p className="text-muted-foreground text-sm text-balance">
+                  Entre com sua conta Google corporativa para acessar o sistema.
+                </p>
+              </div>
 
-          <h1 className="mb-2 text-center font-semibold text-2xl">
-            Scheffer Agente
-          </h1>
-          <p className="mb-8 text-center text-gray-400">Entre para continuar</p>
+              {errorMessage ? (
+                <Alert variant="destructive">
+                  <AlertDescription className="text-center">
+                    {errorMessage}
+                  </AlertDescription>
+                </Alert>
+              ) : null}
 
-          {error ? (
-            <div className="mb-6 rounded-lg border border-red-900/40 bg-red-900/20 p-4">
-              <p className="text-center text-red-200 text-sm">
-                {error === "AccessDenied"
-                  ? "Acesso negado para este domínio."
-                  : error === "Configuration"
-                    ? "Configuração OAuth inválida. Verifique AUTH_GOOGLE_ID e AUTH_GOOGLE_SECRET."
-                    : "Erro ao fazer login. Tente novamente."}
+              <Button
+                className="w-full cursor-pointer gap-3"
+                disabled={isSubmitting}
+                onClick={handleGoogleLogin}
+                type="button"
+                variant="outline"
+              >
+                <LogoGoogle size={20} />
+                {isSubmitting ? "Redirecionando..." : "Entrar com Google"}
+              </Button>
+
+              <p className="text-center text-muted-foreground text-xs">
+                Somente emails @scheffer.agr.br.
               </p>
             </div>
-          ) : null}
-
-          <button
-            className="flex w-full cursor-pointer items-center justify-center gap-3 rounded-full border border-[#2a2f3c] bg-[#1a1d27] px-6 py-3 font-medium text-gray-100 shadow-lg shadow-black/20 transition-colors hover:border-[#3a3f4f]"
-            onClick={handleGoogleLogin}
-            type="button"
-          >
-            <LogoGoogle size={20} />
-            Entrar com Google
-          </button>
-
-          <p className="mt-6 text-center text-gray-500 text-xs">
-            Use sua conta corporativa para acessar
-          </p>
+          </div>
+        </div>
+      </div>
+      <div className="bg-muted relative hidden lg:flex items-center justify-center">
+        <div className="relative h-1/2 w-1/2">
+          <Image
+            alt="Ilustração de inteligência artificial"
+            className="object-contain"
+            fill
+            priority
+            sizes="25vw"
+            src="/images/login-hero.png"
+            unoptimized
+          />
         </div>
       </div>
     </div>

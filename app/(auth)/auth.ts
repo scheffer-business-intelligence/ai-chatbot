@@ -28,8 +28,10 @@ declare module "next-auth/jwt" {
   }
 }
 
-const allowedGoogleDomain =
+const REQUIRED_GOOGLE_DOMAIN = "scheffer.agr.br";
+const configuredGoogleDomain =
   process.env.AUTH_GOOGLE_ALLOWED_DOMAIN?.trim().toLowerCase();
+const allowedGoogleDomain = REQUIRED_GOOGLE_DOMAIN;
 
 const RETRYABLE_NETWORK_CODES = new Set([
   "UND_ERR_CONNECT_TIMEOUT",
@@ -156,7 +158,7 @@ const googleProvider = {
       params: {
         scope: "openid email profile",
         prompt: "select_account",
-        ...(allowedGoogleDomain ? { hd: allowedGoogleDomain } : {}),
+        hd: allowedGoogleDomain,
       },
     },
     token: "https://oauth2.googleapis.com/token",
@@ -177,14 +179,18 @@ export const {
   providers: [googleProvider],
   callbacks: {
     signIn({ user, account }) {
-      if (account?.provider !== "google" || !allowedGoogleDomain) {
-        return true;
+      if (account?.provider !== "google") {
+        return false;
       }
 
       const email = user.email?.toLowerCase() ?? "";
       const domain = email.split("@")[1];
 
-      return domain === allowedGoogleDomain;
+      return (
+        domain === allowedGoogleDomain ||
+        (configuredGoogleDomain === allowedGoogleDomain &&
+          domain === configuredGoogleDomain)
+      );
     },
     jwt({ token, user }) {
       if (user) {
