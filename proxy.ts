@@ -1,9 +1,10 @@
 import { type NextRequest, NextResponse } from "next/server";
 import { getToken } from "next-auth/jwt";
-import { guestRegex, isDevelopmentEnvironment } from "./lib/constants";
+import { isDevelopmentEnvironment } from "./lib/constants";
 
 export async function proxy(request: NextRequest) {
   const { pathname } = request.nextUrl;
+  const isAuthPage = ["/login", "/register"].includes(pathname);
 
   /*
    * Playwright starts the dev server and requires a 200 status to
@@ -23,17 +24,34 @@ export async function proxy(request: NextRequest) {
     secureCookie: !isDevelopmentEnvironment,
   });
 
-  if (!token) {
-    const redirectUrl = encodeURIComponent(request.url);
+  const rawToken = token as { type?: unknown; email?: unknown } | null;
+  const tokenType = typeof rawToken?.type === "string" ? rawToken.type : null;
+  const tokenEmail = typeof rawToken?.email === "string" ? rawToken.email : "";
+  const isLegacyGuestSession =
+    tokenType === "guest" || /^guest-\d+$/.test(tokenEmail);
 
-    return NextResponse.redirect(
-      new URL(`/api/auth/guest?redirectUrl=${redirectUrl}`, request.url)
-    );
+  if (!token || isLegacyGuestSession) {
+    if (pathname.startsWith("/api/")) {
+      return Response.json(
+        {
+          code: "unauthorized:auth",
+          message: "You need to sign in before continuing.",
+        },
+        { status: 401 }
+      );
+    }
+
+    if (isAuthPage) {
+      return NextResponse.next();
+    }
+
+    const loginUrl = new URL("/login", request.url);
+    loginUrl.searchParams.set("callbackUrl", request.url);
+
+    return NextResponse.redirect(loginUrl);
   }
 
-  const isGuest = guestRegex.test(token?.email ?? "");
-
-  if (token && !isGuest && ["/login", "/register"].includes(pathname)) {
+  if (isAuthPage) {
     return NextResponse.redirect(new URL("/", request.url));
   }
 

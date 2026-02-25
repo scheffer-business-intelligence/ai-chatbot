@@ -266,7 +266,15 @@ export async function POST(request: Request) {
 
     const isToolApprovalFlow = Boolean(messages);
 
-    const chat = await getChatById({ id });
+    let chat: Awaited<ReturnType<typeof getChatById>> = null;
+    try {
+      chat = await getChatById({ id });
+    } catch (error) {
+      console.warn(
+        "Failed to resolve chat by id before handling request, proceeding as new chat:",
+        error
+      );
+    }
     let messageHistory: ChatMessage[] = [];
     let titlePromise: Promise<string> | null = null;
 

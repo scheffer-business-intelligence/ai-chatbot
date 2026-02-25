@@ -1,76 +1,68 @@
 "use client";
 
-import Link from "next/link";
-import { useRouter } from "next/navigation";
-import { useSession } from "next-auth/react";
-import { useActionState, useEffect, useState } from "react";
-
-import { AuthForm } from "@/components/auth-form";
-import { SubmitButton } from "@/components/submit-button";
-import { toast } from "@/components/toast";
-import { type LoginActionState, login } from "../actions";
+import { Bot } from "lucide-react";
+import { useSearchParams } from "next/navigation";
+import { signIn } from "next-auth/react";
+import { Suspense } from "react";
+import { LogoGoogle } from "@/components/icons";
 
 export default function Page() {
-  const router = useRouter();
-
-  const [email, setEmail] = useState("");
-  const [isSuccessful, setIsSuccessful] = useState(false);
-
-  const [state, formAction] = useActionState<LoginActionState, FormData>(
-    login,
-    {
-      status: "idle",
-    }
+  return (
+    <Suspense fallback={<div className="flex min-h-screen bg-[#0f1117]" />}>
+      <LoginPage />
+    </Suspense>
   );
+}
 
-  const { update: updateSession } = useSession();
+function LoginPage() {
+  const searchParams = useSearchParams();
+  const error = searchParams.get("error");
+  const callbackUrl = searchParams.get("callbackUrl") || "/";
 
-  // biome-ignore lint/correctness/useExhaustiveDependencies: router and updateSession are stable refs
-  useEffect(() => {
-    if (state.status === "failed") {
-      toast({
-        type: "error",
-        description: "Invalid credentials!",
-      });
-    } else if (state.status === "invalid_data") {
-      toast({
-        type: "error",
-        description: "Failed validating your submission!",
-      });
-    } else if (state.status === "success") {
-      setIsSuccessful(true);
-      updateSession();
-      router.refresh();
-    }
-  }, [state.status]);
-
-  const handleSubmit = (formData: FormData) => {
-    setEmail(formData.get("email") as string);
-    formAction(formData);
+  const handleGoogleLogin = async () => {
+    await signIn("google", { callbackUrl });
   };
 
   return (
-    <div className="flex h-dvh w-screen items-start justify-center bg-background pt-12 md:items-center md:pt-0">
-      <div className="flex w-full max-w-md flex-col gap-12 overflow-hidden rounded-2xl">
-        <div className="flex flex-col items-center justify-center gap-2 px-4 text-center sm:px-16">
-          <h3 className="font-semibold text-xl dark:text-zinc-50">Sign In</h3>
-          <p className="text-gray-500 text-sm dark:text-zinc-400">
-            Use your email and password to sign in
+    <div className="flex min-h-screen items-center justify-center bg-[#0f1117] text-gray-100">
+      <div className="w-full max-w-md px-4">
+        <div className="rounded-2xl border border-[#1f2230] bg-[#0f1117] p-8 shadow-2xl shadow-black/30">
+          <div className="mb-6 flex justify-center">
+            <div className="flex h-16 w-16 items-center justify-center rounded-full bg-[#1f2230]">
+              <Bot className="h-8 w-8 text-[#10a37f]" />
+            </div>
+          </div>
+
+          <h1 className="mb-2 text-center font-semibold text-2xl">
+            Scheffer Agente
+          </h1>
+          <p className="mb-8 text-center text-gray-400">Entre para continuar</p>
+
+          {error ? (
+            <div className="mb-6 rounded-lg border border-red-900/40 bg-red-900/20 p-4">
+              <p className="text-center text-red-200 text-sm">
+                {error === "AccessDenied"
+                  ? "Acesso negado para este domínio."
+                  : error === "Configuration"
+                    ? "Configuração OAuth inválida. Verifique AUTH_GOOGLE_ID e AUTH_GOOGLE_SECRET."
+                    : "Erro ao fazer login. Tente novamente."}
+              </p>
+            </div>
+          ) : null}
+
+          <button
+            className="flex w-full cursor-pointer items-center justify-center gap-3 rounded-full border border-[#2a2f3c] bg-[#1a1d27] px-6 py-3 font-medium text-gray-100 shadow-lg shadow-black/20 transition-colors hover:border-[#3a3f4f]"
+            onClick={handleGoogleLogin}
+            type="button"
+          >
+            <LogoGoogle size={20} />
+            Entrar com Google
+          </button>
+
+          <p className="mt-6 text-center text-gray-500 text-xs">
+            Use sua conta corporativa para acessar
           </p>
         </div>
-        <AuthForm action={handleSubmit} defaultEmail={email}>
-          <SubmitButton isSuccessful={isSuccessful}>Sign in</SubmitButton>
-          <p className="mt-4 text-center text-gray-600 text-sm dark:text-zinc-400">
-            {"Don't have an account? "}
-            <Link
-              className="font-semibold text-gray-800 hover:underline dark:text-zinc-200"
-              href="/register"
-            >
-              Sign up
-            </Link>
-            {" for free."}
-          </p>
-        </AuthForm>
       </div>
     </div>
   );

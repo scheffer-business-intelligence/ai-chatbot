@@ -2,7 +2,6 @@
 
 import { ChevronUp } from "lucide-react";
 import Image from "next/image";
-import { useRouter } from "next/navigation";
 import type { User } from "next-auth";
 import { signOut, useSession } from "next-auth/react";
 import { useTheme } from "next-themes";
@@ -18,16 +17,12 @@ import {
   SidebarMenuButton,
   SidebarMenuItem,
 } from "@/components/ui/sidebar";
-import { guestRegex } from "@/lib/constants";
 import { LoaderIcon } from "./icons";
 import { toast } from "./toast";
 
 export function SidebarUserNav({ user }: { user: User }) {
-  const router = useRouter();
-  const { data, status } = useSession();
+  const { status } = useSession();
   const { setTheme, resolvedTheme } = useTheme();
-
-  const isGuest = guestRegex.test(data?.user?.email ?? "");
 
   return (
     <SidebarMenu>
@@ -59,7 +54,7 @@ export function SidebarUserNav({ user }: { user: User }) {
                   width={24}
                 />
                 <span className="truncate" data-testid="user-email">
-                  {isGuest ? "Guest" : user?.email}
+                  {user?.email}
                 </span>
                 <ChevronUp className="ml-auto" />
               </SidebarMenuButton>
@@ -94,17 +89,13 @@ export function SidebarUserNav({ user }: { user: User }) {
                     return;
                   }
 
-                  if (isGuest) {
-                    router.push("/login");
-                  } else {
-                    signOut({
-                      redirectTo: "/",
-                    });
-                  }
+                  signOut({
+                    redirectTo: "/",
+                  });
                 }}
                 type="button"
               >
-                {isGuest ? "Faça login na sua conta" : "Sair"}
+                Sair
               </button>
             </DropdownMenuItem>
           </DropdownMenuContent>

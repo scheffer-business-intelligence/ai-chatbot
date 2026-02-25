@@ -120,6 +120,110 @@ const TABLE_DDL_STATEMENTS = [
       is_deleted BOOL
     )
   `,
+  `
+    ALTER TABLE \`${MESSAGES_TABLE_REF}\`
+    ADD COLUMN IF NOT EXISTS message_id STRING
+  `,
+  `
+    ALTER TABLE \`${MESSAGES_TABLE_REF}\`
+    ADD COLUMN IF NOT EXISTS session_id STRING
+  `,
+  `
+    ALTER TABLE \`${MESSAGES_TABLE_REF}\`
+    ADD COLUMN IF NOT EXISTS user_id STRING
+  `,
+  `
+    ALTER TABLE \`${MESSAGES_TABLE_REF}\`
+    ADD COLUMN IF NOT EXISTS role STRING
+  `,
+  `
+    ALTER TABLE \`${MESSAGES_TABLE_REF}\`
+    ADD COLUMN IF NOT EXISTS content STRING
+  `,
+  `
+    ALTER TABLE \`${MESSAGES_TABLE_REF}\`
+    ADD COLUMN IF NOT EXISTS created_at STRING
+  `,
+  `
+    ALTER TABLE \`${MESSAGES_TABLE_REF}\`
+    ADD COLUMN IF NOT EXISTS updated_at STRING
+  `,
+  `
+    ALTER TABLE \`${MESSAGES_TABLE_REF}\`
+    ADD COLUMN IF NOT EXISTS parts_json STRING
+  `,
+  `
+    ALTER TABLE \`${MESSAGES_TABLE_REF}\`
+    ADD COLUMN IF NOT EXISTS attachments_json STRING
+  `,
+  `
+    ALTER TABLE \`${MESSAGES_TABLE_REF}\`
+    ADD COLUMN IF NOT EXISTS chart_spec_json STRING
+  `,
+  `
+    ALTER TABLE \`${MESSAGES_TABLE_REF}\`
+    ADD COLUMN IF NOT EXISTS chart_error STRING
+  `,
+  `
+    ALTER TABLE \`${MESSAGES_TABLE_REF}\`
+    ADD COLUMN IF NOT EXISTS answered_in INT64
+  `,
+  `
+    ALTER TABLE \`${MESSAGES_TABLE_REF}\`
+    ADD COLUMN IF NOT EXISTS visibility STRING
+  `,
+  `
+    ALTER TABLE \`${MESSAGES_TABLE_REF}\`
+    ADD COLUMN IF NOT EXISTS is_deleted BOOL
+  `,
+  `
+    ALTER TABLE \`${FILES_TABLE_REF}\`
+    ADD COLUMN IF NOT EXISTS file_id STRING
+  `,
+  `
+    ALTER TABLE \`${FILES_TABLE_REF}\`
+    ADD COLUMN IF NOT EXISTS session_id STRING
+  `,
+  `
+    ALTER TABLE \`${FILES_TABLE_REF}\`
+    ADD COLUMN IF NOT EXISTS user_id STRING
+  `,
+  `
+    ALTER TABLE \`${FILES_TABLE_REF}\`
+    ADD COLUMN IF NOT EXISTS chat_id STRING
+  `,
+  `
+    ALTER TABLE \`${FILES_TABLE_REF}\`
+    ADD COLUMN IF NOT EXISTS message_id STRING
+  `,
+  `
+    ALTER TABLE \`${FILES_TABLE_REF}\`
+    ADD COLUMN IF NOT EXISTS filename STRING
+  `,
+  `
+    ALTER TABLE \`${FILES_TABLE_REF}\`
+    ADD COLUMN IF NOT EXISTS content_type STRING
+  `,
+  `
+    ALTER TABLE \`${FILES_TABLE_REF}\`
+    ADD COLUMN IF NOT EXISTS file_size INT64
+  `,
+  `
+    ALTER TABLE \`${FILES_TABLE_REF}\`
+    ADD COLUMN IF NOT EXISTS gcs_url STRING
+  `,
+  `
+    ALTER TABLE \`${FILES_TABLE_REF}\`
+    ADD COLUMN IF NOT EXISTS object_path STRING
+  `,
+  `
+    ALTER TABLE \`${FILES_TABLE_REF}\`
+    ADD COLUMN IF NOT EXISTS created_at STRING
+  `,
+  `
+    ALTER TABLE \`${FILES_TABLE_REF}\`
+    ADD COLUMN IF NOT EXISTS is_deleted BOOL
+  `,
 ];
 
 let ensureTablesPromise: Promise<void> | null = null;
@@ -520,8 +624,8 @@ async function getChatMetaById(chatId: string): Promise<Chat | null> {
         message_id,
         user_id,
         content,
-        parts_json,
-        visibility,
+        '{}' AS parts_json,
+        NULL AS visibility,
         created_at
       FROM \`${MESSAGES_TABLE_REF}\`
       WHERE session_id = @session_id
@@ -562,7 +666,7 @@ async function getFallbackChatFromMessages(
         session_id,
         ANY_VALUE(user_id) AS user_id,
         MIN(created_at) AS created_at,
-        ANY_VALUE(visibility) AS visibility,
+        NULL AS visibility,
         ARRAY_AGG(
           IF(role = 'user', content, NULL)
           IGNORE NULLS
@@ -616,7 +720,7 @@ async function getSessionMetadata(chatId: string) {
     `
       SELECT
         user_id,
-        visibility
+        NULL AS visibility
       FROM \`${MESSAGES_TABLE_REF}\`
       WHERE session_id = @chat_id
       ORDER BY created_at DESC
@@ -768,39 +872,6 @@ export async function createUser(email: string, password: string) {
     return [{ id: userId, email }];
   } catch (_error) {
     throw new ChatSDKError("bad_request:database", "Failed to create user");
-  }
-}
-
-export async function createGuestUser() {
-  const userId = generateUUID();
-  const email = `guest-${Date.now()}`;
-  const password = generateHashedPassword(generateUUID());
-  const now = new Date().toISOString();
-
-  try {
-    await upsertMetaMessage(
-      buildMetaRow({
-        messageId: `user:${userId}`,
-        sessionId: META_USERS_SESSION,
-        userId,
-        content: email,
-        payload: {
-          userId,
-          email,
-          password,
-          createdAt: now,
-          updatedAt: now,
-        },
-        createdAt: now,
-      })
-    );
-
-    return [{ id: userId, email }];
-  } catch (_error) {
-    throw new ChatSDKError(
-      "bad_request:database",
-      "Failed to create guest user"
-    );
   }
 }
 
@@ -978,8 +1049,8 @@ export async function getChatsByUserId({
           message_id,
           user_id,
           content,
-          parts_json,
-          visibility,
+          '{}' AS parts_json,
+          NULL AS visibility,
           created_at
         FROM \`${MESSAGES_TABLE_REF}\`
         WHERE session_id = @session_id
@@ -1038,7 +1109,7 @@ export async function getChatsByUserId({
           session_id AS id,
           ANY_VALUE(user_id) AS user_id,
           MIN(created_at) AS created_at,
-          ANY_VALUE(visibility) AS visibility,
+          NULL AS visibility,
           ARRAY_AGG(
             IF(role = 'user', content, NULL)
             IGNORE NULLS
@@ -1073,7 +1144,7 @@ export async function getChatsByUserId({
           session_id AS id,
           ANY_VALUE(user_id) AS user_id,
           MIN(created_at) AS created_at,
-          ANY_VALUE(visibility) AS visibility,
+          NULL AS visibility,
           ARRAY_AGG(
             IF(role = 'user', content, NULL)
             IGNORE NULLS
@@ -1153,7 +1224,7 @@ export async function getProviderSessionByChatId({
           message_id,
           user_id,
           content,
-          parts_json,
+          '{}' AS parts_json,
           created_at,
           updated_at
         FROM \`${MESSAGES_TABLE_REF}\`
@@ -1171,7 +1242,7 @@ export async function getProviderSessionByChatId({
           message_id,
           user_id,
           content,
-          parts_json,
+          '{}' AS parts_json,
           created_at,
           updated_at
         FROM \`${MESSAGES_TABLE_REF}\`

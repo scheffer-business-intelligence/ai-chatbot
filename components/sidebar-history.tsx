@@ -122,13 +122,22 @@ export function SidebarHistory({ user }: { user: User | undefined }) {
   const [deleteId, setDeleteId] = useState<string | null>(null);
   const [showDeleteDialog, setShowDeleteDialog] = useState(false);
 
-  const hasReachedEnd = paginatedChatHistories
-    ? paginatedChatHistories.some((page) => page.hasMore === false)
-    : false;
+  const normalizedChatHistoryPages = (paginatedChatHistories ?? []).map(
+    (page) => ({
+      chats: Array.isArray(page?.chats) ? page.chats : [],
+      hasMore: page?.hasMore === true,
+    })
+  );
 
-  const hasEmptyChatHistory = paginatedChatHistories
-    ? paginatedChatHistories.every((page) => page.chats.length === 0)
-    : false;
+  const hasReachedEnd =
+    normalizedChatHistoryPages.length > 0
+      ? normalizedChatHistoryPages.some((page) => page.hasMore === false)
+      : false;
+
+  const hasEmptyChatHistory =
+    normalizedChatHistoryPages.length > 0
+      ? normalizedChatHistoryPages.every((page) => page.chats.length === 0)
+      : false;
 
   const handleDelete = () => {
     const chatToDelete = deleteId;
@@ -221,9 +230,9 @@ export function SidebarHistory({ user }: { user: User | undefined }) {
       <SidebarGroup>
         <SidebarGroupContent>
           <SidebarMenu>
-            {paginatedChatHistories &&
+            {normalizedChatHistoryPages.length > 0 &&
               (() => {
-                const chatsFromHistory = paginatedChatHistories.flatMap(
+                const chatsFromHistory = normalizedChatHistoryPages.flatMap(
                   (paginatedChatHistory) => paginatedChatHistory.chats
                 );
 
