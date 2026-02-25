@@ -326,6 +326,79 @@ function stripContextBlocksForStream(text: string): string {
   return stripContextBlock(withoutBqAndMarkers, "CHART_CONTEXT").trimEnd();
 }
 
+function toErrorText(error: unknown): string {
+  if (error instanceof Error) {
+    return error.message.toLowerCase();
+  }
+
+  if (typeof error === "string") {
+    return error.toLowerCase();
+  }
+
+  if (!error || typeof error !== "object") {
+    return "";
+  }
+
+  try {
+    return JSON.stringify(error).toLowerCase();
+  } catch {
+    return "";
+  }
+}
+
+const INVALID_VERTEX_SESSION_STATE_MARKERS = [
+  "invalid session",
+  "session invalid",
+  "session expired",
+  "session not found",
+  "session does not exist",
+  "unknown session",
+  "invalid_argument",
+  "not_found",
+  "failed_precondition",
+];
+
+const INVALID_VERTEX_SESSION_SCOPE_MARKERS = [
+  "session_id",
+  "session id",
+  '"session"',
+  "session",
+];
+
+export function isInvalidVertexSessionError(error: unknown): boolean {
+  const errorText = toErrorText(error);
+
+  if (!errorText) {
+    return false;
+  }
+
+  const hasSessionScope = INVALID_VERTEX_SESSION_SCOPE_MARKERS.some((marker) =>
+    errorText.includes(marker)
+  );
+
+  if (!hasSessionScope) {
+    return false;
+  }
+
+  const hasInvalidState = INVALID_VERTEX_SESSION_STATE_MARKERS.some((marker) =>
+    errorText.includes(marker)
+  );
+
+  if (!hasInvalidState) {
+    return false;
+  }
+
+  return (
+    errorText.includes("vertex ai error: 400") ||
+    errorText.includes("vertex ai error: 404") ||
+    errorText.includes('"code":400') ||
+    errorText.includes('"code":404') ||
+    errorText.includes('status": "invalid_argument"') ||
+    errorText.includes('status": "not_found"') ||
+    errorText.includes('status": "failed_precondition"')
+  );
+}
+
 async function* parseJsonStream(
   stream: ReadableStream<Uint8Array>
 ): AsyncGenerator<Record<string, unknown>, void, void> {

@@ -23,7 +23,52 @@ const BQ_DATASET = process.env.BQ_DATASET || "scheffer_agente";
 const BQ_BASE_URL = "https://bigquery.googleapis.com/bigquery/v2";
 const BQ_MESSAGES_TABLE = process.env.BQ_MESSAGES_TABLE || "chat_messages";
 const BQ_FILES_TABLE = process.env.BQ_FILES_TABLE || "chat_files";
-const BQ_AUTO_CREATE_TABLES = process.env.BQ_AUTO_CREATE_TABLES !== "false";
+const BQ_AUTO_CREATE_TABLES = process.env.BQ_AUTO_CREATE_TABLES === "true";
+const BQ_REQUEST_MAX_ATTEMPTS = toPositiveInt(
+  process.env.BQ_REQUEST_MAX_ATTEMPTS,
+  3
+);
+const BQ_REQUEST_BASE_DELAY_MS = toPositiveInt(
+  process.env.BQ_REQUEST_BASE_DELAY_MS,
+  300
+);
+const BQ_REQUEST_MAX_DELAY_MS = toPositiveInt(
+  process.env.BQ_REQUEST_MAX_DELAY_MS,
+  3000
+);
+const BQ_RATE_LIMIT_COOLDOWN_MS = toPositiveInt(
+  process.env.BQ_RATE_LIMIT_COOLDOWN_MS,
+  30_000
+);
+const BQ_RATE_LIMIT_LOG_INTERVAL_MS = toPositiveInt(
+  process.env.BQ_RATE_LIMIT_LOG_INTERVAL_MS,
+  30_000
+);
+
+const RETRYABLE_BIGQUERY_STATUSES = new Set([408, 429, 500, 502, 503, 504]);
+const RETRYABLE_BIGQUERY_REASONS = new Set([
+  "backenderror",
+  "internalerror",
+  "jobratelimitexceeded",
+  "ratelimitexceeded",
+  "resourcesexhausted",
+  "timeout",
+]);
+const RATE_LIMIT_BIGQUERY_REASONS = new Set([
+  "jobratelimitexceeded",
+  "ratelimitexceeded",
+  "resourcesexhausted",
+]);
+const RETRYABLE_BIGQUERY_NETWORK_CODES = new Set([
+  "UND_ERR_CONNECT_TIMEOUT",
+  "UND_ERR_HEADERS_TIMEOUT",
+  "UND_ERR_SOCKET",
+  "ECONNRESET",
+  "ECONNREFUSED",
+  "ENETUNREACH",
+  "ETIMEDOUT",
+  "EAI_AGAIN",
+]);
 
 const MESSAGES_TABLE_REF = `${BQ_PROJECT_ID}.${BQ_DATASET}.${BQ_MESSAGES_TABLE}`;
 const FILES_TABLE_REF = `${BQ_PROJECT_ID}.${BQ_DATASET}.${BQ_FILES_TABLE}`;
@@ -229,6 +274,131 @@ const TABLE_DDL_STATEMENTS = [
 let ensureTablesPromise: Promise<void> | null = null;
 let tablesEnsured = false;
 let autoCreateDisabled = false;
+let bqRateLimitCooldownUntilMs = 0;
+let bqRateLimitLastLoggedAtMs = 0;
+
+function toPositiveInt(value: string | undefined, fallback: number): number {
+  const parsed = Number.parseInt(value ?? "", 10);
+
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return fallback;
+  }
+
+  return parsed;
+}
+
+function delay(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function computeBackoffDelayMs(attempt: number) {
+  const exponential = BQ_REQUEST_BASE_DELAY_MS * 2 ** (attempt - 1);
+  const jitter = Math.floor(Math.random() * BQ_REQUEST_BASE_DELAY_MS);
+  return Math.min(exponential + jitter, BQ_REQUEST_MAX_DELAY_MS);
+}
+
+function extractBigQueryErrorCode(error: unknown): string | undefined {
+  if (!error || typeof error !== "object") {
+    return undefined;
+  }
+
+  const typedError = error as { code?: unknown; cause?: { code?: unknown } };
+  if (typeof typedError.code === "string") {
+    return typedError.code;
+  }
+
+  if (typedError.cause && typeof typedError.cause.code === "string") {
+    return typedError.cause.code;
+  }
+
+  return undefined;
+}
+
+function isRetryableBigQueryNetworkError(error: unknown): boolean {
+  if (error instanceof Error && error.name === "AbortError") {
+    return true;
+  }
+
+  const code = extractBigQueryErrorCode(error);
+  return Boolean(code && RETRYABLE_BIGQUERY_NETWORK_CODES.has(code));
+}
+
+function normalizeBigQueryReason(value: string | undefined): string {
+  return (value ?? "unknown").trim().toLowerCase();
+}
+
+function parseBigQueryErrorResponse(status: number, errorText: string) {
+  let message = errorText;
+  let reason = "unknown";
+
+  try {
+    const parsed = JSON.parse(errorText) as {
+      error?: {
+        message?: unknown;
+        status?: unknown;
+        errors?: Array<{ reason?: unknown }>;
+      };
+    };
+
+    if (typeof parsed.error?.message === "string" && parsed.error.message) {
+      message = parsed.error.message;
+    }
+
+    const firstReason = parsed.error?.errors?.[0]?.reason;
+    if (typeof firstReason === "string" && firstReason) {
+      reason = firstReason;
+    } else if (
+      typeof parsed.error?.status === "string" &&
+      parsed.error.status
+    ) {
+      reason = parsed.error.status;
+    }
+  } catch {
+    // Keep raw text when payload is not JSON.
+  }
+
+  return {
+    status,
+    reason: normalizeBigQueryReason(reason),
+    message,
+  };
+}
+
+function isRetryableBigQueryError(status: number, reason: string): boolean {
+  if (RETRYABLE_BIGQUERY_STATUSES.has(status)) {
+    return true;
+  }
+
+  return RETRYABLE_BIGQUERY_REASONS.has(normalizeBigQueryReason(reason));
+}
+
+function isBigQueryRateLimitReason(reason: string): boolean {
+  return RATE_LIMIT_BIGQUERY_REASONS.has(normalizeBigQueryReason(reason));
+}
+
+class BigQueryRequestError extends Error {
+  statusCode: number;
+  reason: string;
+  retryable: boolean;
+
+  constructor({
+    statusCode,
+    reason,
+    message,
+    retryable,
+  }: {
+    statusCode: number;
+    reason: string;
+    message: string;
+    retryable: boolean;
+  }) {
+    super(message);
+    this.name = "BigQueryRequestError";
+    this.statusCode = statusCode;
+    this.reason = reason;
+    this.retryable = retryable;
+  }
+}
 
 function buildQueryParameters(
   params: QueryParameter[]
@@ -498,21 +668,114 @@ async function bigQueryRequest(
   path: string,
   body: Record<string, unknown>
 ): Promise<Record<string, unknown>> {
-  const response = await fetch(`${BQ_BASE_URL}/${path}`, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${accessToken}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify(body),
-  });
+  const now = Date.now();
 
-  if (!response.ok) {
-    const errorText = await response.text();
-    throw new Error(`BigQuery error: ${response.status} - ${errorText}`);
+  if (now < bqRateLimitCooldownUntilMs) {
+    const remainingMs = bqRateLimitCooldownUntilMs - now;
+
+    if (now - bqRateLimitLastLoggedAtMs >= BQ_RATE_LIMIT_LOG_INTERVAL_MS) {
+      bqRateLimitLastLoggedAtMs = now;
+      console.warn(
+        `BigQuery rate-limit cooldown active for ${remainingMs}ms. Skipping request.`
+      );
+    }
+
+    throw new BigQueryRequestError({
+      statusCode: 429,
+      reason: "jobratelimitexceeded",
+      message: `BigQuery rate-limit cooldown active (${remainingMs}ms remaining).`,
+      retryable: true,
+    });
   }
 
-  return (await response.json()) as Record<string, unknown>;
+  let lastError: unknown;
+
+  for (let attempt = 1; attempt <= BQ_REQUEST_MAX_ATTEMPTS; attempt += 1) {
+    let shouldRetry = false;
+
+    try {
+      const response = await fetch(`${BQ_BASE_URL}/${path}`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(body),
+      });
+
+      if (response.ok) {
+        return (await response.json()) as Record<string, unknown>;
+      }
+
+      const errorText = await response.text();
+      const parsedError = parseBigQueryErrorResponse(
+        response.status,
+        errorText
+      );
+      const retryable = isRetryableBigQueryError(
+        parsedError.status,
+        parsedError.reason
+      );
+
+      if (isBigQueryRateLimitReason(parsedError.reason)) {
+        bqRateLimitCooldownUntilMs = Date.now() + BQ_RATE_LIMIT_COOLDOWN_MS;
+
+        const logNow = Date.now();
+        if (
+          logNow - bqRateLimitLastLoggedAtMs >=
+          BQ_RATE_LIMIT_LOG_INTERVAL_MS
+        ) {
+          bqRateLimitLastLoggedAtMs = logNow;
+          console.warn(
+            "BigQuery rate limit detected. Entering cooldown window.",
+            {
+              reason: parsedError.reason,
+              cooldownMs: BQ_RATE_LIMIT_COOLDOWN_MS,
+            }
+          );
+        }
+      }
+
+      const requestError = new BigQueryRequestError({
+        statusCode: parsedError.status,
+        reason: parsedError.reason,
+        message: `BigQuery error: ${parsedError.status} - ${parsedError.message}`,
+        retryable,
+      });
+
+      lastError = requestError;
+      shouldRetry = requestError.retryable && attempt < BQ_REQUEST_MAX_ATTEMPTS;
+
+      if (!shouldRetry) {
+        throw requestError;
+      }
+    } catch (error) {
+      if (error instanceof BigQueryRequestError) {
+        if (error.retryable && attempt < BQ_REQUEST_MAX_ATTEMPTS) {
+          lastError = error;
+          shouldRetry = true;
+        } else {
+          throw error;
+        }
+      } else if (isRetryableBigQueryNetworkError(error)) {
+        lastError = error;
+        shouldRetry = attempt < BQ_REQUEST_MAX_ATTEMPTS;
+      } else {
+        const reason = error instanceof Error ? error.message : String(error);
+        throw new Error(`BigQuery request failed: ${reason}`);
+      }
+    }
+
+    if (shouldRetry) {
+      await delay(computeBackoffDelayMs(attempt));
+    }
+  }
+
+  if (lastError instanceof Error) {
+    throw lastError;
+  }
+
+  throw new Error("BigQuery request failed after retries.");
 }
 
 async function runQueryRaw(
@@ -536,7 +799,7 @@ async function runQueryRaw(
   );
 }
 
-async function ensureBigQueryTables(accessToken?: string) {
+export async function ensureBigQueryTables(accessToken?: string) {
   if (!BQ_AUTO_CREATE_TABLES || tablesEnsured || autoCreateDisabled) {
     return;
   }
@@ -571,7 +834,6 @@ async function runQuery(
   params: QueryParameter[] = []
 ): Promise<Record<string, unknown>> {
   const accessToken = await getServiceAccountAccessToken();
-  await ensureBigQueryTables(accessToken);
   return await runQueryRaw(accessToken, query, params);
 }
 
@@ -584,7 +846,11 @@ async function queryRows(
     const response = await runQuery(query, params);
     return mapResponseRows(response);
   } catch (error) {
-    if (!fallbackQuery) {
+    const shouldSkipFallback =
+      error instanceof BigQueryRequestError &&
+      (isBigQueryRateLimitReason(error.reason) || error.statusCode === 429);
+
+    if (!fallbackQuery || shouldSkipFallback) {
       throw error;
     }
 
@@ -595,7 +861,6 @@ async function queryRows(
 
 async function upsertMetaMessage(row: BigQueryChatMessageRow) {
   const accessToken = await getServiceAccountAccessToken();
-  await ensureBigQueryTables(accessToken);
   await upsertChatMessageRow(accessToken, row);
 }
 
@@ -1349,7 +1614,6 @@ export async function saveMessages({ messages }: { messages: DBMessage[] }) {
     );
 
     const accessToken = await getServiceAccountAccessToken();
-    await ensureBigQueryTables(accessToken);
 
     const metadataCache = new Map<
       string,

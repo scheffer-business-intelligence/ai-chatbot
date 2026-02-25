@@ -44,6 +44,7 @@ import { generateUUID, getTextFromMessage } from "@/lib/utils";
 import {
   AGENT_ENGINE_PROVIDER_ID,
   createVertexSession,
+  isInvalidVertexSessionError,
   streamVertexQuery,
   type VertexExtractedContext,
 } from "@/lib/vertex/agent-engine";
@@ -52,8 +53,87 @@ import { type PostRequestBody, postRequestBodySchema } from "./schema";
 
 export const maxDuration = 300;
 const DEFAULT_AGENT_ENGINE_MAX_INLINE_FILE_BYTES = 5 * 1024 * 1024;
+const AGENT_ENGINE_SESSION_RECOVERY_ATTEMPTS = 1;
 const AGENT_ENGINE_INLINE_XLSX_MIME_TYPE =
   "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
+const agentSessionRefreshLocks = new Map<string, Promise<string>>();
+
+function resetExtractedContext(context: VertexExtractedContext) {
+  context.chartSpec = null;
+  context.chartError = null;
+  context.hasChartContext = false;
+  context.contextSheets = [];
+}
+
+function getAgentSessionRefreshLockKey(chatId: string) {
+  return `${AGENT_ENGINE_PROVIDER_ID}:${chatId}`;
+}
+
+async function refreshAgentEngineProviderSession({
+  chatId,
+  userId,
+  previousSessionId,
+}: {
+  chatId: string;
+  userId: string;
+  previousSessionId: string;
+}) {
+  const lockKey = getAgentSessionRefreshLockKey(chatId);
+  const inFlight = agentSessionRefreshLocks.get(lockKey);
+
+  if (inFlight) {
+    return await inFlight;
+  }
+
+  const refreshPromise = (async () => {
+    let latestProviderSession: Awaited<
+      ReturnType<typeof getProviderSessionByChatId>
+    > = null;
+
+    try {
+      latestProviderSession = await getProviderSessionByChatId({
+        chatId,
+        provider: AGENT_ENGINE_PROVIDER_ID,
+      });
+    } catch (error) {
+      console.warn(
+        "Unable to read current Agent Engine provider session before refresh. Proceeding with session recreation.",
+        { chatId, userId, error }
+      );
+    }
+
+    if (
+      latestProviderSession?.sessionId &&
+      latestProviderSession.sessionId !== previousSessionId
+    ) {
+      return latestProviderSession.sessionId;
+    }
+
+    const accessToken = await getServiceAccountAccessToken();
+    const nextSessionId = await createVertexSession(accessToken, userId);
+
+    try {
+      await upsertProviderSession({
+        chatId,
+        provider: AGENT_ENGINE_PROVIDER_ID,
+        sessionId: nextSessionId,
+        userId,
+      });
+    } catch (error) {
+      console.warn(
+        "Failed to persist refreshed Agent Engine provider session. Continuing with in-memory session for this request.",
+        { chatId, userId, error }
+      );
+    }
+
+    return nextSessionId;
+  })().finally(() => {
+    agentSessionRefreshLocks.delete(lockKey);
+  });
+
+  agentSessionRefreshLocks.set(lockKey, refreshPromise);
+  return await refreshPromise;
+}
 
 function getAgentEngineMaxInlineFileBytes() {
   const configuredLimit = process.env.AGENT_ENGINE_MAX_INLINE_FILE_BYTES;
@@ -464,10 +544,21 @@ export async function POST(request: Request) {
           ).toResponse();
         }
 
-        const existingProviderSession = await getProviderSessionByChatId({
-          chatId: id,
-          provider: AGENT_ENGINE_PROVIDER_ID,
-        });
+        let existingProviderSession: Awaited<
+          ReturnType<typeof getProviderSessionByChatId>
+        > = null;
+
+        try {
+          existingProviderSession = await getProviderSessionByChatId({
+            chatId: id,
+            provider: AGENT_ENGINE_PROVIDER_ID,
+          });
+        } catch (error) {
+          console.warn(
+            "Failed to load Agent Engine provider session from BigQuery. A new Vertex session will be created.",
+            { chatId: id, userId: session.user.id, error }
+          );
+        }
 
         let providerSessionId = existingProviderSession?.sessionId;
 
@@ -477,12 +568,19 @@ export async function POST(request: Request) {
             session.user.id
           );
 
-          await upsertProviderSession({
-            chatId: id,
-            provider: AGENT_ENGINE_PROVIDER_ID,
-            sessionId: providerSessionId,
-            userId: session.user.id,
-          });
+          try {
+            await upsertProviderSession({
+              chatId: id,
+              provider: AGENT_ENGINE_PROVIDER_ID,
+              sessionId: providerSessionId,
+              userId: session.user.id,
+            });
+          } catch (error) {
+            console.warn(
+              "Failed to persist initial Agent Engine provider session. Continuing with in-memory session for this request.",
+              { chatId: id, userId: session.user.id, error }
+            );
+          }
         }
 
         const vertexMessage = await buildVertexMessageFromUserMessage(
@@ -495,31 +593,74 @@ export async function POST(request: Request) {
           execute: async ({ writer: dataStream }) => {
             const textPartId = generateUUID();
             let hasVisibleOutput = false;
+            let activeProviderSessionId = providerSessionId;
             dataStream.write({ type: "start" });
             dataStream.write({ type: "text-start", id: textPartId });
 
-            for await (const delta of streamVertexQuery({
-              accessToken: serviceAccountAccessToken,
-              sessionId: providerSessionId,
-              userId: session.user.id,
-              message: vertexMessage,
-              signal: request.signal,
-              extractedContext,
-            })) {
-              if (!delta) {
-                continue;
-              }
+            const streamAgentEngineResponse = async (
+              currentProviderSessionId: string
+            ) => {
+              for await (const delta of streamVertexQuery({
+                accessToken: serviceAccountAccessToken,
+                sessionId: currentProviderSessionId,
+                userId: session.user.id,
+                message: vertexMessage,
+                signal: request.signal,
+                extractedContext,
+              })) {
+                if (!delta) {
+                  continue;
+                }
 
-              if (!delta.trim()) {
-                continue;
-              }
+                if (!delta.trim()) {
+                  continue;
+                }
 
-              dataStream.write({
-                type: "text-delta",
-                id: textPartId,
-                delta,
-              });
-              hasVisibleOutput = true;
+                dataStream.write({
+                  type: "text-delta",
+                  id: textPartId,
+                  delta,
+                });
+                hasVisibleOutput = true;
+              }
+            };
+
+            for (
+              let attempt = 0;
+              attempt <= AGENT_ENGINE_SESSION_RECOVERY_ATTEMPTS;
+              attempt += 1
+            ) {
+              try {
+                await streamAgentEngineResponse(activeProviderSessionId);
+                break;
+              } catch (error) {
+                const canRecoverSession =
+                  attempt < AGENT_ENGINE_SESSION_RECOVERY_ATTEMPTS &&
+                  !hasVisibleOutput &&
+                  isInvalidVertexSessionError(error);
+
+                if (!canRecoverSession) {
+                  throw error;
+                }
+
+                console.warn(
+                  "Agent Engine session appears invalid. Recreating provider session.",
+                  {
+                    chatId: id,
+                    userId: session.user.id,
+                    attempt: attempt + 1,
+                  }
+                );
+
+                resetExtractedContext(extractedContext);
+                activeProviderSessionId =
+                  await refreshAgentEngineProviderSession({
+                    chatId: id,
+                    userId: session.user.id,
+                    previousSessionId: activeProviderSessionId,
+                  });
+                providerSessionId = activeProviderSessionId;
+              }
             }
 
             if (!hasVisibleOutput) {

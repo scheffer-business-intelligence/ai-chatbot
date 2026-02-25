@@ -3,6 +3,9 @@ import { auth } from "@/app/(auth)/auth";
 import { deleteAllChatsByUserId, getChatsByUserId } from "@/lib/db/queries";
 import { ChatSDKError } from "@/lib/errors";
 
+const HISTORY_FALLBACK_LOG_COOLDOWN_MS = 30_000;
+let lastHistoryFallbackLogAt = 0;
+
 export async function GET(request: NextRequest) {
   const { searchParams } = request.nextUrl;
 
@@ -33,10 +36,14 @@ export async function GET(request: NextRequest) {
 
     return Response.json(chats);
   } catch (error) {
-    console.warn(
-      "Failed to load history from BigQuery, returning empty:",
-      error
-    );
+    const now = Date.now();
+    if (now - lastHistoryFallbackLogAt >= HISTORY_FALLBACK_LOG_COOLDOWN_MS) {
+      lastHistoryFallbackLogAt = now;
+      console.warn(
+        "Failed to load history from BigQuery, returning empty:",
+        error
+      );
+    }
     return Response.json({ chats: [], hasMore: false });
   }
 }
