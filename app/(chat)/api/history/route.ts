@@ -1,5 +1,6 @@
 import type { NextRequest } from "next/server";
 import { auth } from "@/app/(auth)/auth";
+import { getBigQueryUserIdCandidates } from "@/lib/auth/user-id";
 import { deleteAllChatsByUserId, getChatsByUserId } from "@/lib/db/queries";
 import { ChatSDKError } from "@/lib/errors";
 
@@ -26,13 +27,32 @@ export async function GET(request: NextRequest) {
     return new ChatSDKError("unauthorized:chat").toResponse();
   }
 
+  const [bigQueryUserId, fallbackBigQueryUserId] =
+    getBigQueryUserIdCandidates(session.user);
+  if (!bigQueryUserId) {
+    return new ChatSDKError("unauthorized:chat").toResponse();
+  }
+
   try {
-    const chats = await getChatsByUserId({
-      id: session.user.id,
+    let chats = await getChatsByUserId({
+      id: bigQueryUserId,
       limit,
       startingAfter,
       endingBefore,
     });
+
+    if (
+      chats.chats.length === 0 &&
+      fallbackBigQueryUserId &&
+      fallbackBigQueryUserId !== bigQueryUserId
+    ) {
+      chats = await getChatsByUserId({
+        id: fallbackBigQueryUserId,
+        limit,
+        startingAfter,
+        endingBefore,
+      });
+    }
 
     return Response.json(chats);
   } catch (error) {
@@ -55,7 +75,21 @@ export async function DELETE() {
     return new ChatSDKError("unauthorized:chat").toResponse();
   }
 
-  const result = await deleteAllChatsByUserId({ userId: session.user.id });
+  const [bigQueryUserId, fallbackBigQueryUserId] =
+    getBigQueryUserIdCandidates(session.user);
+  if (!bigQueryUserId) {
+    return new ChatSDKError("unauthorized:chat").toResponse();
+  }
 
-  return Response.json(result, { status: 200 });
+  const distinctUserIds = [
+    ...new Set([bigQueryUserId, fallbackBigQueryUserId].filter(Boolean)),
+  ] as string[];
+  let deletedCount = 0;
+
+  for (const userId of distinctUserIds) {
+    const result = await deleteAllChatsByUserId({ userId });
+    deletedCount += result.deletedCount;
+  }
+
+  return Response.json({ deletedCount }, { status: 200 });
 }

@@ -1,7 +1,6 @@
 "use client";
 import type { UseChatHelpers } from "@ai-sdk/react";
 import { useState } from "react";
-import type { Vote } from "@/lib/db/schema";
 import {
   DATA_FROM_CONTEXT_MARKER,
   type ExportContextSheet,
@@ -10,8 +9,8 @@ import {
 } from "@/lib/export-context";
 import type { ChatMessage } from "@/lib/types";
 import { cn, sanitizeText } from "@/lib/utils";
+import { useDataStream } from "@/components/data-stream-provider";
 import { ChartRenderer } from "./charts/chart-renderer";
-import { useDataStream } from "./data-stream-provider";
 import { DocumentPreview } from "./document-preview";
 import { MessageContent } from "./elements/message";
 import { Response } from "./elements/response";
@@ -25,10 +24,9 @@ import { PreviewAttachment } from "./preview-attachment";
 import { Weather } from "./weather";
 
 const PurePreviewMessage = ({
-  addToolApprovalResponse,
   chatId,
+  addToolApprovalResponse,
   message,
-  vote,
   isLoading,
   setMessages,
   regenerate,
@@ -38,10 +36,9 @@ const PurePreviewMessage = ({
   inheritedExportContextSheets = [],
   requiresScrollPadding: _requiresScrollPadding,
 }: {
-  addToolApprovalResponse: UseChatHelpers<ChatMessage>["addToolApprovalResponse"];
   chatId: string;
+  addToolApprovalResponse: UseChatHelpers<ChatMessage>["addToolApprovalResponse"];
   message: ChatMessage;
-  vote: Vote | undefined;
   isLoading: boolean;
   setMessages: UseChatHelpers<ChatMessage>["setMessages"];
   regenerate: UseChatHelpers<ChatMessage>["regenerate"];
@@ -431,7 +428,6 @@ const PurePreviewMessage = ({
               message={message}
               regenerate={onRegenerate ?? regenerate}
               setMode={setMode}
-              vote={vote}
             />
           )}
         </div>
@@ -442,7 +438,11 @@ const PurePreviewMessage = ({
 
 export const PreviewMessage = PurePreviewMessage;
 
-export const ThinkingMessage = () => {
+export const ThinkingMessage = ({ statusText }: { statusText?: string }) => {
+  const normalizedStatus = statusText?.trim();
+  const showThinkingDots = !normalizedStatus;
+  const label = normalizedStatus ?? "Pensando";
+
   return (
     <div
       className="group/message fade-in w-full animate-in duration-300"
@@ -458,12 +458,14 @@ export const ThinkingMessage = () => {
 
         <div className="flex w-full flex-col gap-2 md:gap-4">
           <div className="flex items-center gap-1 p-0 text-muted-foreground text-sm">
-            <span className="animate-pulse">Pensando</span>
-            <span className="inline-flex">
-              <span className="animate-bounce [animation-delay:0ms]">.</span>
-              <span className="animate-bounce [animation-delay:150ms]">.</span>
-              <span className="animate-bounce [animation-delay:300ms]">.</span>
-            </span>
+            <span className="animate-pulse">{label}</span>
+            {showThinkingDots && (
+              <span className="inline-flex">
+                <span className="animate-bounce [animation-delay:0ms]">.</span>
+                <span className="animate-bounce [animation-delay:150ms]">.</span>
+                <span className="animate-bounce [animation-delay:300ms]">.</span>
+              </span>
+            )}
           </div>
         </div>
       </div>

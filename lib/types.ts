@@ -39,6 +39,7 @@ export type CustomUIDataTypes = {
   clear: null;
   finish: null;
   "chat-title": string;
+  "agent-status": string;
   "chart-spec": ChartSpecV1;
   "chart-warning": string;
   "export-context": ExportContextSheet[];

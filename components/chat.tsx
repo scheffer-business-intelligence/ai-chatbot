@@ -3,8 +3,8 @@
 import { useChat } from "@ai-sdk/react";
 import { DefaultChatTransport } from "ai";
 import { useRouter, useSearchParams } from "next/navigation";
-import { useEffect, useRef, useState } from "react";
-import useSWR, { useSWRConfig } from "swr";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { useSWRConfig } from "swr";
 import { unstable_serialize } from "swr/infinite";
 import { ChatHeader } from "@/components/chat-header";
 import {
@@ -17,13 +17,13 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
+import { Button } from "@/components/ui/button";
 import { useArtifactSelector } from "@/hooks/use-artifact";
-import type { Vote } from "@/lib/db/schema";
 import { ChatSDKError } from "@/lib/errors";
 import type { Attachment, ChatMessage } from "@/lib/types";
-import { fetcher, fetchWithErrorHandlers, generateUUID } from "@/lib/utils";
+import { fetchWithErrorHandlers, generateUUID } from "@/lib/utils";
 import { Artifact } from "./artifact";
-import { useDataStream } from "./data-stream-provider";
+import { useDataStream } from "@/components/data-stream-provider";
 import { Messages } from "./messages";
 import { MultimodalInput } from "./multimodal-input";
 import { getChatHistoryPaginationKey } from "./sidebar-history";
@@ -58,8 +58,11 @@ export function Chat({
 
   const [input, setInput] = useState<string>("");
   const [showCreditCardAlert, setShowCreditCardAlert] = useState(false);
+  const [isContinuingSharedChat, setIsContinuingSharedChat] = useState(false);
   const [currentModelId, setCurrentModelId] = useState(initialChatModel);
+  const [agentStatus, setAgentStatus] = useState<string | null>(null);
   const currentModelIdRef = useRef(currentModelId);
+  const hasStreamedAssistantTextRef = useRef(false);
 
   useEffect(() => {
     currentModelIdRef.current = currentModelId;
@@ -119,11 +122,28 @@ export function Chat({
     }),
     onData: (dataPart) => {
       setDataStream((ds) => (ds ? [...ds, dataPart] : []));
+
+      if (dataPart.type === "data-agent-status") {
+        if (hasStreamedAssistantTextRef.current) {
+          return;
+        }
+
+        const normalizedStatus =
+          typeof dataPart.data === "string" ? dataPart.data.trim() : "";
+
+        if (normalizedStatus) {
+          setAgentStatus(normalizedStatus);
+        }
+      }
     },
     onFinish: () => {
+      hasStreamedAssistantTextRef.current = false;
+      setAgentStatus(null);
       mutate(unstable_serialize(getChatHistoryPaginationKey));
     },
     onError: (error) => {
+      hasStreamedAssistantTextRef.current = false;
+      setAgentStatus(null);
       if (error instanceof ChatSDKError) {
         if (
           error.message?.includes("AI Gateway requires a valid credit card")
@@ -153,6 +173,59 @@ export function Chat({
     },
   });
 
+  useEffect(() => {
+    const lastMessage = messages.at(-1);
+    if (!lastMessage || lastMessage.role !== "assistant") {
+      return;
+    }
+
+    const hasVisibleAssistantContent =
+      lastMessage.parts?.some((part) => {
+        if (part.type === "text") {
+          return part.text.trim().length > 0;
+        }
+
+        if (part.type === "reasoning") {
+          return part.text.trim().length > 0;
+        }
+
+        if (part.type.startsWith("tool-")) {
+          return true;
+        }
+
+        if (
+          part.type === "data-chart-spec" ||
+          part.type === "data-chart-warning" ||
+          part.type === "data-export-context"
+        ) {
+          return true;
+        }
+
+        return part.type === "file";
+      }) ?? false;
+
+    if (hasVisibleAssistantContent) {
+      hasStreamedAssistantTextRef.current = true;
+      setAgentStatus(null);
+    }
+  }, [messages]);
+
+  useEffect(() => {
+    if (status === "error" || status === "ready") {
+      hasStreamedAssistantTextRef.current = false;
+      setAgentStatus(null);
+    }
+  }, [status]);
+
+  const sendMessageWithStatusReset: typeof sendMessage = useCallback(
+    (message, options) => {
+      hasStreamedAssistantTextRef.current = false;
+      setAgentStatus(null);
+      return sendMessage(message, options);
+    },
+    [sendMessage]
+  );
+
   const searchParams = useSearchParams();
   const query = searchParams.get("query");
 
@@ -160,7 +233,7 @@ export function Chat({
 
   useEffect(() => {
     if (query && !hasAppendedQuery) {
-      sendMessage({
+      sendMessageWithStatusReset({
         role: "user" as const,
         parts: [{ type: "text", text: query }],
       });
@@ -168,15 +241,62 @@ export function Chat({
       setHasAppendedQuery(true);
       window.history.replaceState({}, "", `/chat/${id}`);
     }
-  }, [query, sendMessage, hasAppendedQuery, id]);
-
-  const { data: votes } = useSWR<Vote[]>(
-    messages.length >= 2 ? `/api/vote?chatId=${id}` : null,
-    fetcher
-  );
+  }, [query, sendMessageWithStatusReset, hasAppendedQuery, id]);
 
   const [attachments, setAttachments] = useState<Attachment[]>([]);
   const isArtifactVisible = useArtifactSelector((state) => state.isVisible);
+
+  const handleContinueSharedChat = useCallback(async () => {
+    if (isContinuingSharedChat) {
+      return;
+    }
+
+    setIsContinuingSharedChat(true);
+
+    try {
+      const response = await fetch("/api/share/continue", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ chatId: id }),
+      });
+
+      const payload = (await response.json().catch(() => null)) as
+        | { chatId?: string; message?: string; cause?: string; error?: string }
+        | null;
+
+      if (!response.ok) {
+        throw new Error(
+          payload?.cause ||
+            payload?.error ||
+            payload?.message ||
+            "Falha ao criar nova sessão."
+        );
+      }
+
+      const nextChatId = payload?.chatId;
+      if (!nextChatId) {
+        throw new Error("Falha ao criar nova sessão.");
+      }
+
+      await mutate(unstable_serialize(getChatHistoryPaginationKey));
+      router.push(`/chat/${nextChatId}`);
+      router.refresh();
+      toast({
+        type: "success",
+        description: "Nova sessão criada com o contexto da conversa.",
+      });
+    } catch (error) {
+      toast({
+        type: "error",
+        description:
+          error instanceof Error ? error.message : "Falha ao continuar conversa.",
+      });
+    } finally {
+      setIsContinuingSharedChat(false);
+    }
+  }, [id, isContinuingSharedChat, mutate, router]);
 
   return (
     <>
@@ -185,6 +305,7 @@ export function Chat({
 
         <Messages
           addToolApprovalResponse={addToolApprovalResponse}
+          agentStatus={agentStatus}
           chatId={id}
           isArtifactVisible={isArtifactVisible}
           isReadonly={isReadonly}
@@ -193,7 +314,6 @@ export function Chat({
           selectedModelId={initialChatModel}
           setMessages={setMessages}
           status={status}
-          votes={votes}
         />
 
         <div className="sticky bottom-0 z-1 mx-auto flex w-full max-w-4xl gap-2 border-t-0 bg-background px-2 pb-3 md:px-4 md:pb-4">
@@ -205,7 +325,7 @@ export function Chat({
               messages={messages}
               onModelChange={setCurrentModelId}
               selectedModelId={currentModelId}
-              sendMessage={sendMessage}
+              sendMessage={sendMessageWithStatusReset}
               setAttachments={setAttachments}
               setInput={setInput}
               setMessages={setMessages}
@@ -213,11 +333,29 @@ export function Chat({
               stop={stop}
             />
           )}
+          {isReadonly && (
+            <div className="flex w-full items-center justify-between gap-3 rounded-lg border bg-muted/20 px-3 py-2">
+              <p className="text-muted-foreground text-sm">
+                Este chat compartilhado está em modo somente leitura.
+              </p>
+              <Button
+                disabled={isContinuingSharedChat}
+                onClick={handleContinueSharedChat}
+                size="sm"
+                type="button"
+              >
+                {isContinuingSharedChat
+                  ? "Abrindo..."
+                  : "Continuar em nova conversa"}
+              </Button>
+            </div>
+          )}
         </div>
       </div>
 
       <Artifact
         addToolApprovalResponse={addToolApprovalResponse}
+        agentStatus={agentStatus}
         attachments={attachments}
         chatId={id}
         input={input}
@@ -225,13 +363,12 @@ export function Chat({
         messages={messages}
         regenerate={regenerate}
         selectedModelId={currentModelId}
-        sendMessage={sendMessage}
+        sendMessage={sendMessageWithStatusReset}
         setAttachments={setAttachments}
         setInput={setInput}
         setMessages={setMessages}
         status={status}
         stop={stop}
-        votes={votes}
       />
 
       <AlertDialog

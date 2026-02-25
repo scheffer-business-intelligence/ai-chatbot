@@ -17,7 +17,7 @@ import { imageArtifact } from "@/artifacts/image/client";
 import { sheetArtifact } from "@/artifacts/sheet/client";
 import { textArtifact } from "@/artifacts/text/client";
 import { useArtifact } from "@/hooks/use-artifact";
-import type { Document, Vote } from "@/lib/db/schema";
+import type { Document } from "@/lib/db/schema";
 import type { Attachment, ChatMessage } from "@/lib/types";
 import { fetcher } from "@/lib/utils";
 import { ArtifactActions } from "./artifact-actions";
@@ -53,6 +53,7 @@ export type UIArtifact = {
 
 function PureArtifact({
   addToolApprovalResponse,
+  agentStatus,
   chatId,
   input,
   setInput,
@@ -64,11 +65,11 @@ function PureArtifact({
   messages,
   setMessages,
   regenerate,
-  votes,
   isReadonly,
   selectedModelId,
 }: {
   addToolApprovalResponse: UseChatHelpers<ChatMessage>["addToolApprovalResponse"];
+  agentStatus: string | null;
   chatId: string;
   input: string;
   setInput: Dispatch<SetStateAction<string>>;
@@ -78,7 +79,6 @@ function PureArtifact({
   setAttachments: Dispatch<SetStateAction<Attachment[]>>;
   messages: ChatMessage[];
   setMessages: UseChatHelpers<ChatMessage>["setMessages"];
-  votes: Vote[] | undefined;
   sendMessage: UseChatHelpers<ChatMessage>["sendMessage"];
   regenerate: UseChatHelpers<ChatMessage>["regenerate"];
   isReadonly: boolean;
@@ -320,6 +320,7 @@ function PureArtifact({
               <div className="flex h-full flex-col items-center justify-between">
                 <ArtifactMessages
                   addToolApprovalResponse={addToolApprovalResponse}
+                  agentStatus={agentStatus}
                   artifactStatus={artifact.status}
                   chatId={chatId}
                   isReadonly={isReadonly}
@@ -327,7 +328,6 @@ function PureArtifact({
                   regenerate={regenerate}
                   setMessages={setMessages}
                   status={status}
-                  votes={votes}
                 />
 
                 <div className="relative flex w-full flex-row items-end gap-2 px-4 pb-4">
@@ -508,10 +508,10 @@ function PureArtifact({
 }
 
 export const Artifact = memo(PureArtifact, (prevProps, nextProps) => {
-  if (prevProps.status !== nextProps.status) {
+  if (prevProps.agentStatus !== nextProps.agentStatus) {
     return false;
   }
-  if (!equal(prevProps.votes, nextProps.votes)) {
+  if (prevProps.status !== nextProps.status) {
     return false;
   }
   if (prevProps.input !== nextProps.input) {

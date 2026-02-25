@@ -6,6 +6,7 @@ import { auth } from "@/app/(auth)/auth";
 import { Chat } from "@/components/chat";
 import { DataStreamHandler } from "@/components/data-stream-handler";
 import { chatModels, DEFAULT_CHAT_MODEL } from "@/lib/ai/models";
+import { getBigQueryUserIdCandidates } from "@/lib/auth/user-id";
 import { getChatMessagesByChatId } from "@/lib/chat-store";
 import { getChatById } from "@/lib/db/queries";
 
@@ -26,22 +27,39 @@ async function ChatPage({ params }: { params: Promise<{ id: string }> }) {
   }
 
   const session = await auth();
+  const sessionUser = session?.user;
 
-  if (!session) {
+  let isOwner = false;
+  let resolvedUserId = chat.userId;
+  let resolvedFallbackUserId: string | undefined;
+
+  if (sessionUser) {
+    const [bigQueryUserId, fallbackBigQueryUserId] =
+      getBigQueryUserIdCandidates(sessionUser);
+    const chatOwnerIds = new Set(
+      [sessionUser.id, bigQueryUserId, fallbackBigQueryUserId].filter(
+        Boolean
+      ) as string[]
+    );
+
+    isOwner = chatOwnerIds.has(chat.userId);
+
+    if (!isOwner && chat.visibility !== "public") {
+      return notFound();
+    }
+
+    if (isOwner) {
+      resolvedUserId = bigQueryUserId || chat.userId;
+      resolvedFallbackUserId = fallbackBigQueryUserId || undefined;
+    }
+  } else if (chat.visibility !== "public") {
     redirect(`/login?callbackUrl=${encodeURIComponent(`/chat/${id}`)}`);
-  }
-
-  if (!session.user) {
-    return notFound();
-  }
-
-  if (session.user.id !== chat.userId) {
-    return notFound();
   }
 
   const uiMessages = await getChatMessagesByChatId({
     chatId: id,
-    userId: chat.userId,
+    userId: resolvedUserId,
+    fallbackUserId: isOwner ? resolvedFallbackUserId : undefined,
   });
 
   const cookieStore = await cookies();
@@ -59,7 +77,7 @@ async function ChatPage({ params }: { params: Promise<{ id: string }> }) {
           id={chat.id}
           initialChatModel={DEFAULT_CHAT_MODEL}
           initialMessages={uiMessages}
-          isReadonly={session?.user?.id !== chat.userId}
+          isReadonly={!isOwner}
         />
         <DataStreamHandler />
       </>
@@ -72,7 +90,7 @@ async function ChatPage({ params }: { params: Promise<{ id: string }> }) {
         id={chat.id}
         initialChatModel={selectedModelId}
         initialMessages={uiMessages}
-        isReadonly={session?.user?.id !== chat.userId}
+        isReadonly={!isOwner}
       />
       <DataStreamHandler />
     </>

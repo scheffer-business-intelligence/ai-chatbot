@@ -1,10 +1,8 @@
 import type { UseChatHelpers } from "@ai-sdk/react";
-import equal from "fast-deep-equal";
 import { AnimatePresence, motion } from "framer-motion";
 import { memo } from "react";
 import { deleteTrailingMessages } from "@/app/(chat)/actions";
 import { useMessages } from "@/hooks/use-messages";
-import type { Vote } from "@/lib/db/schema";
 import {
   type ExportContextSheet,
   extractContextSheets,
@@ -16,10 +14,10 @@ import type { UIArtifact } from "./artifact";
 import { PreviewMessage, ThinkingMessage } from "./message";
 
 type ArtifactMessagesProps = {
-  addToolApprovalResponse: UseChatHelpers<ChatMessage>["addToolApprovalResponse"];
   chatId: string;
+  addToolApprovalResponse: UseChatHelpers<ChatMessage>["addToolApprovalResponse"];
+  agentStatus: string | null;
   status: UseChatHelpers<ChatMessage>["status"];
-  votes: Vote[] | undefined;
   messages: ChatMessage[];
   setMessages: UseChatHelpers<ChatMessage>["setMessages"];
   regenerate: UseChatHelpers<ChatMessage>["regenerate"];
@@ -57,10 +55,10 @@ function getContextSheetsFromMessage(
 }
 
 function PureArtifactMessages({
-  addToolApprovalResponse,
   chatId,
+  addToolApprovalResponse,
+  agentStatus,
   status,
-  votes,
   messages,
   setMessages,
   regenerate,
@@ -125,8 +123,13 @@ function PureArtifactMessages({
       );
     })();
 
-  const shouldShowThinkingMessage =
+  const isWaitingForAssistant =
     !hasToolApprovalResponse &&
+    (status === "submitted" || status === "streaming");
+  const shouldShowStatusLine = isWaitingForAssistant && Boolean(agentStatus);
+  const shouldShowThinkingFallback =
+    isWaitingForAssistant &&
+    !agentStatus &&
     (status === "submitted" ||
       (status === "streaming" && !hasVisibleStreamingAssistantContent));
 
@@ -199,18 +202,22 @@ function PureArtifactMessages({
                 hasSentMessage && index === messages.length - 1
               }
               setMessages={setMessages}
-              vote={
-                votes
-                  ? votes.find((vote) => vote.messageId === message.id)
-                  : undefined
-              }
             />
           );
         });
       })()}
 
       <AnimatePresence mode="wait">
-        {shouldShowThinkingMessage && <ThinkingMessage key="thinking" />}
+        {shouldShowStatusLine && (
+          <ThinkingMessage
+            key={agentStatus ? `thinking-${agentStatus}` : "thinking"}
+            statusText={agentStatus ?? undefined}
+          />
+        )}
+      </AnimatePresence>
+
+      <AnimatePresence mode="wait">
+        {shouldShowThinkingFallback && <ThinkingMessage key="thinking" />}
       </AnimatePresence>
 
       <motion.div
@@ -227,6 +234,10 @@ function areEqual(
   prevProps: ArtifactMessagesProps,
   nextProps: ArtifactMessagesProps
 ) {
+  if (prevProps.agentStatus !== nextProps.agentStatus) {
+    return false;
+  }
+
   if (
     prevProps.artifactStatus === "streaming" &&
     nextProps.artifactStatus === "streaming"
@@ -241,9 +252,6 @@ function areEqual(
     return false;
   }
   if (prevProps.messages.length !== nextProps.messages.length) {
-    return false;
-  }
-  if (!equal(prevProps.votes, nextProps.votes)) {
     return false;
   }
 

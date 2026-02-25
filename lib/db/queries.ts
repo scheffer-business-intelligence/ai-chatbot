@@ -77,6 +77,7 @@ const META_USERS_SESSION = `${META_SESSION_PREFIX}users`;
 const META_CHATS_SESSION = `${META_SESSION_PREFIX}chats`;
 const META_PROVIDER_SESSION = `${META_SESSION_PREFIX}providers`;
 const META_DOCUMENTS_SESSION = `${META_SESSION_PREFIX}documents`;
+const CHAT_META_MESSAGE_PREFIX = "chat:";
 
 export type VisibilityType = "private" | "public";
 
@@ -277,6 +278,12 @@ let tablesEnsured = false;
 let autoCreateDisabled = false;
 let bqRateLimitCooldownUntilMs = 0;
 let bqRateLimitLastLoggedAtMs = 0;
+const CHATS_QUERY_FALLBACK_LOG_COOLDOWN_MS = 5 * 60_000;
+let lastChatsQueryFallbackLogAtMs = 0;
+const CHAT_BY_ID_ERROR_LOG_COOLDOWN_MS = 60_000;
+let lastChatByIdErrorLogAtMs = 0;
+const MESSAGE_BY_ID_ERROR_LOG_COOLDOWN_MS = 60_000;
+let lastMessageByIdErrorLogAtMs = 0;
 
 function toPositiveInt(value: string | undefined, fallback: number): number {
   const parsed = Number.parseInt(value ?? "", 10);
@@ -876,13 +883,15 @@ async function getChatMetaById(chatId: string): Promise<Chat | null> {
         visibility,
         created_at
       FROM \`${MESSAGES_TABLE_REF}\`
-      WHERE session_id = @session_id
-        AND message_id = @message_id
+      WHERE message_id = @message_id
+        AND role = 'system'
+        AND (session_id = @chat_session_id OR session_id = @legacy_session_id)
         AND (is_deleted IS NULL OR is_deleted = FALSE)
       LIMIT 1
     `,
     [
-      { name: "session_id", type: "STRING", value: META_CHATS_SESSION },
+      { name: "chat_session_id", type: "STRING", value: chatId },
+      { name: "legacy_session_id", type: "STRING", value: META_CHATS_SESSION },
       { name: "message_id", type: "STRING", value: `chat:${chatId}` },
     ],
     `
@@ -890,12 +899,13 @@ async function getChatMetaById(chatId: string): Promise<Chat | null> {
         message_id,
         user_id,
         content,
-        '{}' AS parts_json,
+        parts_json,
         NULL AS visibility,
         created_at
       FROM \`${MESSAGES_TABLE_REF}\`
-      WHERE session_id = @session_id
-        AND message_id = @message_id
+      WHERE message_id = @message_id
+        AND role = 'system'
+        AND (session_id = @chat_session_id OR session_id = @legacy_session_id)
       LIMIT 1
     `
   );
@@ -917,7 +927,7 @@ async function getFallbackChatFromMessages(
         ARRAY_AGG(
           IF(role = 'user', content, NULL)
           IGNORE NULLS
-          ORDER BY TIMESTAMP(created_at)
+          ORDER BY SAFE_CAST(created_at AS TIMESTAMP)
           LIMIT 1
         )[SAFE_OFFSET(0)] AS title
       FROM \`${MESSAGES_TABLE_REF}\`
@@ -979,7 +989,7 @@ async function getSessionMetadata(chatId: string) {
       FROM \`${MESSAGES_TABLE_REF}\`
       WHERE session_id = @chat_id
         AND (is_deleted IS NULL OR is_deleted = FALSE)
-      ORDER BY TIMESTAMP(created_at) DESC
+      ORDER BY SAFE_CAST(created_at AS TIMESTAMP) DESC
       LIMIT 1
     `,
     [{ name: "chat_id", type: "STRING", value: chatId }],
@@ -1058,7 +1068,7 @@ export async function getUser(email: string): Promise<User[]> {
           AND role = 'system'
           AND content = @email
           AND (is_deleted IS NULL OR is_deleted = FALSE)
-        ORDER BY TIMESTAMP(created_at) DESC
+        ORDER BY SAFE_CAST(created_at AS TIMESTAMP) DESC
       `,
       [
         { name: "session_id", type: "STRING", value: META_USERS_SESSION },
@@ -1169,7 +1179,7 @@ export async function saveChat({
     await upsertMetaMessage(
       buildMetaRow({
         messageId: `chat:${id}`,
-        sessionId: META_CHATS_SESSION,
+        sessionId: id,
         userId,
         content: title,
         payload,
@@ -1198,26 +1208,33 @@ export async function deleteChatById({ id }: { id: string }) {
     await runQuery(
       `
         DELETE FROM \`${MESSAGES_TABLE_REF}\`
-        WHERE session_id = @provider_session
-          AND JSON_VALUE(parts_json, '$.chatId') = @chat_id
+        WHERE STARTS_WITH(message_id, @provider_prefix)
+          AND (session_id = @chat_id OR session_id = @provider_session)
       `,
       [
+        {
+          name: "provider_prefix",
+          type: "STRING",
+          value: `provider:${id}:`,
+        },
+        { name: "chat_id", type: "STRING", value: id },
         {
           name: "provider_session",
           type: "STRING",
           value: META_PROVIDER_SESSION,
         },
-        { name: "chat_id", type: "STRING", value: id },
       ]
     );
 
     await runQuery(
       `
         DELETE FROM \`${MESSAGES_TABLE_REF}\`
-        WHERE session_id = @chats_session
-          AND message_id = @message_id
+        WHERE message_id = @message_id
+          AND role = 'system'
+          AND (session_id = @chat_id OR session_id = @chats_session)
       `,
       [
+        { name: "chat_id", type: "STRING", value: id },
         { name: "chats_session", type: "STRING", value: META_CHATS_SESSION },
         { name: "message_id", type: "STRING", value: `chat:${id}` },
       ]
@@ -1239,19 +1256,21 @@ export async function deleteAllChatsByUserId({ userId }: { userId: string }) {
         SELECT
           message_id
         FROM \`${MESSAGES_TABLE_REF}\`
-        WHERE session_id = @session_id
+        WHERE STARTS_WITH(message_id, @chat_prefix)
+          AND role = 'system'
           AND user_id = @user_id
           AND (is_deleted IS NULL OR is_deleted = FALSE)
       `,
       [
-        { name: "session_id", type: "STRING", value: META_CHATS_SESSION },
+        { name: "chat_prefix", type: "STRING", value: CHAT_META_MESSAGE_PREFIX },
         { name: "user_id", type: "STRING", value: userId },
       ],
       `
         SELECT
           message_id
         FROM \`${MESSAGES_TABLE_REF}\`
-        WHERE session_id = @session_id
+        WHERE STARTS_WITH(message_id, @chat_prefix)
+          AND role = 'system'
           AND user_id = @user_id
       `
     );
@@ -1315,19 +1334,20 @@ export async function getChatsByUserId({
           message_id,
           user_id,
           content,
-          '{}' AS parts_json,
-          NULL AS visibility,
+          parts_json,
+          visibility,
           created_at
         FROM \`${MESSAGES_TABLE_REF}\`
-        WHERE session_id = @session_id
+        WHERE STARTS_WITH(message_id, @chat_prefix)
+          AND role = 'system'
           AND user_id = @user_id
           AND (is_deleted IS NULL OR is_deleted = FALSE)
-          ${cursorOperator ? `AND TIMESTAMP(created_at) ${cursorOperator} TIMESTAMP(@cursor_created_at)` : ""}
-        ORDER BY TIMESTAMP(created_at) DESC
+          ${cursorOperator ? `AND SAFE_CAST(created_at AS TIMESTAMP) ${cursorOperator} SAFE_CAST(@cursor_created_at AS TIMESTAMP)` : ""}
+        ORDER BY SAFE_CAST(created_at AS TIMESTAMP) DESC
         LIMIT @limit
       `,
       [
-        { name: "session_id", type: "STRING", value: META_CHATS_SESSION },
+        { name: "chat_prefix", type: "STRING", value: CHAT_META_MESSAGE_PREFIX },
         { name: "user_id", type: "STRING", value: id },
         ...(cursorCreatedAt
           ? [
@@ -1346,10 +1366,11 @@ export async function getChatsByUserId({
           user_id,
           content,
           parts_json,
-          visibility,
+          NULL AS visibility,
           created_at
         FROM \`${MESSAGES_TABLE_REF}\`
-        WHERE session_id = @session_id
+        WHERE STARTS_WITH(message_id, @chat_prefix)
+          AND role = 'system'
           AND user_id = @user_id
           ${cursorOperator ? `AND created_at ${cursorOperator} @cursor_created_at` : ""}
         ORDER BY created_at DESC
@@ -1379,7 +1400,7 @@ export async function getChatsByUserId({
           ARRAY_AGG(
             IF(role = 'user', content, NULL)
             IGNORE NULLS
-            ORDER BY TIMESTAMP(created_at)
+            ORDER BY SAFE_CAST(created_at AS TIMESTAMP)
             LIMIT 1
           )[SAFE_OFFSET(0)] AS title
         FROM \`${MESSAGES_TABLE_REF}\`
@@ -1387,8 +1408,8 @@ export async function getChatsByUserId({
           AND NOT STARTS_WITH(session_id, @meta_prefix)
           AND (is_deleted IS NULL OR is_deleted = FALSE)
         GROUP BY session_id
-        ${cursorOperator ? `HAVING MIN(TIMESTAMP(created_at)) ${cursorOperator} TIMESTAMP(@cursor_created_at)` : ""}
-        ORDER BY MIN(TIMESTAMP(created_at)) DESC
+        ${cursorOperator ? `HAVING MIN(SAFE_CAST(created_at AS TIMESTAMP)) ${cursorOperator} SAFE_CAST(@cursor_created_at AS TIMESTAMP)` : ""}
+        ORDER BY MIN(SAFE_CAST(created_at AS TIMESTAMP)) DESC
         LIMIT @limit
       `,
       [
@@ -1454,10 +1475,23 @@ export async function getChatsByUserId({
       throw error;
     }
 
-    throw new ChatSDKError(
-      "bad_request:database",
-      "Failed to get chats by user id"
-    );
+    const now = Date.now();
+    if (
+      process.env.NODE_ENV === "production" &&
+      now - lastChatsQueryFallbackLogAtMs >=
+        CHATS_QUERY_FALLBACK_LOG_COOLDOWN_MS
+    ) {
+      lastChatsQueryFallbackLogAtMs = now;
+      console.warn(
+        "Failed to get chats by user id from BigQuery. Returning empty history list.",
+        error
+      );
+    }
+
+    return {
+      chats: [],
+      hasMore: false,
+    };
   }
 }
 
@@ -1469,8 +1503,13 @@ export async function getChatById({ id }: { id: string }) {
     }
 
     return await getFallbackChatFromMessages(id);
-  } catch (_error) {
-    throw new ChatSDKError("bad_request:database", "Failed to get chat by id");
+  } catch (error) {
+    const now = Date.now();
+    if (now - lastChatByIdErrorLogAtMs >= CHAT_BY_ID_ERROR_LOG_COOLDOWN_MS) {
+      lastChatByIdErrorLogAtMs = now;
+      console.warn("Failed to get chat by id from BigQuery.", { id, error });
+    }
+    return null;
   }
 }
 
@@ -1494,13 +1533,18 @@ export async function getProviderSessionByChatId({
           created_at,
           updated_at
         FROM \`${MESSAGES_TABLE_REF}\`
-        WHERE session_id = @session_id
+        WHERE (session_id = @chat_session_id OR session_id = @legacy_session_id)
           AND message_id = @message_id
           AND (is_deleted IS NULL OR is_deleted = FALSE)
         LIMIT 1
       `,
       [
-        { name: "session_id", type: "STRING", value: META_PROVIDER_SESSION },
+        { name: "chat_session_id", type: "STRING", value: chatId },
+        {
+          name: "legacy_session_id",
+          type: "STRING",
+          value: META_PROVIDER_SESSION,
+        },
         { name: "message_id", type: "STRING", value: messageId },
       ],
       `
@@ -1512,7 +1556,7 @@ export async function getProviderSessionByChatId({
           created_at,
           updated_at
         FROM \`${MESSAGES_TABLE_REF}\`
-        WHERE session_id = @session_id
+        WHERE (session_id = @chat_session_id OR session_id = @legacy_session_id)
           AND message_id = @message_id
         LIMIT 1
       `
@@ -1590,7 +1634,7 @@ export async function upsertProviderSession({
     await upsertMetaMessage(
       buildMetaRow({
         messageId: `provider:${chatId}:${encodeURIComponent(provider)}`,
-        sessionId: META_PROVIDER_SESSION,
+        sessionId: chatId,
         userId,
         content: sessionId,
         payload,
@@ -1737,7 +1781,7 @@ export async function getMessagesByChatId({ id }: { id: string }) {
         WHERE session_id = @chat_id
           AND NOT STARTS_WITH(session_id, @meta_prefix)
           AND (is_deleted IS NULL OR is_deleted = FALSE)
-        ORDER BY TIMESTAMP(created_at) ASC
+        ORDER BY SAFE_CAST(created_at AS TIMESTAMP) ASC
       `,
       [
         { name: "chat_id", type: "STRING", value: id },
@@ -1750,10 +1794,10 @@ export async function getMessagesByChatId({ id }: { id: string }) {
           role,
           content,
           created_at,
-          parts_json,
-          attachments_json,
-          chart_spec_json,
-          chart_error
+          NULL AS parts_json,
+          '[]' AS attachments_json,
+          NULL AS chart_spec_json,
+          NULL AS chart_error
         FROM \`${MESSAGES_TABLE_REF}\`
         WHERE session_id = @chat_id
           AND NOT STARTS_WITH(session_id, @meta_prefix)
@@ -1862,7 +1906,7 @@ export async function getDocumentsById({
         WHERE session_id = @session_id
           AND JSON_VALUE(parts_json, '$.id') = @document_id
           AND (is_deleted IS NULL OR is_deleted = FALSE)
-        ORDER BY TIMESTAMP(created_at) ASC
+        ORDER BY SAFE_CAST(created_at AS TIMESTAMP) ASC
       `,
       [
         { name: "session_id", type: "STRING", value: META_DOCUMENTS_SESSION },
@@ -1907,7 +1951,7 @@ export async function getDocumentById({ id }: { id: string }) {
         WHERE session_id = @session_id
           AND JSON_VALUE(parts_json, '$.id') = @document_id
           AND (is_deleted IS NULL OR is_deleted = FALSE)
-        ORDER BY TIMESTAMP(created_at) DESC
+        ORDER BY SAFE_CAST(created_at AS TIMESTAMP) DESC
         LIMIT 1
       `,
       [
@@ -1963,7 +2007,7 @@ export async function deleteDocumentsByIdAfterTimestamp({
         FROM \`${MESSAGES_TABLE_REF}\`
         WHERE session_id = @session_id
           AND JSON_VALUE(parts_json, '$.id') = @document_id
-          AND TIMESTAMP(created_at) > TIMESTAMP(@threshold)
+          AND SAFE_CAST(created_at AS TIMESTAMP) > SAFE_CAST(@threshold AS TIMESTAMP)
           AND (is_deleted IS NULL OR is_deleted = FALSE)
       `,
       [
@@ -1990,7 +2034,7 @@ export async function deleteDocumentsByIdAfterTimestamp({
         DELETE FROM \`${MESSAGES_TABLE_REF}\`
         WHERE session_id = @session_id
           AND JSON_VALUE(parts_json, '$.id') = @document_id
-          AND TIMESTAMP(created_at) > TIMESTAMP(@threshold)
+          AND SAFE_CAST(created_at AS TIMESTAMP) > SAFE_CAST(@threshold AS TIMESTAMP)
       `,
       [
         { name: "session_id", type: "STRING", value: META_DOCUMENTS_SESSION },
@@ -2027,7 +2071,7 @@ export async function getMessageById({ id }: { id: string }) {
         FROM \`${MESSAGES_TABLE_REF}\`
         WHERE message_id = @message_id
           AND (is_deleted IS NULL OR is_deleted = FALSE)
-        ORDER BY TIMESTAMP(created_at) ASC
+        ORDER BY SAFE_CAST(created_at AS TIMESTAMP) ASC
       `,
       [{ name: "message_id", type: "STRING", value: id }],
       `
@@ -2036,11 +2080,7 @@ export async function getMessageById({ id }: { id: string }) {
           session_id,
           role,
           content,
-          created_at,
-          parts_json,
-          attachments_json,
-          chart_spec_json,
-          chart_error
+          created_at
         FROM \`${MESSAGES_TABLE_REF}\`
         WHERE message_id = @message_id
         ORDER BY created_at ASC
@@ -2048,11 +2088,17 @@ export async function getMessageById({ id }: { id: string }) {
     );
 
     return rows.map(mapMessageRowToDbMessage);
-  } catch (_error) {
-    throw new ChatSDKError(
-      "bad_request:database",
-      "Failed to get message by id"
-    );
+  } catch (error) {
+    const now = Date.now();
+    if (
+      now - lastMessageByIdErrorLogAtMs >=
+      MESSAGE_BY_ID_ERROR_LOG_COOLDOWN_MS
+    ) {
+      lastMessageByIdErrorLogAtMs = now;
+      console.warn("Failed to get message by id from BigQuery.", { id, error });
+    }
+
+    return [];
   }
 }
 
@@ -2071,7 +2117,7 @@ export async function deleteMessagesByChatIdAfterTimestamp({
         DELETE FROM \`${MESSAGES_TABLE_REF}\`
         WHERE session_id = @chat_id
           AND NOT STARTS_WITH(session_id, @meta_prefix)
-          AND TIMESTAMP(created_at) >= TIMESTAMP(@threshold)
+          AND SAFE_CAST(created_at AS TIMESTAMP) >= SAFE_CAST(@threshold AS TIMESTAMP)
       `,
       [
         { name: "chat_id", type: "STRING", value: chatId },
@@ -2114,7 +2160,7 @@ export async function updateChatVisibilityById({
     await upsertMetaMessage(
       buildMetaRow({
         messageId: `chat:${chatId}`,
-        sessionId: META_CHATS_SESSION,
+        sessionId: chatId,
         userId: chat.userId,
         content: chat.title,
         payload,
@@ -2124,22 +2170,28 @@ export async function updateChatVisibilityById({
       })
     );
 
-    await runQuery(
-      `
-        UPDATE \`${MESSAGES_TABLE_REF}\`
-        SET
-          visibility = @visibility,
-          updated_at = @updated_at
-        WHERE session_id = @chat_id
-          AND NOT STARTS_WITH(session_id, @meta_prefix)
-      `,
-      [
-        { name: "visibility", type: "STRING", value: visibility },
-        { name: "updated_at", type: "STRING", value: now },
-        { name: "chat_id", type: "STRING", value: chatId },
-        { name: "meta_prefix", type: "STRING", value: META_SESSION_PREFIX },
-      ]
-    );
+    try {
+      await runQuery(
+        `
+          UPDATE \`${MESSAGES_TABLE_REF}\`
+          SET
+            visibility = @visibility
+          WHERE session_id = @chat_id
+            AND NOT STARTS_WITH(session_id, @meta_prefix)
+        `,
+        [
+          { name: "visibility", type: "STRING", value: visibility },
+          { name: "chat_id", type: "STRING", value: chatId },
+          { name: "meta_prefix", type: "STRING", value: META_SESSION_PREFIX },
+        ]
+      );
+    } catch (error) {
+      // Share relies on chat metadata visibility; message-row visibility is best-effort.
+      console.warn(
+        "Failed to backfill message visibility. Keeping metadata visibility update only.",
+        { chatId, error }
+      );
+    }
   } catch (_error) {
     throw new ChatSDKError(
       "bad_request:database",
@@ -2175,7 +2227,7 @@ export async function updateChatTitleById({
     await upsertMetaMessage(
       buildMetaRow({
         messageId: `chat:${chatId}`,
-        sessionId: META_CHATS_SESSION,
+        sessionId: chatId,
         userId: chat.userId,
         content: title,
         payload,
@@ -2210,7 +2262,7 @@ export async function getMessageCountByUserId({
           AND role = 'user'
           AND NOT STARTS_WITH(session_id, @meta_prefix)
           AND (is_deleted IS NULL OR is_deleted = FALSE)
-          AND TIMESTAMP(created_at) >= TIMESTAMP(@threshold)
+          AND SAFE_CAST(created_at AS TIMESTAMP) >= SAFE_CAST(@threshold AS TIMESTAMP)
       `,
       [
         { name: "user_id", type: "STRING", value: id },

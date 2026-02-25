@@ -1,11 +1,12 @@
 import Link from "next/link";
 import { memo } from "react";
 import type { Chat } from "@/lib/db/schema";
-import { MoreHorizontalIcon, TrashIcon } from "./icons";
+import { MoreHorizontalIcon, ShareIcon, TrashIcon } from "./icons";
 import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
+  DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "./ui/dropdown-menu";
 import {
@@ -17,11 +18,13 @@ import {
 const PureChatItem = ({
   chat,
   isActive,
+  onShare,
   onDelete,
   setOpenMobile,
 }: {
   chat: Chat;
   isActive: boolean;
+  onShare: (chat: Chat) => void;
   onDelete: (chatId: string) => void;
   setOpenMobile: (open: boolean) => void;
 }) => {
@@ -45,6 +48,11 @@ const PureChatItem = ({
         </DropdownMenuTrigger>
 
         <DropdownMenuContent align="end" side="bottom">
+          <DropdownMenuItem className="cursor-pointer" onSelect={() => onShare(chat)}>
+            <ShareIcon />
+            <span>Compartilhar</span>
+          </DropdownMenuItem>
+          <DropdownMenuSeparator />
           <DropdownMenuItem
             className="cursor-pointer text-destructive focus:bg-destructive/15 focus:text-destructive dark:text-red-500"
             onSelect={() => onDelete(chat.id)}

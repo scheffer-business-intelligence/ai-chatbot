@@ -122,6 +122,76 @@ export function SidebarHistory({ user }: { user: User | undefined }) {
   const [deleteId, setDeleteId] = useState<string | null>(null);
   const [showDeleteDialog, setShowDeleteDialog] = useState(false);
 
+  const updateChatVisibilityInCache = (
+    chatId: string,
+    visibility: "public" | "private"
+  ) => {
+    mutate(
+      (chatHistories) =>
+        chatHistories?.map((chatHistory) => ({
+          ...chatHistory,
+          chats: chatHistory.chats.map((chat) =>
+            chat.id === chatId ? { ...chat, visibility } : chat
+          ),
+        })),
+      { revalidate: false }
+    );
+  };
+
+  const handleShare = (chat: Chat) => {
+    const sharePromise = (async () => {
+      if (chat.visibility !== "public") {
+        const response = await fetch("/api/chat", {
+          method: "PATCH",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            id: chat.id,
+            visibility: "public",
+          }),
+        });
+
+        const payload = (await response.json().catch(() => null)) as
+          | { message?: string; cause?: string; error?: string }
+          | null;
+
+        if (!response.ok) {
+          throw new Error(
+            payload?.cause ||
+              payload?.error ||
+              payload?.message ||
+              "Falha ao habilitar compartilhamento."
+          );
+        }
+
+        updateChatVisibilityInCache(chat.id, "public");
+      }
+
+      const shareUrl = `${window.location.origin}/chat/${chat.id}`;
+
+      if (navigator.clipboard?.writeText) {
+        try {
+          await navigator.clipboard.writeText(shareUrl);
+        } catch {
+          window.prompt("Copie o link da conversa:", shareUrl);
+        }
+      } else {
+        window.prompt("Copie o link da conversa:", shareUrl);
+      }
+    })();
+
+    toast.promise(sharePromise, {
+      loading:
+        chat.visibility === "public"
+          ? "Copiando link..."
+          : "Preparando compartilhamento...",
+      success: "Link de compartilhamento copiado!",
+      error: (error) =>
+        error instanceof Error ? error.message : "Falha ao compartilhar.",
+    });
+  };
+
   const normalizedChatHistoryPages = (paginatedChatHistories ?? []).map(
     (page) => ({
       chats: Array.isArray(page?.chats) ? page.chats : [],
@@ -250,6 +320,7 @@ export function SidebarHistory({ user }: { user: User | undefined }) {
                             chat={chat}
                             isActive={chat.id === id}
                             key={chat.id}
+                            onShare={handleShare}
                             onDelete={(chatId) => {
                               setDeleteId(chatId);
                               setShowDeleteDialog(true);

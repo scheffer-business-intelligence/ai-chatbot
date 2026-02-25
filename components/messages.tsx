@@ -2,7 +2,6 @@ import type { UseChatHelpers } from "@ai-sdk/react";
 import { ArrowDownIcon } from "lucide-react";
 import { deleteTrailingMessages } from "@/app/(chat)/actions";
 import { useMessages } from "@/hooks/use-messages";
-import type { Vote } from "@/lib/db/schema";
 import {
   type ExportContextSheet,
   extractContextSheets,
@@ -10,15 +9,15 @@ import {
 } from "@/lib/export-context";
 import type { ChatMessage } from "@/lib/types";
 import { sanitizeText } from "@/lib/utils";
-import { useDataStream } from "./data-stream-provider";
+import { useDataStream } from "@/components/data-stream-provider";
 import { Greeting } from "./greeting";
 import { PreviewMessage, ThinkingMessage } from "./message";
 
 type MessagesProps = {
-  addToolApprovalResponse: UseChatHelpers<ChatMessage>["addToolApprovalResponse"];
   chatId: string;
+  addToolApprovalResponse: UseChatHelpers<ChatMessage>["addToolApprovalResponse"];
+  agentStatus: string | null;
   status: UseChatHelpers<ChatMessage>["status"];
-  votes: Vote[] | undefined;
   messages: ChatMessage[];
   setMessages: UseChatHelpers<ChatMessage>["setMessages"];
   regenerate: UseChatHelpers<ChatMessage>["regenerate"];
@@ -57,10 +56,10 @@ function getContextSheetsFromMessage(
 }
 
 function PureMessages({
-  addToolApprovalResponse,
   chatId,
+  addToolApprovalResponse,
+  agentStatus,
   status,
-  votes,
   messages,
   setMessages,
   regenerate,
@@ -128,8 +127,13 @@ function PureMessages({
       );
     })();
 
-  const shouldShowThinkingMessage =
+  const isWaitingForAssistant =
     !hasToolApprovalResponse &&
+    (status === "submitted" || status === "streaming");
+  const shouldShowStatusLine = isWaitingForAssistant && Boolean(agentStatus);
+  const shouldShowThinkingFallback =
+    isWaitingForAssistant &&
+    !agentStatus &&
     (status === "submitted" ||
       (status === "streaming" && !hasVisibleStreamingAssistantContent));
 
@@ -207,17 +211,16 @@ function PureMessages({
                     hasSentMessage && index === messages.length - 1
                   }
                   setMessages={setMessages}
-                  vote={
-                    votes
-                      ? votes.find((vote) => vote.messageId === message.id)
-                      : undefined
-                  }
                 />
               );
             });
           })()}
 
-          {shouldShowThinkingMessage && <ThinkingMessage />}
+          {shouldShowStatusLine && (
+            <ThinkingMessage statusText={agentStatus ?? undefined} />
+          )}
+
+          {shouldShowThinkingFallback && <ThinkingMessage />}
 
           <div
             className="min-h-[24px] min-w-[24px] shrink-0"

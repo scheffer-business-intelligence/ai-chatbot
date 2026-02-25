@@ -1,13 +1,7 @@
 import "server-only";
 
 import type { UIMessagePart } from "ai";
-import {
-  deleteMessagesByChatIdAfterTimestamp,
-  getMessageById,
-  getMessageCountByUserId,
-  getMessagesByChatId,
-} from "@/lib/db/queries";
-import type { DBMessage } from "@/lib/db/schema";
+import { deleteMessagesByChatIdAfterTimestamp } from "@/lib/db/queries";
 import {
   type BigQueryChatMessageRow,
   countUserMessagesSince,
@@ -19,7 +13,7 @@ import {
   upsertChatMessageRow,
 } from "@/lib/gcp/bigquery";
 import type { ChatMessage, ChatTools, CustomUIDataTypes } from "@/lib/types";
-import { convertToUIMessages, sanitizeText } from "@/lib/utils";
+import { sanitizeText } from "@/lib/utils";
 
 type PersistChatMessageParams = {
   chatId: string;
@@ -37,6 +31,13 @@ type MessageReference = {
   createdAt: Date;
 };
 
+const MESSAGE_COUNT_FALLBACK_LOG_COOLDOWN_MS = 60_000;
+let lastMessageCountFallbackLogAtMs = 0;
+
+function getDistinctUserIds(userId: string, fallbackUserId?: string) {
+  return [...new Set([userId, fallbackUserId].filter(Boolean) as string[])];
+}
+
 function parseCreatedAtFromMetadata(message: ChatMessage) {
   if (message.metadata?.createdAt) {
     const parsed = new Date(message.metadata.createdAt);
@@ -46,6 +47,15 @@ function parseCreatedAtFromMetadata(message: ChatMessage) {
   }
 
   return new Date();
+}
+
+function parseSortableTimestamp(value: string | null | undefined) {
+  if (!value) {
+    return 0;
+  }
+
+  const parsed = new Date(value).getTime();
+  return Number.isNaN(parsed) ? 0 : parsed;
 }
 
 function getPlainTextFromMessage(message: ChatMessage) {
@@ -73,31 +83,6 @@ function extractAttachmentsFromMessage(message: ChatMessage) {
           part.mediaType) ||
         "application/octet-stream",
     }));
-}
-
-function toDbMessage({
-  chatId,
-  message,
-  chartSpec,
-  chartError,
-  createdAt,
-}: {
-  chatId: string;
-  message: ChatMessage;
-  chartSpec?: unknown;
-  chartError?: string | null;
-  createdAt: Date;
-}): DBMessage {
-  return {
-    id: message.id,
-    chatId,
-    role: message.role,
-    parts: message.parts,
-    attachments: extractAttachmentsFromMessage(message),
-    chartSpec: (chartSpec ?? null) as DBMessage["chartSpec"],
-    chartError: chartError ?? null,
-    createdAt,
-  };
 }
 
 function parseJsonString<T>(value: string | null | undefined): T | null {
@@ -189,52 +174,74 @@ export async function persistMessageToBigQuery(
   }
 }
 
-export async function persistMessageToPostgres(
-  params: Omit<
-    PersistChatMessageParams,
-    "visibility" | "answeredIn" | "isDeleted"
-  >
-) {
-  const createdAt = parseCreatedAtFromMetadata(params.message);
-  const dbMessage = toDbMessage({
-    chatId: params.chatId,
-    message: params.message,
-    chartSpec: params.chartSpec,
-    chartError: params.chartError,
-    createdAt,
-  });
-
-  const { saveMessages } = await import("@/lib/db/queries");
-  await saveMessages({ messages: [dbMessage] });
-}
-
 export async function getChatMessagesByChatId({
   chatId,
   userId,
+  fallbackUserId,
 }: {
   chatId: string;
   userId: string;
+  fallbackUserId?: string;
 }): Promise<ChatMessage[]> {
   try {
     const accessToken = await getBigQueryAccessToken();
-    const bqMessages = await querySessionMessages(accessToken, userId, chatId);
 
-    if (bqMessages.length > 0) {
-      return bqMessages.map((row) => toChatMessageFromBigQueryRow(row));
+    const userIds = getDistinctUserIds(userId, fallbackUserId);
+    if (userIds.length === 0) {
+      return [];
     }
+
+    const messagesById = new Map<string, BigQueryChatMessageRow>();
+
+    for (const candidateUserId of userIds) {
+      const candidateRows = await querySessionMessages(
+        accessToken,
+        candidateUserId,
+        chatId
+      );
+
+      for (const candidateRow of candidateRows) {
+        const existingRow = messagesById.get(candidateRow.message_id);
+        if (!existingRow) {
+          messagesById.set(candidateRow.message_id, candidateRow);
+          continue;
+        }
+
+        const existingUpdatedAt = parseSortableTimestamp(existingRow.updated_at);
+        const nextUpdatedAt = parseSortableTimestamp(candidateRow.updated_at);
+        const existingCreatedAt = parseSortableTimestamp(existingRow.created_at);
+        const nextCreatedAt = parseSortableTimestamp(candidateRow.created_at);
+
+        if (
+          nextUpdatedAt > existingUpdatedAt ||
+          (nextUpdatedAt === existingUpdatedAt &&
+            nextCreatedAt > existingCreatedAt)
+        ) {
+          messagesById.set(candidateRow.message_id, candidateRow);
+        }
+      }
+    }
+
+    return [...messagesById.values()]
+      .sort((messageA, messageB) => {
+        const messageATimestamp = parseSortableTimestamp(messageA.created_at);
+        const messageBTimestamp = parseSortableTimestamp(messageB.created_at);
+        return messageATimestamp - messageBTimestamp;
+      })
+      .map((row) => toChatMessageFromBigQueryRow(row));
   } catch (error) {
     console.error("Failed to load chat messages from BigQuery:", error);
+    return [];
   }
-
-  const fallbackMessages = await getMessagesByChatId({ id: chatId });
-  return convertToUIMessages(fallbackMessages);
 }
 
 export async function countRecentUserMessages({
   userId,
+  fallbackUserId,
   differenceInHours,
 }: {
   userId: string;
+  fallbackUserId?: string;
   differenceInHours: number;
 }) {
   try {
@@ -242,27 +249,56 @@ export async function countRecentUserMessages({
     const threshold = new Date(
       Date.now() - differenceInHours * 60 * 60 * 1000
     ).toISOString();
-    const count = await countUserMessagesSince(accessToken, userId, threshold);
-    return count;
+
+    const userIds = getDistinctUserIds(userId, fallbackUserId);
+    let total = 0;
+
+    for (const candidateUserId of userIds) {
+      total += await countUserMessagesSince(
+        accessToken,
+        candidateUserId,
+        threshold
+      );
+    }
+
+    return total;
   } catch (error) {
-    console.error("Failed to count messages in BigQuery, falling back:", error);
-    return await getMessageCountByUserId({
-      id: userId,
-      differenceInHours,
-    });
+    const now = Date.now();
+    if (
+      now - lastMessageCountFallbackLogAtMs >=
+      MESSAGE_COUNT_FALLBACK_LOG_COOLDOWN_MS
+    ) {
+      lastMessageCountFallbackLogAtMs = now;
+      console.warn(
+        "Failed to count messages in BigQuery, falling back:",
+        error
+      );
+    }
+    return 0;
   }
 }
 
 export async function findMessageReferenceById({
   messageId,
   userId,
+  fallbackUserId,
 }: {
   messageId: string;
   userId: string;
+  fallbackUserId?: string;
 }): Promise<MessageReference | null> {
   try {
     const accessToken = await getBigQueryAccessToken();
-    const message = await getChatMessageById(accessToken, userId, messageId);
+
+    const userIds = getDistinctUserIds(userId, fallbackUserId);
+    let message: BigQueryChatMessageRow | null = null;
+
+    for (const candidateUserId of userIds) {
+      message = await getChatMessageById(accessToken, candidateUserId, messageId);
+      if (message) {
+        break;
+      }
+    }
 
     if (message?.session_id && message.created_at) {
       const createdAt = new Date(message.created_at);
@@ -276,37 +312,32 @@ export async function findMessageReferenceById({
   } catch (error) {
     console.error("Failed to resolve message reference from BigQuery:", error);
   }
-
-  const fallbackMessage = await getMessageById({ id: messageId });
-  const messageFromDb = fallbackMessage[0];
-
-  if (!messageFromDb) {
-    return null;
-  }
-
-  return {
-    chatId: messageFromDb.chatId,
-    createdAt: messageFromDb.createdAt,
-  };
+  return null;
 }
 
 export async function deleteTrailingMessagesByTimestamp({
   chatId,
   userId,
+  fallbackUserId,
   timestamp,
 }: {
   chatId: string;
   userId: string;
+  fallbackUserId?: string;
   timestamp: Date;
 }) {
   try {
     const accessToken = await getBigQueryAccessToken();
-    await softDeleteMessagesAfterTimestamp(
-      accessToken,
-      userId,
-      chatId,
-      timestamp.toISOString()
-    );
+    const userIds = getDistinctUserIds(userId, fallbackUserId);
+
+    for (const candidateUserId of userIds) {
+      await softDeleteMessagesAfterTimestamp(
+        accessToken,
+        candidateUserId,
+        chatId,
+        timestamp.toISOString()
+      );
+    }
   } catch (error) {
     console.error(
       "Failed to soft delete trailing messages in BigQuery:",
@@ -320,13 +351,19 @@ export async function deleteTrailingMessagesByTimestamp({
 export async function softDeleteSessionMessagesByChatId({
   chatId,
   userId,
+  fallbackUserId,
 }: {
   chatId: string;
   userId: string;
+  fallbackUserId?: string;
 }) {
   try {
     const accessToken = await getBigQueryAccessToken();
-    await softDeleteSessionMessages(accessToken, userId, chatId);
+    const userIds = getDistinctUserIds(userId, fallbackUserId);
+
+    for (const candidateUserId of userIds) {
+      await softDeleteSessionMessages(accessToken, candidateUserId, chatId);
+    }
   } catch (error) {
     console.error("Failed to soft delete chat messages in BigQuery:", error);
   }

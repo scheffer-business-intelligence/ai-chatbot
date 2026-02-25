@@ -19,6 +19,19 @@ export type VertexExtractedContext = {
   contextSheets: ExportContextSheet[];
 };
 
+export type VertexStreamEvent =
+  | { type: "status"; status: string }
+  | { type: "text"; delta: string };
+
+const DEFAULT_AGENT_STATUS_PREFIXES = [
+  "Processando sua solicitação...",
+  "Ativando o agente especialista",
+  "Obtendo os dados...",
+  "Dados obtidos com sucesso!",
+  "Dados obtidos com sucesso",
+  "Gerando resposta...",
+];
+
 function getBaseVertexUrl(engineId: string) {
   return `https://${VERTEX_LOCATION}-aiplatform.googleapis.com/v1/projects/${VERTEX_PROJECT_ID}/locations/${VERTEX_LOCATION}/reasoningEngines/${engineId}`;
 }
@@ -190,15 +203,7 @@ function extractTextDeep(node: unknown, depth = 0): string | null {
     return contentText;
   }
 
-  for (const key of [
-    "response",
-    "output",
-    "event",
-    "events",
-    "payload",
-    "data",
-    "result",
-  ]) {
+  for (const key of ["response", "output"]) {
     if (!(key in record)) {
       continue;
     }
@@ -253,19 +258,25 @@ function extractTextFromVertexResponse(
 
   return (
     extractTextDeep(response) ||
-    extractTextDeep(output) ||
-    extractTextDeep(data)
+    extractTextDeep(output)
   );
 }
 
-function parseVertexResponseText(responseText: string): string[] {
-  const allTexts: string[] = [];
+function parseVertexResponsePayloads(
+  responseText: string
+): Record<string, unknown>[] {
+  const payloads: Record<string, unknown>[] = [];
 
   try {
-    const data = JSON.parse(responseText) as Record<string, unknown>;
-    const text = extractTextFromVertexResponse(data);
-    if (text) {
-      allTexts.push(text);
+    const parsed = JSON.parse(responseText) as unknown;
+    if (Array.isArray(parsed)) {
+      for (const item of parsed) {
+        if (item && typeof item === "object") {
+          payloads.push(item as Record<string, unknown>);
+        }
+      }
+    } else if (parsed && typeof parsed === "object") {
+      payloads.push(parsed as Record<string, unknown>);
     }
   } catch {
     const lines = responseText.split(/\r?\n/);
@@ -288,10 +299,15 @@ function parseVertexResponseText(responseText: string): string[] {
       }
 
       try {
-        const data = JSON.parse(payload) as Record<string, unknown>;
-        const text = extractTextFromVertexResponse(data);
-        if (text) {
-          allTexts.push(text);
+        const parsed = JSON.parse(payload) as unknown;
+        if (Array.isArray(parsed)) {
+          for (const item of parsed) {
+            if (item && typeof item === "object") {
+              payloads.push(item as Record<string, unknown>);
+            }
+          }
+        } else if (parsed && typeof parsed === "object") {
+          payloads.push(parsed as Record<string, unknown>);
         }
       } catch {
         // Ignore non-JSON lines.
@@ -299,7 +315,298 @@ function parseVertexResponseText(responseText: string): string[] {
     }
   }
 
-  return allTexts;
+  return payloads;
+}
+
+function normalizeStatusText(text: string): string {
+  return text.replace(/\s+/g, " ").trim();
+}
+
+function ensureStatusSuffix(text: string): string {
+  const normalized = normalizeStatusText(text);
+  if (!normalized) {
+    return normalized;
+  }
+
+  if (/[.!?…]$/.test(normalized)) {
+    return normalized;
+  }
+
+  return `${normalized}...`;
+}
+
+type KnownStatusMatch = {
+  index: number;
+  status: string;
+};
+
+function extractKnownStatusesInOrder(text: string): string[] {
+  const normalizedText = normalizeStatusText(text);
+  if (!normalizedText) {
+    return [];
+  }
+
+  const patterns: Array<{
+    regex: RegExp;
+    format: (rawMatch: string) => string;
+  }> = [
+    {
+      regex: /processando sua solicitação\.{0,3}/gi,
+      format: (rawMatch) => ensureStatusSuffix(rawMatch),
+    },
+    {
+      regex: /ativando o agente especialista(?:\s*\([^)]+\))?\.{0,3}/gi,
+      format: (rawMatch) => ensureStatusSuffix(rawMatch),
+    },
+    {
+      regex: /obtendo os dados\.{0,3}/gi,
+      format: (rawMatch) => ensureStatusSuffix(rawMatch),
+    },
+    {
+      regex: /dados obtidos com sucesso!?\.{0,3}/gi,
+      format: (rawMatch) => ensureStatusSuffix(rawMatch),
+    },
+    {
+      regex: /gerando resposta\.{0,3}/gi,
+      format: (rawMatch) => ensureStatusSuffix(rawMatch),
+    },
+  ];
+
+  const matches: KnownStatusMatch[] = [];
+
+  for (const pattern of patterns) {
+    let match = pattern.regex.exec(normalizedText);
+    while (match) {
+      const rawMatch = normalizeStatusText(match[0]);
+      if (rawMatch) {
+        matches.push({
+          index: match.index,
+          status: pattern.format(rawMatch),
+        });
+      }
+
+      if (match[0].length === 0) {
+        pattern.regex.lastIndex += 1;
+      }
+
+      match = pattern.regex.exec(normalizedText);
+    }
+  }
+
+  if (matches.length === 0) {
+    return [];
+  }
+
+  matches.sort((a, b) => a.index - b.index);
+  const orderedStatuses: string[] = [];
+  let previousStatus = "";
+
+  for (const item of matches) {
+    if (item.status === previousStatus) {
+      continue;
+    }
+
+    orderedStatuses.push(item.status);
+    previousStatus = item.status;
+  }
+
+  return orderedStatuses;
+}
+
+function isLikelyStatusText(text: string): boolean {
+  if (!text) {
+    return false;
+  }
+
+  if (text.length > 180) {
+    return false;
+  }
+
+  if (text.includes("```")) {
+    return false;
+  }
+
+  if (/^#{1,6}\s/.test(text)) {
+    return false;
+  }
+
+  if (/^[-*]\s/.test(text)) {
+    return false;
+  }
+
+  return true;
+}
+
+function collectStatusCandidateTexts(node: unknown, depth = 0): string[] {
+  if (!node || depth > 6) {
+    return [];
+  }
+
+  if (typeof node === "string") {
+    const normalized = normalizeStatusText(node);
+    return normalized ? [normalized] : [];
+  }
+
+  if (typeof node !== "object") {
+    return [];
+  }
+
+  if (Array.isArray(node)) {
+    return node.flatMap((item) => collectStatusCandidateTexts(item, depth + 1));
+  }
+
+  const record = node as Record<string, unknown>;
+  const candidates: string[] = [];
+
+  for (const key of [
+    "status",
+    "statusMessage",
+    "status_message",
+    "message",
+    "text",
+    "title",
+    "description",
+    "detail",
+  ]) {
+    if (typeof record[key] === "string") {
+      const normalized = normalizeStatusText(record[key] as string);
+      if (normalized) {
+        candidates.push(normalized);
+      }
+    }
+  }
+
+  const contentText = extractTextFromContent(record.content);
+  if (contentText) {
+    const normalized = normalizeStatusText(contentText);
+    if (normalized) {
+      candidates.push(normalized);
+    }
+  }
+
+  for (const key of [
+    "event",
+    "events",
+    "payload",
+    "data",
+    "result",
+    "message",
+    "content",
+    "parts",
+  ]) {
+    if (!(key in record)) {
+      continue;
+    }
+
+    candidates.push(...collectStatusCandidateTexts(record[key], depth + 1));
+  }
+
+  return candidates;
+}
+
+function extractStatusUpdatesFromVertexResponse(
+  data: Record<string, unknown>
+): string[] {
+  const response = data.response as Record<string, unknown> | undefined;
+  const output = data.output as Record<string, unknown> | undefined;
+  const sources: unknown[] = [
+    data.event,
+    data.events,
+    response?.event,
+    response?.events,
+    output?.event,
+    output?.events,
+  ];
+
+  let latestStatus: string | null = null;
+
+  for (const source of sources) {
+    for (const candidate of collectStatusCandidateTexts(source)) {
+      const knownStatuses = extractKnownStatusesInOrder(candidate);
+      if (knownStatuses.length > 0) {
+        latestStatus = knownStatuses[knownStatuses.length - 1] ?? latestStatus;
+        continue;
+      }
+
+      if (isLikelyStatusText(candidate)) {
+        latestStatus = ensureStatusSuffix(candidate);
+      }
+    }
+  }
+
+  return latestStatus ? [latestStatus] : [];
+}
+
+function escapeRegex(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function stripLeadingAgentStatuses(
+  text: string,
+  statusHistory: string[]
+): string {
+  if (!text) {
+    return text;
+  }
+
+  const stripKnownStatusTokens = (value: string): string => {
+    const knownStatusRegex =
+      /^\s*(?:processando sua solicitação|ativando o agente especialista(?:\s*\([^)]+\))?|obtendo os dados|dados obtidos com sucesso!?|gerando resposta)\s*\.{0,3}\s*/i;
+    const agentTagRegex = /^\s*\([^)]+_agent\)\s*\.{0,3}\s*/i;
+
+    let nextValue = value;
+
+    while (true) {
+      const withoutAgentTag = nextValue.replace(agentTagRegex, "");
+      const withoutKnownStatus = withoutAgentTag.replace(knownStatusRegex, "");
+
+      if (withoutKnownStatus === nextValue) {
+        break;
+      }
+
+      nextValue = withoutKnownStatus;
+    }
+
+    return nextValue.replace(/^\s+/, "");
+  };
+
+  let nextText = stripKnownStatusTokens(text);
+
+  const candidates = [...statusHistory, ...DEFAULT_AGENT_STATUS_PREFIXES]
+    .flatMap((status) => {
+      const knownStatuses = extractKnownStatusesInOrder(status);
+      if (knownStatuses.length > 0) {
+        return knownStatuses;
+      }
+
+      return [ensureStatusSuffix(status)];
+    })
+    .map((status) => normalizeStatusText(status))
+    .filter(Boolean);
+
+  if (candidates.length === 0) {
+    return nextText;
+  }
+
+  const uniqueCandidates = [...new Set(candidates)].sort(
+    (a, b) => b.length - a.length
+  );
+  const statusPattern = uniqueCandidates.map(escapeRegex).join("|");
+
+  if (!statusPattern) {
+    return nextText;
+  }
+
+  const leadingStatusesRegex = new RegExp(
+    `^(?:\\s*(?:${statusPattern})\\s*)+`,
+    "i"
+  );
+
+  while (leadingStatusesRegex.test(nextText)) {
+    nextText = nextText.replace(leadingStatusesRegex, "").replace(/^\s+/, "");
+  }
+
+  return stripKnownStatusTokens(nextText);
 }
 
 function stripContextBlock(text: string, tagName: string): string {
@@ -577,14 +884,33 @@ function computeNextRawText(
     return accumulatedRawText;
   }
 
+  if (accumulatedRawText.includes(incomingText)) {
+    return accumulatedRawText;
+  }
+
+  if (incomingText.includes(accumulatedRawText)) {
+    return incomingText;
+  }
+
+  const maxOverlap = Math.min(accumulatedRawText.length, incomingText.length);
+  for (let size = maxOverlap; size > 0; size -= 1) {
+    if (accumulatedRawText.endsWith(incomingText.slice(0, size))) {
+      return `${accumulatedRawText}${incomingText.slice(size)}`;
+    }
+  }
+
   return `${accumulatedRawText}${incomingText}`;
 }
 
 function extractVisibleDelta(
   nextRawText: string,
-  accumulatedVisibleText: string
+  accumulatedVisibleText: string,
+  statusHistory: string[]
 ): { delta: string; nextVisibleText: string } {
-  const nextVisibleText = stripContextBlocksForStream(nextRawText);
+  const nextVisibleText = stripLeadingAgentStatuses(
+    stripContextBlocksForStream(nextRawText),
+    statusHistory
+  );
 
   if (nextVisibleText.startsWith(accumulatedVisibleText)) {
     return {
@@ -613,7 +939,7 @@ export async function* streamVertexQuery({
   message: string | { role: "user"; parts: Record<string, unknown>[] };
   signal?: AbortSignal;
   extractedContext?: VertexExtractedContext;
-}): AsyncGenerator<string, void, void> {
+}): AsyncGenerator<VertexStreamEvent, void, void> {
   if (!VERTEX_PROJECT_ID) {
     throw new Error("VERTEX_PROJECT_ID is not configured");
   }
@@ -654,6 +980,8 @@ export async function* streamVertexQuery({
 
   let accumulatedRawText = "";
   let accumulatedVisibleText = "";
+  let lastStatus: string | null = null;
+  const statusHistory: string[] = [];
   const writeExtractedContext = (rawText: string) => {
     if (!extractedContext) {
       return;
@@ -668,27 +996,41 @@ export async function* streamVertexQuery({
 
   if (!response.body) {
     const responseText = await response.text();
-    const texts = parseVertexResponseText(responseText);
+    const payloads = parseVertexResponsePayloads(responseText);
 
-    if (texts.length === 0 && responseText.trim()) {
+    if (payloads.length === 0 && responseText.trim()) {
       console.warn(
         "Vertex streamQuery (no body) raw response sample:",
         responseText.slice(0, 2000)
       );
     }
 
-    for (const text of texts) {
+    for (const payload of payloads) {
+      for (const status of extractStatusUpdatesFromVertexResponse(payload)) {
+        if (status && status !== lastStatus) {
+          yield { type: "status", status };
+          lastStatus = status;
+          statusHistory.push(status);
+        }
+      }
+
+      const text = extractTextFromVertexResponse(payload);
+      if (!text) {
+        continue;
+      }
+
       const nextRawText = computeNextRawText(text, accumulatedRawText);
       const { delta, nextVisibleText } = extractVisibleDelta(
         nextRawText,
-        accumulatedVisibleText
+        accumulatedVisibleText,
+        statusHistory
       );
 
       accumulatedRawText = nextRawText;
       accumulatedVisibleText = nextVisibleText;
 
       if (delta) {
-        yield delta;
+        yield { type: "text", delta };
       }
     }
 
@@ -704,6 +1046,14 @@ export async function* streamVertexQuery({
   const rawSamples: string[] = [];
 
   for await (const data of parseJsonStream(response.body)) {
+    for (const status of extractStatusUpdatesFromVertexResponse(data)) {
+      if (status && status !== lastStatus) {
+        yield { type: "status", status };
+        lastStatus = status;
+        statusHistory.push(status);
+      }
+    }
+
     const text = extractTextFromVertexResponse(data);
     if (!text) {
       if (rawSamples.length < 3) {
@@ -719,14 +1069,15 @@ export async function* streamVertexQuery({
     const nextRawText = computeNextRawText(text, accumulatedRawText);
     const { delta, nextVisibleText } = extractVisibleDelta(
       nextRawText,
-      accumulatedVisibleText
+      accumulatedVisibleText,
+      statusHistory
     );
 
     accumulatedRawText = nextRawText;
     accumulatedVisibleText = nextVisibleText;
 
     if (delta) {
-      yield delta;
+      yield { type: "text", delta };
     }
   }
 

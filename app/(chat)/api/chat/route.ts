@@ -20,6 +20,7 @@ import { createDocument } from "@/lib/ai/tools/create-document";
 import { getWeather } from "@/lib/ai/tools/get-weather";
 import { updateDocument } from "@/lib/ai/tools/update-document";
 import { getServiceAccountAccessToken } from "@/lib/auth/service-account-token";
+import { getBigQueryUserIdCandidates } from "@/lib/auth/user-id";
 import {
   countRecentUserMessages,
   getChatMessagesByChatId,
@@ -33,6 +34,7 @@ import {
   getProviderSessionByChatId,
   saveChat,
   saveMessages,
+  updateChatVisibilityById,
   updateChatTitleById,
   updateMessage,
   upsertProviderSession,
@@ -325,6 +327,7 @@ export async function POST(request: Request) {
 
   try {
     const { id, message, messages, selectedChatModel } = requestBody;
+    const requestStartedAtMs = Date.now();
     const chatVisibility = "private" as const;
 
     const session = await auth();
@@ -333,10 +336,22 @@ export async function POST(request: Request) {
       return new ChatSDKError("unauthorized:chat").toResponse();
     }
 
+    const [bigQueryUserId, fallbackBigQueryUserId] =
+      getBigQueryUserIdCandidates(session.user);
+    if (!bigQueryUserId) {
+      return new ChatSDKError("unauthorized:chat").toResponse();
+    }
+    const chatOwnerIds = new Set(
+      [session.user.id, bigQueryUserId, fallbackBigQueryUserId].filter(
+        Boolean
+      ) as string[]
+    );
+
     const userType: UserType = session.user.type;
 
     const messageCount = await countRecentUserMessages({
-      userId: session.user.id,
+      userId: bigQueryUserId,
+      fallbackUserId: fallbackBigQueryUserId,
       differenceInHours: 24,
     });
 
@@ -359,19 +374,20 @@ export async function POST(request: Request) {
     let titlePromise: Promise<string> | null = null;
 
     if (chat) {
-      if (chat.userId !== session.user.id) {
+      if (!chatOwnerIds.has(chat.userId)) {
         return new ChatSDKError("forbidden:chat").toResponse();
       }
       if (!isToolApprovalFlow) {
         messageHistory = await getChatMessagesByChatId({
           chatId: id,
-          userId: session.user.id,
+          userId: bigQueryUserId,
+          fallbackUserId: fallbackBigQueryUserId,
         });
       }
     } else if (message?.role === "user") {
       await saveChat({
         id,
-        userId: session.user.id,
+        userId: bigQueryUserId,
         title: "Nova Conversa",
         visibility: chatVisibility,
       });
@@ -418,7 +434,7 @@ export async function POST(request: Request) {
 
       await persistMessageToBigQuery({
         chatId: id,
-        userId: session.user.id,
+        userId: bigQueryUserId,
         message: message as ChatMessage,
         visibility: chatVisibility,
       });
@@ -436,6 +452,7 @@ export async function POST(request: Request) {
     }: {
       messages: ChatMessage[];
     }) => {
+      const answeredInMs = Math.max(Date.now() - requestStartedAtMs, 0);
       const lastAssistantMessageId = [...finishedMessages]
         .reverse()
         .find((currentMessage) => currentMessage.role === "assistant")?.id;
@@ -513,9 +530,14 @@ export async function POST(request: Request) {
 
         await persistMessageToBigQuery({
           chatId: id,
-          userId: session.user.id,
+          userId: bigQueryUserId,
           message: finishedMessage,
           visibility: chatVisibility,
+          answeredIn:
+            finishedMessage.role === "assistant" &&
+            finishedMessage.id === lastAssistantMessageId
+              ? answeredInMs
+              : null,
           chartSpec: shouldPersistChartContext
             ? extractedContext.chartSpec
             : undefined,
@@ -556,7 +578,7 @@ export async function POST(request: Request) {
         } catch (error) {
           console.warn(
             "Failed to load Agent Engine provider session from BigQuery. A new Vertex session will be created.",
-            { chatId: id, userId: session.user.id, error }
+            { chatId: id, userId: bigQueryUserId, error }
           );
         }
 
@@ -565,7 +587,7 @@ export async function POST(request: Request) {
         if (!providerSessionId) {
           providerSessionId = await createVertexSession(
             serviceAccountAccessToken,
-            session.user.id
+            bigQueryUserId
           );
 
           try {
@@ -573,12 +595,12 @@ export async function POST(request: Request) {
               chatId: id,
               provider: AGENT_ENGINE_PROVIDER_ID,
               sessionId: providerSessionId,
-              userId: session.user.id,
+              userId: bigQueryUserId,
             });
           } catch (error) {
             console.warn(
               "Failed to persist initial Agent Engine provider session. Continuing with in-memory session for this request.",
-              { chatId: id, userId: session.user.id, error }
+              { chatId: id, userId: bigQueryUserId, error }
             );
           }
         }
@@ -606,14 +628,27 @@ export async function POST(request: Request) {
             const streamAgentEngineResponse = async (
               currentProviderSessionId: string
             ) => {
-              for await (const delta of streamVertexQuery({
+              for await (const event of streamVertexQuery({
                 accessToken: serviceAccountAccessToken,
                 sessionId: currentProviderSessionId,
-                userId: session.user.id,
+                userId: bigQueryUserId,
                 message: vertexMessage,
                 signal: request.signal,
                 extractedContext,
               })) {
+                if (event.type === "status") {
+                  if (!event.status) {
+                    continue;
+                  }
+
+                  dataStream.write({
+                    type: "data-agent-status",
+                    data: event.status,
+                  });
+                  continue;
+                }
+
+                const { delta } = event;
                 if (!delta) {
                   continue;
                 }
@@ -653,7 +688,7 @@ export async function POST(request: Request) {
                   "Agent Engine session appears invalid. Recreating provider session.",
                   {
                     chatId: id,
-                    userId: session.user.id,
+                    userId: bigQueryUserId,
                     attempt: attempt + 1,
                   }
                 );
@@ -662,7 +697,7 @@ export async function POST(request: Request) {
                 activeProviderSessionId =
                   await refreshAgentEngineProviderSession({
                     chatId: id,
-                    userId: session.user.id,
+                    userId: bigQueryUserId,
                     previousSessionId: activeProviderSessionId,
                   });
                 providerSessionId = activeProviderSessionId;
@@ -819,6 +854,20 @@ export async function POST(request: Request) {
     const vercelId = request.headers.get("x-vercel-id");
 
     if (error instanceof ChatSDKError) {
+      const causeText =
+        typeof error.cause === "string" ? error.cause.toLowerCase() : "";
+      const tokenEndpointUnavailable =
+        error.surface === "database" &&
+        (causeText.includes("service-account token endpoint") ||
+          causeText.includes("service-account access token") ||
+          causeText.includes("oauth2.googleapis.com/token"));
+
+      if (tokenEndpointUnavailable) {
+        const offlineCause =
+          typeof error.cause === "string" ? error.cause : undefined;
+        return new ChatSDKError("offline:chat", offlineCause).toResponse();
+      }
+
       return error.toResponse();
     }
 
@@ -850,18 +899,99 @@ export async function DELETE(request: Request) {
     return new ChatSDKError("unauthorized:chat").toResponse();
   }
 
+  const [bigQueryUserId, fallbackBigQueryUserId] =
+    getBigQueryUserIdCandidates(session.user);
+  if (!bigQueryUserId) {
+    return new ChatSDKError("unauthorized:chat").toResponse();
+  }
+  const chatOwnerIds = new Set(
+    [session.user.id, bigQueryUserId, fallbackBigQueryUserId].filter(
+      Boolean
+    ) as string[]
+  );
+
   const chat = await getChatById({ id });
 
-  if (chat?.userId !== session.user.id) {
+  if (chat && !chatOwnerIds.has(chat.userId)) {
     return new ChatSDKError("forbidden:chat").toResponse();
   }
 
   await softDeleteSessionMessagesByChatId({
     chatId: id,
-    userId: session.user.id,
+    userId: bigQueryUserId,
+    fallbackUserId: fallbackBigQueryUserId,
   });
 
   const deletedChat = await deleteChatById({ id });
 
   return Response.json(deletedChat, { status: 200 });
+}
+
+export async function PATCH(request: Request) {
+  let requestBody: { id?: string; visibility?: "public" | "private" };
+
+  try {
+    requestBody = (await request.json()) as {
+      id?: string;
+      visibility?: "public" | "private";
+    };
+  } catch (_) {
+    return new ChatSDKError("bad_request:api").toResponse();
+  }
+
+  const id = typeof requestBody.id === "string" ? requestBody.id : "";
+  const visibility = requestBody.visibility;
+
+  if (!id || (visibility !== "public" && visibility !== "private")) {
+    return new ChatSDKError("bad_request:api").toResponse();
+  }
+
+  const session = await auth();
+
+  if (!session?.user) {
+    return new ChatSDKError("unauthorized:chat").toResponse();
+  }
+
+  const [bigQueryUserId, fallbackBigQueryUserId] =
+    getBigQueryUserIdCandidates(session.user);
+  if (!bigQueryUserId) {
+    return new ChatSDKError("unauthorized:chat").toResponse();
+  }
+
+  const chatOwnerIds = new Set(
+    [session.user.id, bigQueryUserId, fallbackBigQueryUserId].filter(
+      Boolean
+    ) as string[]
+  );
+
+  const chat = await getChatById({ id });
+
+  if (!chat) {
+    return new ChatSDKError("not_found:chat").toResponse();
+  }
+
+  if (!chatOwnerIds.has(chat.userId)) {
+    return new ChatSDKError("forbidden:chat").toResponse();
+  }
+
+  try {
+    await updateChatVisibilityById({
+      chatId: id,
+      visibility,
+    });
+  } catch (error) {
+    if (error instanceof ChatSDKError) {
+      return error.toResponse();
+    }
+
+    return new ChatSDKError("bad_request:database").toResponse();
+  }
+
+  return Response.json(
+    {
+      id,
+      visibility,
+    },
+    { status: 200 }
+  );
 }

@@ -5,6 +5,7 @@ import { cookies } from "next/headers";
 import { auth } from "@/app/(auth)/auth";
 import { titlePrompt } from "@/lib/ai/prompts";
 import { getTitleModel } from "@/lib/ai/providers";
+import { getBigQueryUserIdCandidates } from "@/lib/auth/user-id";
 import {
   deleteTrailingMessagesByTimestamp,
   findMessageReferenceById,
@@ -58,9 +59,16 @@ export async function deleteTrailingMessages({ id }: { id: string }) {
     return;
   }
 
+  const [bigQueryUserId, fallbackBigQueryUserId] =
+    getBigQueryUserIdCandidates(session.user);
+  if (!bigQueryUserId) {
+    return;
+  }
+
   const messageReference = await findMessageReferenceById({
     messageId: id,
-    userId: session.user.id,
+    userId: bigQueryUserId,
+    fallbackUserId: fallbackBigQueryUserId,
   });
 
   if (!messageReference) {
@@ -69,7 +77,8 @@ export async function deleteTrailingMessages({ id }: { id: string }) {
 
   await deleteTrailingMessagesByTimestamp({
     chatId: messageReference.chatId,
-    userId: session.user.id,
+    userId: bigQueryUserId,
+    fallbackUserId: fallbackBigQueryUserId,
     timestamp: messageReference.createdAt,
   });
 }

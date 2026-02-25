@@ -13,10 +13,11 @@ type SuggestedActionsProps = {
 
 function PureSuggestedActions({ chatId, sendMessage }: SuggestedActionsProps) {
   const suggestedActions = [
-    "What are the advantages of using Next.js?",
-    "Write code to demonstrate Dijkstra's algorithm",
-    "Help me write an essay about Silicon Valley",
-    "What is the weather in San Francisco?",
+    "Quais são os intervalos críticos na seiva do algodão de acordo com AEA, NovaCrop e Scheffer, por estádio fenológico?",
+    "Qual foi a produtividade média da soja por regional na última safra? Estamos melhorando a produtividade?",
+    "Quais são as diretrizes operacionais da Scheffer para coletas de seiva?",
+    "Qual a produtividade média da fazenda Rafaela na última safra da soja?",
+    "Quais talhões estão com menos cálcio no solo?",
   ];
 
   return (

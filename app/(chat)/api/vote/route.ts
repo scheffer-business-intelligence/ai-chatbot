@@ -1,4 +1,5 @@
 import { auth } from "@/app/(auth)/auth";
+import { getBigQueryUserIdCandidates } from "@/lib/auth/user-id";
 import { getChatById, getVotesByChatId, voteMessage } from "@/lib/db/queries";
 import { ChatSDKError } from "@/lib/errors";
 
@@ -18,6 +19,16 @@ export async function GET(request: Request) {
   if (!session?.user) {
     return new ChatSDKError("unauthorized:vote").toResponse();
   }
+  const [bigQueryUserId, fallbackBigQueryUserId] =
+    getBigQueryUserIdCandidates(session.user);
+  if (!bigQueryUserId) {
+    return new ChatSDKError("unauthorized:vote").toResponse();
+  }
+  const chatOwnerIds = new Set(
+    [session.user.id, bigQueryUserId, fallbackBigQueryUserId].filter(
+      Boolean
+    ) as string[]
+  );
 
   const chat = await getChatById({ id: chatId });
 
@@ -25,7 +36,7 @@ export async function GET(request: Request) {
     return new ChatSDKError("not_found:chat").toResponse();
   }
 
-  if (chat.userId !== session.user.id) {
+  if (!chatOwnerIds.has(chat.userId)) {
     return new ChatSDKError("forbidden:vote").toResponse();
   }
 
@@ -54,6 +65,16 @@ export async function PATCH(request: Request) {
   if (!session?.user) {
     return new ChatSDKError("unauthorized:vote").toResponse();
   }
+  const [bigQueryUserId, fallbackBigQueryUserId] =
+    getBigQueryUserIdCandidates(session.user);
+  if (!bigQueryUserId) {
+    return new ChatSDKError("unauthorized:vote").toResponse();
+  }
+  const chatOwnerIds = new Set(
+    [session.user.id, bigQueryUserId, fallbackBigQueryUserId].filter(
+      Boolean
+    ) as string[]
+  );
 
   const chat = await getChatById({ id: chatId });
 
@@ -61,7 +82,7 @@ export async function PATCH(request: Request) {
     return new ChatSDKError("not_found:vote").toResponse();
   }
 
-  if (chat.userId !== session.user.id) {
+  if (!chatOwnerIds.has(chat.userId)) {
     return new ChatSDKError("forbidden:vote").toResponse();
   }
 

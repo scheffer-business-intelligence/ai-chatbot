@@ -2,11 +2,17 @@
 
 import type { ComponentProps } from "react";
 import { Streamdown } from "streamdown";
+import { normalizeMarkdownForRender } from "@/lib/markdown";
 import { cn } from "@/lib/utils";
 
 type ResponseProps = ComponentProps<typeof Streamdown>;
 
 export function Response({ className, children, ...props }: ResponseProps) {
+  const normalizedChildren =
+    typeof children === "string"
+      ? normalizeMarkdownForRender(children)
+      : children;
+
   return (
     <Streamdown
       className={cn(
@@ -15,7 +21,7 @@ export function Response({ className, children, ...props }: ResponseProps) {
       )}
       {...props}
     >
-      {children}
+      {normalizedChildren}
     </Streamdown>
   );
 }
