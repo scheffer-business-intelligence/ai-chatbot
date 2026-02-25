@@ -3,14 +3,12 @@
 import { generateText, type UIMessage } from "ai";
 import { cookies } from "next/headers";
 import { auth } from "@/app/(auth)/auth";
-import type { VisibilityType } from "@/components/visibility-selector";
 import { titlePrompt } from "@/lib/ai/prompts";
 import { getTitleModel } from "@/lib/ai/providers";
 import {
   deleteTrailingMessagesByTimestamp,
   findMessageReferenceById,
 } from "@/lib/chat-store";
-import { updateChatVisibilityById } from "@/lib/db/queries";
 import { getTextFromMessage } from "@/lib/utils";
 
 function createFallbackTitle(input: string) {
@@ -74,14 +72,4 @@ export async function deleteTrailingMessages({ id }: { id: string }) {
     userId: session.user.id,
     timestamp: messageReference.createdAt,
   });
-}
-
-export async function updateChatVisibility({
-  chatId,
-  visibility,
-}: {
-  chatId: string;
-  visibility: VisibilityType;
-}) {
-  await updateChatVisibilityById({ chatId, visibility });
 }

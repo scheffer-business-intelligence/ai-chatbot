@@ -1,5 +1,6 @@
 "use client";
 
+import Image from "next/image";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import type { User } from "next-auth";
@@ -71,9 +72,14 @@ export function AppSidebar({ user }: { user: User | undefined }) {
                   setOpenMobile(false);
                 }}
               >
-                <span className="cursor-pointer rounded-md px-2 font-semibold text-lg hover:bg-muted">
-                  Scheffer Agente
-                </span>
+                <Image
+                  alt="Scheffer Agente"
+                  className="h-5 w-auto object-contain"
+                  height={29}
+                  priority
+                  src="/images/scheffer-logo.png"
+                  width={196}
+                />
               </Link>
               <div className="flex flex-row gap-1">
                 {user && (

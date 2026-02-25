@@ -324,8 +324,8 @@ export async function POST(request: Request) {
   }
 
   try {
-    const { id, message, messages, selectedChatModel, selectedVisibilityType } =
-      requestBody;
+    const { id, message, messages, selectedChatModel } = requestBody;
+    const chatVisibility = "private" as const;
 
     const session = await auth();
 
@@ -373,7 +373,7 @@ export async function POST(request: Request) {
         id,
         userId: session.user.id,
         title: "Nova Conversa",
-        visibility: selectedVisibilityType,
+        visibility: chatVisibility,
       });
       if (
         isAgentEngineModel(selectedChatModel) ||
@@ -420,7 +420,7 @@ export async function POST(request: Request) {
         chatId: id,
         userId: session.user.id,
         message: message as ChatMessage,
-        visibility: selectedVisibilityType,
+        visibility: chatVisibility,
       });
     }
 
@@ -515,7 +515,7 @@ export async function POST(request: Request) {
           chatId: id,
           userId: session.user.id,
           message: finishedMessage,
-          visibility: selectedVisibilityType,
+          visibility: chatVisibility,
           chartSpec: shouldPersistChartContext
             ? extractedContext.chartSpec
             : undefined,
@@ -582,18 +582,24 @@ export async function POST(request: Request) {
             );
           }
         }
+        if (!providerSessionId) {
+          throw new Error(
+            "Failed to initialize Agent Engine provider session."
+          );
+        }
 
         const vertexMessage = await buildVertexMessageFromUserMessage(
           latestUserMessage,
           request.signal
         );
+        const initialProviderSessionId: string = providerSessionId;
 
         stream = createUIMessageStream({
           originalMessages: isToolApprovalFlow ? uiMessages : undefined,
           execute: async ({ writer: dataStream }) => {
             const textPartId = generateUUID();
             let hasVisibleOutput = false;
-            let activeProviderSessionId = providerSessionId;
+            let activeProviderSessionId = initialProviderSessionId;
             dataStream.write({ type: "start" });
             dataStream.write({ type: "text-start", id: textPartId });
 

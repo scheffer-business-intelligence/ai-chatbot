@@ -1,7 +1,6 @@
 import "server-only";
 
 import type { ArtifactKind } from "@/components/artifact";
-import type { VisibilityType } from "@/components/visibility-selector";
 import { getServiceAccountAccessToken } from "@/lib/auth/service-account-token";
 import type { BigQueryChatMessageRow } from "@/lib/gcp/bigquery";
 import { upsertChatMessageRow } from "@/lib/gcp/bigquery";
@@ -78,6 +77,8 @@ const META_USERS_SESSION = `${META_SESSION_PREFIX}users`;
 const META_CHATS_SESSION = `${META_SESSION_PREFIX}chats`;
 const META_PROVIDER_SESSION = `${META_SESSION_PREFIX}providers`;
 const META_DOCUMENTS_SESSION = `${META_SESSION_PREFIX}documents`;
+
+export type VisibilityType = "private" | "public";
 
 type BigQueryParameterType = "STRING" | "INT64" | "BOOL";
 

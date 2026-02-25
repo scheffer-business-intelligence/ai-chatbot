@@ -1,10 +1,10 @@
 "use client";
 
-import { ChevronUp } from "lucide-react";
-import Image from "next/image";
+import { ChevronUp, LogOut, Moon, Sun } from "lucide-react";
 import type { User } from "next-auth";
 import { signOut, useSession } from "next-auth/react";
 import { useTheme } from "next-themes";
+import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -23,6 +23,18 @@ import { toast } from "./toast";
 export function SidebarUserNav({ user }: { user: User }) {
   const { status } = useSession();
   const { setTheme, resolvedTheme } = useTheme();
+  const isDarkTheme = resolvedTheme === "dark";
+  const nextTheme = isDarkTheme ? "light" : "dark";
+  const nextThemeLabel = nextTheme === "dark" ? "Dark Mode" : "Light Mode";
+  const displayName =
+    user.name?.trim() || user.email?.split("@")[0] || "Usuário";
+  const avatarFallback =
+    displayName
+      .split(" ")
+      .filter(Boolean)
+      .slice(0, 2)
+      .map((chunk) => chunk.charAt(0).toUpperCase())
+      .join("") || "U";
 
   return (
     <SidebarMenu>
@@ -46,15 +58,15 @@ export function SidebarUserNav({ user }: { user: User }) {
                 className="h-10 bg-background data-[state=open]:bg-sidebar-accent data-[state=open]:text-sidebar-accent-foreground"
                 data-testid="user-nav-button"
               >
-                <Image
-                  alt={user.email ?? "User Avatar"}
-                  className="rounded-full"
-                  height={24}
-                  src={`https://avatar.vercel.sh/${user.email}`}
-                  width={24}
-                />
-                <span className="truncate" data-testid="user-email">
-                  {user?.email}
+                <Avatar className="size-6">
+                  <AvatarImage
+                    alt={displayName}
+                    src={user.image ?? "/images/scheffer-icon.png"}
+                  />
+                  <AvatarFallback>{avatarFallback}</AvatarFallback>
+                </Avatar>
+                <span className="truncate" data-testid="user-name">
+                  {displayName}
                 </span>
                 <ChevronUp className="ml-auto" />
               </SidebarMenuButton>
@@ -68,35 +80,37 @@ export function SidebarUserNav({ user }: { user: User }) {
             <DropdownMenuItem
               className="cursor-pointer"
               data-testid="user-nav-item-theme"
-              onSelect={() =>
-                setTheme(resolvedTheme === "dark" ? "light" : "dark")
-              }
+              onSelect={() => setTheme(nextTheme)}
             >
-              {`${resolvedTheme === "light" ? "dark" : "light"} mode`}
+              {nextTheme === "dark" ? (
+                <Moon className="size-4" />
+              ) : (
+                <Sun className="size-4" />
+              )}
+              <span>{nextThemeLabel}</span>
             </DropdownMenuItem>
             <DropdownMenuSeparator />
-            <DropdownMenuItem asChild data-testid="user-nav-item-auth">
-              <button
-                className="w-full cursor-pointer"
-                onClick={() => {
-                  if (status === "loading") {
-                    toast({
-                      type: "error",
-                      description:
-                        "Checking authentication status, please try again!",
-                    });
-
-                    return;
-                  }
-
-                  signOut({
-                    redirectTo: "/",
+            <DropdownMenuItem
+              className="cursor-pointer"
+              data-testid="user-nav-item-auth"
+              onSelect={() => {
+                if (status === "loading") {
+                  toast({
+                    type: "error",
+                    description:
+                      "Checking authentication status, please try again!",
                   });
-                }}
-                type="button"
-              >
-                Sair
-              </button>
+
+                  return;
+                }
+
+                signOut({
+                  redirectTo: "/",
+                });
+              }}
+            >
+              <LogOut className="size-4" />
+              <span>Sair</span>
             </DropdownMenuItem>
           </DropdownMenuContent>
         </DropdownMenu>
