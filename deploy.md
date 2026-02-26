@@ -86,7 +86,36 @@ gcloud projects add-iam-policy-binding "$PROJECT_ID" \
   --member="serviceAccount:$DEPLOYER_SA_EMAIL" \
   --role="roles/artifactregistry.writer"
 
+gcloud projects add-iam-policy-binding "$PROJECT_ID" \
+  --member="serviceAccount:$DEPLOYER_SA_EMAIL" \
+  --role="roles/serviceusage.serviceUsageConsumer" \
+  --condition=None
+
 gcloud iam service-accounts add-iam-policy-binding "$RUNTIME_SA_EMAIL" \
+  --member="serviceAccount:$DEPLOYER_SA_EMAIL" \
+  --role="roles/iam.serviceAccountUser"
+
+# Necessario para --source no gcloud run deploy (permite storage.buckets.list)
+gcloud projects add-iam-policy-binding "$PROJECT_ID" \
+  --member="serviceAccount:$DEPLOYER_SA_EMAIL" \
+  --role="roles/storage.admin" \
+  --condition=None
+
+# Opcional (escopo bucket): permissao explicita no bucket run-sources-*
+gcloud storage buckets add-iam-policy-binding "gs://run-sources-$PROJECT_ID-$REGION" \
+  --member="serviceAccount:$DEPLOYER_SA_EMAIL" \
+  --role="roles/storage.admin" \
+  --project="$PROJECT_ID"
+
+# Build SA padrao do Cloud Build tambem precisa de serviceusage.services.use
+set -x BUILD_SA (gcloud builds get-default-service-account --project="$PROJECT_ID")
+gcloud projects add-iam-policy-binding "$PROJECT_ID" \
+  --member="serviceAccount:$BUILD_SA" \
+  --role="roles/serviceusage.serviceUsageConsumer" \
+  --condition=None
+
+# Caller (SA do GitHub) precisa de actAs sobre a Build SA padrao
+gcloud iam service-accounts add-iam-policy-binding "$BUILD_SA" \
   --member="serviceAccount:$DEPLOYER_SA_EMAIL" \
   --role="roles/iam.serviceAccountUser"
 ```
