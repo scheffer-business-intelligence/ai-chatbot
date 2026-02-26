@@ -1,6 +1,7 @@
 "use client";
 import type { UseChatHelpers } from "@ai-sdk/react";
 import { useState } from "react";
+import { useDataStream } from "@/components/data-stream-provider";
 import {
   DATA_FROM_CONTEXT_MARKER,
   type ExportContextSheet,
@@ -9,7 +10,6 @@ import {
 } from "@/lib/export-context";
 import type { ChatMessage } from "@/lib/types";
 import { cn, sanitizeText } from "@/lib/utils";
-import { useDataStream } from "@/components/data-stream-provider";
 import { ChartRenderer } from "./charts/chart-renderer";
 import { DocumentPreview } from "./document-preview";
 import { MessageContent } from "./elements/message";
@@ -68,6 +68,14 @@ const PurePreviewMessage = ({
       | { type: "data-export-context"; data?: unknown }
       | undefined
   )?.data;
+  const exportHintFromParts = (
+    message.parts.find((part) => part.type === "data-export-hint") as
+      | {
+          type: "data-export-hint";
+          data?: { filename?: unknown; description?: unknown };
+        }
+      | undefined
+  )?.data;
   const chartSpec = chartSpecFromParts ?? message.metadata?.chartSpec ?? null;
   const chartWarning =
     (typeof chartWarningFromParts === "string"
@@ -78,6 +86,20 @@ const PurePreviewMessage = ({
   const exportContextSheetsFromParts = extractContextSheets(
     exportContextFromParts
   );
+  const exportHint =
+    exportHintFromParts &&
+    typeof exportHintFromParts === "object" &&
+    typeof exportHintFromParts.filename === "string" &&
+    exportHintFromParts.filename.trim()
+      ? {
+          filename: exportHintFromParts.filename.trim(),
+          description:
+            typeof exportHintFromParts.description === "string" &&
+            exportHintFromParts.description.trim()
+              ? exportHintFromParts.description.trim()
+              : "Baixar os dados desta resposta em Excel.",
+        }
+      : null;
   const hasTextOrExportParts =
     message.parts?.some((part) => {
       if (part.type !== "text") {
@@ -86,7 +108,22 @@ const PurePreviewMessage = ({
 
       const parsedText = parseExportAwareText(part.text);
       const visibleText = sanitizeText(parsedText.cleanText).trim();
-      return visibleText.length > 0 || parsedText.exportData !== null;
+      const contextSheets =
+        exportContextSheetsFromParts.length > 0
+          ? exportContextSheetsFromParts
+          : parsedText.contextSheets.length > 0
+            ? parsedText.contextSheets
+            : inheritedExportContextSheets;
+      const hasFallbackExport =
+        message.role === "assistant" &&
+        exportHint !== null &&
+        contextSheets.length > 0;
+
+      return (
+        visibleText.length > 0 ||
+        parsedText.exportData !== null ||
+        hasFallbackExport
+      );
     }) ?? false;
   const hasVisibleAssistantContent =
     message.role !== "assistant" ||
@@ -96,9 +133,21 @@ const PurePreviewMessage = ({
     message.parts.some((part) => {
       if (part.type === "text") {
         const parsedText = parseExportAwareText(part.text);
+        const contextSheets =
+          exportContextSheetsFromParts.length > 0
+            ? exportContextSheetsFromParts
+            : parsedText.contextSheets.length > 0
+              ? parsedText.contextSheets
+              : inheritedExportContextSheets;
+        const hasFallbackExport =
+          message.role === "assistant" &&
+          exportHint !== null &&
+          contextSheets.length > 0;
+
         return (
           sanitizeText(parsedText.cleanText).trim().length > 0 ||
-          parsedText.exportData !== null
+          parsedText.exportData !== null ||
+          hasFallbackExport
         );
       }
 
@@ -118,6 +167,10 @@ const PurePreviewMessage = ({
       }
 
       if (part.type === "data-export-context") {
+        return true;
+      }
+
+      if (part.type === "data-export-hint") {
         return true;
       }
 
@@ -208,13 +261,22 @@ const PurePreviewMessage = ({
                     ? parsedText.contextSheets
                     : inheritedExportContextSheets;
               const exportData =
-                parsedText.exportData === null
-                  ? null
-                  : {
+                parsedText.exportData !== null
+                  ? {
                       ...parsedText.exportData,
                       query: DATA_FROM_CONTEXT_MARKER,
                       contextSheets,
-                    };
+                    }
+                  : message.role === "assistant" &&
+                      exportHint &&
+                      contextSheets.length > 0
+                    ? {
+                        query: DATA_FROM_CONTEXT_MARKER,
+                        filename: exportHint.filename,
+                        description: exportHint.description,
+                        contextSheets,
+                      }
+                    : null;
 
               if (mode === "view") {
                 if (!visibleText.trim() && !exportData) {
@@ -238,7 +300,9 @@ const PurePreviewMessage = ({
                             : undefined
                         }
                       >
-                        <Response>{visibleText}</Response>
+                        <Response mode={isLoading ? "streaming" : "static"}>
+                          {visibleText}
+                        </Response>
                       </MessageContent>
                     )}
 
@@ -462,8 +526,12 @@ export const ThinkingMessage = ({ statusText }: { statusText?: string }) => {
             {showThinkingDots && (
               <span className="inline-flex">
                 <span className="animate-bounce [animation-delay:0ms]">.</span>
-                <span className="animate-bounce [animation-delay:150ms]">.</span>
-                <span className="animate-bounce [animation-delay:300ms]">.</span>
+                <span className="animate-bounce [animation-delay:150ms]">
+                  .
+                </span>
+                <span className="animate-bounce [animation-delay:300ms]">
+                  .
+                </span>
               </span>
             )}
           </div>

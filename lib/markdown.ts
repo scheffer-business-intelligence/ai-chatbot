@@ -56,6 +56,59 @@ function isTableSeparator(line: string): boolean {
   return cells.every((cell) => /^:?-{3,}:?$/.test(cell));
 }
 
+function splitTableLineCells(line: string): string[] {
+  return line
+    .trim()
+    .replace(/^\|/, "")
+    .replace(/\|$/, "")
+    .split("|")
+    .map((cell) => cell.trim());
+}
+
+function normalizeTableSeparatorToHeader(
+  headerLine: string,
+  separatorLine: string
+): string {
+  const headerCells = splitTableLineCells(headerLine).filter(
+    (cell) => cell.length > 0
+  );
+  if (headerCells.length < 2) {
+    return separatorLine;
+  }
+
+  const separatorCells = splitTableLineCells(separatorLine).filter(
+    (cell) => cell.length > 0
+  );
+  if (separatorCells.length === 0) {
+    return separatorLine;
+  }
+
+  if (!separatorCells.every((cell) => isSeparatorCell(cell))) {
+    return separatorLine;
+  }
+
+  const adjustedSeparators = separatorCells
+    .slice(0, headerCells.length)
+    .map((cell) => {
+      if (/^:-{3,}:$/.test(cell)) {
+        return ":---:";
+      }
+      if (/^:-{3,}$/.test(cell)) {
+        return ":---";
+      }
+      if (/^-{3,}:$/.test(cell)) {
+        return "---:";
+      }
+      return "---";
+    });
+
+  while (adjustedSeparators.length < headerCells.length) {
+    adjustedSeparators.push(":---");
+  }
+
+  return `| ${adjustedSeparators.join(" | ")} |`;
+}
+
 function shouldInsertBlankLineBeforeTable(previousLine: string): boolean {
   const trimmed = previousLine.trim();
   if (!trimmed) {
@@ -75,6 +128,86 @@ function shouldInsertBlankLineBeforeTable(previousLine: string): boolean {
   }
 
   return true;
+}
+
+function isSeparatorCell(cell: string): boolean {
+  return /^:?-{3,}:?$/.test(cell.trim());
+}
+
+function reconstructCollapsedTableLine(line: string): string | null {
+  const trimmed = line.trim();
+  if (!trimmed.includes("|") || trimmed.includes("\n")) {
+    return null;
+  }
+
+  const rawCells = trimmed
+    .replace(/^\|/, "")
+    .replace(/\|$/, "")
+    .split("|")
+    .map((cell) => cell.trim())
+    .filter((cell) => cell.length > 0);
+
+  if (rawCells.length < 6) {
+    return null;
+  }
+
+  let separatorStart = -1;
+  let separatorLength = 0;
+
+  for (let index = 0; index < rawCells.length; index += 1) {
+    if (!isSeparatorCell(rawCells[index])) {
+      continue;
+    }
+
+    let runLength = 1;
+    while (
+      index + runLength < rawCells.length &&
+      isSeparatorCell(rawCells[index + runLength])
+    ) {
+      runLength += 1;
+    }
+
+    if (runLength >= 2) {
+      separatorStart = index;
+      separatorLength = runLength;
+      break;
+    }
+  }
+
+  if (separatorStart < 2 || separatorLength < 2) {
+    return null;
+  }
+
+  const headerStart = separatorStart - separatorLength;
+  if (headerStart !== 0) {
+    return null;
+  }
+
+  const headerCells = rawCells.slice(headerStart, separatorStart);
+  const separatorCells = rawCells.slice(
+    separatorStart,
+    separatorStart + separatorLength
+  );
+  const bodyCells = rawCells.slice(separatorStart + separatorLength);
+
+  if (
+    bodyCells.length < separatorLength ||
+    bodyCells.length % separatorLength !== 0
+  ) {
+    return null;
+  }
+
+  const lines: string[] = [];
+  lines.push(`| ${headerCells.join(" | ")} |`);
+  lines.push(`| ${separatorCells.join(" | ")} |`);
+
+  for (let index = 0; index < bodyCells.length; index += separatorLength) {
+    lines.push(
+      `| ${bodyCells.slice(index, index + separatorLength).join(" | ")} |`
+    );
+  }
+
+  return lines.join("\n");
 }
 
 function stripDanglingTrailingEmphasisMarker(line: string): string {
@@ -245,6 +378,28 @@ export function normalizeMarkdownForRender(text: string): string {
         normalizeEscapedPipesInTableLine(currentRaw)
       )
     );
+
+    const nextRaw = normalizeEscapedPipesInTableLine(rawLines[index + 1] ?? "");
+    if (isLikelyTableHeader(currentLine) && nextRaw.includes("|")) {
+      rawLines[index + 1] = normalizeTableSeparatorToHeader(
+        currentLine,
+        nextRaw
+      );
+    }
+
+    const reconstructedTable = reconstructCollapsedTableLine(currentLine);
+    if (reconstructedTable) {
+      const reconstructedLines = reconstructedTable.split("\n");
+      const previousLine = result.at(-1) ?? "";
+      if (
+        reconstructedLines.length >= 2 &&
+        shouldInsertBlankLineBeforeTable(previousLine)
+      ) {
+        result.push("");
+      }
+      result.push(...reconstructedLines);
+      continue;
+    }
     const nextLine = normalizeEscapedPipesInTableLine(
       rawLines[index + 1] ?? ""
     );

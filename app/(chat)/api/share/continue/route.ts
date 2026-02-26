@@ -3,6 +3,7 @@ import { getBigQueryUserIdCandidates } from "@/lib/auth/user-id";
 import { persistMessageToBigQuery } from "@/lib/chat-store";
 import { getChatById, getMessagesByChatId, saveChat } from "@/lib/db/queries";
 import { ChatSDKError } from "@/lib/errors";
+import { dedupeDbAssistantMessages } from "@/lib/messages/dedupe";
 import type { ChatMessage } from "@/lib/types";
 import { generateUUID } from "@/lib/utils";
 
@@ -46,8 +47,10 @@ export async function POST(request: Request) {
     }
 
     const sourceMessages = await getMessagesByChatId({ id: sourceChatId });
-    const messagesToClone = sourceMessages.filter(
-      (message) => message.role === "user" || message.role === "assistant"
+    const messagesToClone = dedupeDbAssistantMessages(
+      sourceMessages.filter(
+        (message) => message.role === "user" || message.role === "assistant"
+      )
     );
 
     const newChatId = generateUUID();

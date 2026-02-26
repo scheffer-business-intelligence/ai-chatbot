@@ -24,7 +24,6 @@ import { getBigQueryUserIdCandidates } from "@/lib/auth/user-id";
 import {
   countRecentUserMessages,
   getChatMessagesByChatId,
-  persistMessageToBigQuery,
   softDeleteSessionMessagesByChatId,
 } from "@/lib/chat-store";
 import { isProductionEnvironment } from "@/lib/constants";
@@ -34,9 +33,10 @@ import {
   getProviderSessionByChatId,
   saveChat,
   saveMessages,
-  updateChatVisibilityById,
   updateChatTitleById,
+  updateChatVisibilityById,
   updateMessage,
+  updateMessageAnsweredIn,
   upsertProviderSession,
 } from "@/lib/db/queries";
 import { ChatSDKError } from "@/lib/errors";
@@ -173,6 +173,50 @@ function getLatestUserMessage(messages: ChatMessage[]) {
   }
 
   return null;
+}
+
+function isExportIntentText(text: string) {
+  if (!text.trim()) {
+    return false;
+  }
+
+  return /\b(exportar|exporte|export|excel|xlsx|planilha|baixar\s+planilha|download\s+(?:da\s+)?(?:tabela|planilha))\b/i.test(
+    text
+  );
+}
+
+function deriveExportFilenameFromPrompt(text: string) {
+  const normalized = text.toLowerCase();
+
+  if (/\brecomend/.test(normalized) || /\bmanejo\b/.test(normalized)) {
+    return "recomendacoes_manejo";
+  }
+
+  if (/\bseiva\b/.test(normalized)) {
+    return "analise_seiva";
+  }
+
+  if (/\bsolo\b/.test(normalized)) {
+    return "analise_solo";
+  }
+
+  return "dados_exportados";
+}
+
+function buildExportHintFromUserMessage(message: ChatMessage | null) {
+  if (!message) {
+    return null;
+  }
+
+  const promptText = getTextFromMessage(message).replace(/\s+/g, " ").trim();
+  if (!isExportIntentText(promptText)) {
+    return null;
+  }
+
+  return {
+    filename: deriveExportFilenameFromPrompt(promptText),
+    description: "Baixar os dados desta resposta em Excel.",
+  };
 }
 
 function shouldAllowTableChartFallback(message: ChatMessage): boolean {
@@ -394,6 +438,7 @@ export async function POST(request: Request) {
           chatId: id,
           userId: bigQueryUserId,
           fallbackUserId: fallbackBigQueryUserId,
+          dedupeAssistantDuplicates: true,
         });
       }
     } else if (message?.role === "user") {
@@ -418,6 +463,11 @@ export async function POST(request: Request) {
     const uiMessages = isToolApprovalFlow
       ? (messages as ChatMessage[])
       : [...messageHistory, message as ChatMessage];
+    const latestUserMessage =
+      message?.role === "user"
+        ? (message as ChatMessage)
+        : getLatestUserMessage(uiMessages);
+    const exportHint = buildExportHintFromUserMessage(latestUserMessage);
 
     const { longitude, latitude, city, country } = geolocation(request);
 
@@ -442,13 +492,6 @@ export async function POST(request: Request) {
             createdAt: new Date(),
           },
         ],
-      });
-
-      await persistMessageToBigQuery({
-        chatId: id,
-        userId: bigQueryUserId,
-        message: message as ChatMessage,
-        visibility: chatVisibility,
       });
     }
 
@@ -534,28 +577,10 @@ export async function POST(request: Request) {
         });
       }
 
-      for (const finishedMessage of finishedMessages) {
-        const shouldPersistChartContext =
-          isAgentEngineModel(selectedChatModel) &&
-          finishedMessage.role === "assistant" &&
-          finishedMessage.id === lastAssistantMessageId;
-
-        await persistMessageToBigQuery({
-          chatId: id,
-          userId: bigQueryUserId,
-          message: finishedMessage,
-          visibility: chatVisibility,
-          answeredIn:
-            finishedMessage.role === "assistant" &&
-            finishedMessage.id === lastAssistantMessageId
-              ? answeredInMs
-              : null,
-          chartSpec: shouldPersistChartContext
-            ? extractedContext.chartSpec
-            : undefined,
-          chartError: shouldPersistChartContext
-            ? extractedContext.chartError
-            : undefined,
+      if (lastAssistantMessageId) {
+        await updateMessageAnsweredIn({
+          id: lastAssistantMessageId,
+          answeredIn: answeredInMs,
         });
       }
     };
@@ -565,11 +590,6 @@ export async function POST(request: Request) {
     if (isAgentEngineModel(selectedChatModel)) {
       try {
         const serviceAccountAccessToken = await getServiceAccountAccessToken();
-
-        const latestUserMessage =
-          message?.role === "user"
-            ? (message as ChatMessage)
-            : getLatestUserMessage(uiMessages);
 
         if (!latestUserMessage) {
           return new ChatSDKError(
@@ -638,6 +658,12 @@ export async function POST(request: Request) {
             let activeProviderSessionId = initialProviderSessionId;
             dataStream.write({ type: "start" });
             dataStream.write({ type: "text-start", id: textPartId });
+            if (exportHint) {
+              dataStream.write({
+                type: "data-export-hint",
+                data: exportHint,
+              });
+            }
 
             const streamAgentEngineResponse = async (
               currentProviderSessionId: string
@@ -786,6 +812,12 @@ export async function POST(request: Request) {
           const textPartId = generateUUID();
           dataStream.write({ type: "start" });
           dataStream.write({ type: "text-start", id: textPartId });
+          if (exportHint) {
+            dataStream.write({
+              type: "data-export-hint",
+              data: exportHint,
+            });
+          }
 
           for await (const delta of streamDirectProviderResponse({
             modelId: selectedChatModel,
@@ -861,6 +893,13 @@ export async function POST(request: Request) {
 
           dataStream.merge(result.toUIMessageStream({ sendReasoning: true }));
 
+          if (exportHint) {
+            dataStream.write({
+              type: "data-export-hint",
+              data: exportHint,
+            });
+          }
+
           if (titlePromise) {
             const title = await titlePromise;
             dataStream.write({ type: "data-chat-title", data: title });
@@ -923,8 +962,9 @@ export async function DELETE(request: Request) {
     return new ChatSDKError("unauthorized:chat").toResponse();
   }
 
-  const [bigQueryUserId, fallbackBigQueryUserId] =
-    getBigQueryUserIdCandidates(session.user);
+  const [bigQueryUserId, fallbackBigQueryUserId] = getBigQueryUserIdCandidates(
+    session.user
+  );
   if (!bigQueryUserId) {
     return new ChatSDKError("unauthorized:chat").toResponse();
   }
@@ -976,8 +1016,9 @@ export async function PATCH(request: Request) {
     return new ChatSDKError("unauthorized:chat").toResponse();
   }
 
-  const [bigQueryUserId, fallbackBigQueryUserId] =
-    getBigQueryUserIdCandidates(session.user);
+  const [bigQueryUserId, fallbackBigQueryUserId] = getBigQueryUserIdCandidates(
+    session.user
+  );
   if (!bigQueryUserId) {
     return new ChatSDKError("unauthorized:chat").toResponse();
   }

@@ -7,6 +7,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { useSWRConfig } from "swr";
 import { unstable_serialize } from "swr/infinite";
 import { ChatHeader } from "@/components/chat-header";
+import { useDataStream } from "@/components/data-stream-provider";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -23,7 +24,6 @@ import { ChatSDKError } from "@/lib/errors";
 import type { Attachment, ChatMessage } from "@/lib/types";
 import { fetchWithErrorHandlers, generateUUID } from "@/lib/utils";
 import { Artifact } from "./artifact";
-import { useDataStream } from "@/components/data-stream-provider";
 import { Messages } from "./messages";
 import { MultimodalInput } from "./multimodal-input";
 import { getChatHistoryPaginationKey } from "./sidebar-history";
@@ -196,7 +196,8 @@ export function Chat({
         if (
           part.type === "data-chart-spec" ||
           part.type === "data-chart-warning" ||
-          part.type === "data-export-context"
+          part.type === "data-export-context" ||
+          part.type === "data-export-hint"
         ) {
           return true;
         }
@@ -262,9 +263,12 @@ export function Chat({
         body: JSON.stringify({ chatId: id }),
       });
 
-      const payload = (await response.json().catch(() => null)) as
-        | { chatId?: string; message?: string; cause?: string; error?: string }
-        | null;
+      const payload = (await response.json().catch(() => null)) as {
+        chatId?: string;
+        message?: string;
+        cause?: string;
+        error?: string;
+      } | null;
 
       if (!response.ok) {
         throw new Error(
@@ -291,7 +295,9 @@ export function Chat({
       toast({
         type: "error",
         description:
-          error instanceof Error ? error.message : "Falha ao continuar conversa.",
+          error instanceof Error
+            ? error.message
+            : "Falha ao continuar conversa.",
       });
     } finally {
       setIsContinuingSharedChat(false);

@@ -15,6 +15,7 @@ type AccessTokenCache = {
 
 const TOKEN_SCOPE = "https://www.googleapis.com/auth/cloud-platform";
 const DEFAULT_TOKEN_URI = "https://oauth2.googleapis.com/token";
+const FALLBACK_TOKEN_URI = "https://www.googleapis.com/oauth2/v4/token";
 const TOKEN_EXPIRY_SECONDS = 3600;
 const TOKEN_REFRESH_BUFFER_MS = 60_000;
 const TOKEN_REQUEST_TIMEOUT_MS = 10_000;
@@ -121,6 +122,39 @@ function getServiceAccountKeyPath() {
   return process.env.GOOGLE_SERVICE_ACCOUNT_KEY_FILE || "bi-scheffer.json";
 }
 
+function normalizeTokenUri(tokenUri: string | undefined) {
+  const normalized = (tokenUri ?? DEFAULT_TOKEN_URI).trim();
+  return normalized || DEFAULT_TOKEN_URI;
+}
+
+function resolveTokenUriFallback(tokenUri: string) {
+  try {
+    const url = new URL(tokenUri);
+
+    if (url.hostname === "oauth2.googleapis.com" && url.pathname === "/token") {
+      return FALLBACK_TOKEN_URI;
+    }
+
+    if (
+      url.hostname === "www.googleapis.com" &&
+      url.pathname === "/oauth2/v4/token"
+    ) {
+      return DEFAULT_TOKEN_URI;
+    }
+  } catch {
+    return null;
+  }
+
+  return null;
+}
+
+function getTokenUrisToTry(tokenUri: string) {
+  const fallbackUri = resolveTokenUriFallback(tokenUri);
+  return fallbackUri && fallbackUri !== tokenUri
+    ? [tokenUri, fallbackUri]
+    : [tokenUri];
+}
+
 function normalizePrivateKey(privateKey: string) {
   if (!privateKey) {
     return privateKey;
@@ -143,7 +177,7 @@ function parseServiceAccountKey(rawContent: string): ServiceAccountKey {
   return {
     client_email: parsedKey.client_email,
     private_key: normalizePrivateKey(parsedKey.private_key),
-    token_uri: parsedKey.token_uri || DEFAULT_TOKEN_URI,
+    token_uri: normalizeTokenUri(parsedKey.token_uri),
   };
 }
 
@@ -197,9 +231,10 @@ function buildSignedJwt({
   return `${unsignedJwt}.${signature}`;
 }
 
-async function requestAccessTokenOnce(): Promise<AccessTokenCache> {
-  const key = await loadServiceAccountKey();
-  const tokenUri = key.token_uri || DEFAULT_TOKEN_URI;
+async function requestAccessTokenFromUri(
+  key: ServiceAccountKey,
+  tokenUri: string
+): Promise<AccessTokenCache> {
   const assertion = buildSignedJwt({
     clientEmail: key.client_email,
     privateKey: key.private_key,
@@ -258,11 +293,15 @@ async function requestAccessTokenOnce(): Promise<AccessTokenCache> {
 }
 
 async function requestAccessToken(): Promise<AccessTokenCache> {
+  const key = await loadServiceAccountKey();
+  const tokenUris = getTokenUrisToTry(normalizeTokenUri(key.token_uri));
   let lastError: unknown;
 
   for (let attempt = 1; attempt <= TOKEN_REQUEST_MAX_ATTEMPTS; attempt += 1) {
+    const tokenUri = tokenUris[(attempt - 1) % tokenUris.length];
+
     try {
-      return await requestAccessTokenOnce();
+      return await requestAccessTokenFromUri(key, tokenUri);
     } catch (error) {
       lastError = error;
 

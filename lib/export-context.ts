@@ -256,6 +256,207 @@ function stripInlineMarkdown(text: string): string {
     .trim();
 }
 
+function splitMarkdownTableRow(line: string): string[] {
+  const trimmed = line.trim().replace(/^\|/, "").replace(/\|$/, "");
+  return trimmed
+    .split(/(?<!\\)\|/g)
+    .map((cell) => stripInlineMarkdown(cell.replace(/\\\|/g, "|").trim()));
+}
+
+function isSeparatorCell(cell: string): boolean {
+  return /^:?-{3,}:?$/.test(cell.trim());
+}
+
+function reconstructCollapsedTableLine(line: string): string | null {
+  const trimmed = line.trim();
+  if (!trimmed.includes("|")) {
+    return null;
+  }
+
+  const rawCells = trimmed
+    .replace(/^\|/, "")
+    .replace(/\|$/, "")
+    .split("|")
+    .map((cell) => cell.trim())
+    .filter((cell) => cell.length > 0);
+
+  if (rawCells.length < 6) {
+    return null;
+  }
+
+  let separatorStart = -1;
+  let separatorLength = 0;
+
+  for (let index = 0; index < rawCells.length; index += 1) {
+    if (!isSeparatorCell(rawCells[index])) {
+      continue;
+    }
+
+    let runLength = 1;
+    while (
+      index + runLength < rawCells.length &&
+      isSeparatorCell(rawCells[index + runLength])
+    ) {
+      runLength += 1;
+    }
+
+    if (runLength >= 2) {
+      separatorStart = index;
+      separatorLength = runLength;
+      break;
+    }
+  }
+
+  if (separatorStart < 2 || separatorLength < 2) {
+    return null;
+  }
+
+  const headerStart = separatorStart - separatorLength;
+  if (headerStart !== 0) {
+    return null;
+  }
+
+  const headerCells = rawCells.slice(headerStart, separatorStart);
+  const separatorCells = rawCells.slice(
+    separatorStart,
+    separatorStart + separatorLength
+  );
+  const bodyCells = rawCells.slice(separatorStart + separatorLength);
+
+  if (
+    bodyCells.length < separatorLength ||
+    bodyCells.length % separatorLength !== 0
+  ) {
+    return null;
+  }
+
+  const normalizedLines: string[] = [];
+  normalizedLines.push(`| ${headerCells.join(" | ")} |`);
+  normalizedLines.push(`| ${separatorCells.join(" | ")} |`);
+
+  for (let index = 0; index < bodyCells.length; index += separatorLength) {
+    normalizedLines.push(
+      `| ${bodyCells.slice(index, index + separatorLength).join(" | ")} |`
+    );
+  }
+
+  return normalizedLines.join("\n");
+}
+
+function normalizeCollapsedTables(lines: string[]): string[] {
+  const normalized: string[] = [];
+
+  for (const line of lines) {
+    const reconstructed = reconstructCollapsedTableLine(line);
+    if (!reconstructed) {
+      normalized.push(line);
+      continue;
+    }
+
+    normalized.push(...reconstructed.split("\n"));
+  }
+
+  return normalized;
+}
+
+function isMarkdownTableSeparatorLine(line: string): boolean {
+  if (!line.includes("|")) {
+    return false;
+  }
+
+  const cells = splitMarkdownTableRow(line);
+  if (cells.length < 2) {
+    return false;
+  }
+
+  return cells.every((cell) => isSeparatorCell(cell.replace(/\s+/g, "")));
+}
+
+function buildUniqueHeaderNames(headers: string[]): string[] {
+  const used = new Map<string, number>();
+
+  return headers.map((header, index) => {
+    const base = header.trim() || `coluna_${index + 1}`;
+    const currentCount = used.get(base) ?? 0;
+    used.set(base, currentCount + 1);
+
+    if (currentCount === 0) {
+      return base;
+    }
+
+    return `${base}_${currentCount + 1}`;
+  });
+}
+
+function extractMarkdownTableSheetFromText(
+  text: string
+): ExportContextSheet | null {
+  const lines = normalizeCollapsedTables(text.split(/\r?\n/));
+
+  for (let index = 0; index < lines.length - 1; index += 1) {
+    const headerLine = lines[index]?.trim() ?? "";
+    const separatorLine = lines[index + 1]?.trim() ?? "";
+
+    if (
+      !headerLine.includes("|") ||
+      !isMarkdownTableSeparatorLine(separatorLine)
+    ) {
+      continue;
+    }
+
+    const rawHeaders = splitMarkdownTableRow(headerLine);
+    if (rawHeaders.length < 2) {
+      continue;
+    }
+
+    const columns = buildUniqueHeaderNames(rawHeaders);
+    const rows: Record<string, unknown>[] = [];
+
+    for (let rowIndex = index + 2; rowIndex < lines.length; rowIndex += 1) {
+      const rowLine = lines[rowIndex]?.trim() ?? "";
+      if (!rowLine || !rowLine.includes("|")) {
+        break;
+      }
+
+      if (isMarkdownTableSeparatorLine(rowLine)) {
+        continue;
+      }
+
+      const rowCells = splitMarkdownTableRow(rowLine);
+      if (rowCells.length === 0) {
+        continue;
+      }
+
+      while (rowCells.length < columns.length) {
+        rowCells.push("");
+      }
+
+      const normalizedCells = rowCells.slice(0, columns.length);
+      if (normalizedCells.every((cell) => !String(cell).trim())) {
+        continue;
+      }
+
+      const rowRecord: Record<string, unknown> = {};
+      columns.forEach((column, columnIndex) => {
+        rowRecord[column] = normalizedCells[columnIndex] ?? "";
+      });
+      rows.push(rowRecord);
+    }
+
+    if (rows.length === 0) {
+      continue;
+    }
+
+    return {
+      name: "Tabela",
+      columns,
+      rows,
+    };
+  }
+
+  return null;
+}
+
 function extractListRowsFromText(text: string): Record<string, unknown>[] {
   const rows: Record<string, unknown>[] = [];
 
@@ -294,6 +495,11 @@ function extractListRowsFromText(text: string): Record<string, unknown>[] {
 }
 
 function buildFallbackSheetsFromText(text: string): ExportContextSheet[] {
+  const tableSheet = extractMarkdownTableSheetFromText(text);
+  if (tableSheet) {
+    return [tableSheet];
+  }
+
   const listRows = extractListRowsFromText(text);
   if (listRows.length === 0) {
     return [];

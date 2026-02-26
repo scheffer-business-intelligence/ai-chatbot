@@ -43,6 +43,10 @@ export type CustomUIDataTypes = {
   "chart-spec": ChartSpecV1;
   "chart-warning": string;
   "export-context": ExportContextSheet[];
+  "export-hint": {
+    filename: string;
+    description: string;
+  };
 };
 
 export type ChatMessage = UIMessage<

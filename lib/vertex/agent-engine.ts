@@ -35,9 +35,26 @@ const DEFAULT_AGENT_STATUS_PREFIXES = [
   "Dados obtidos com sucesso",
   "Gerando resposta...",
 ];
+const AGENT_ENGINE_STREAM_DEBUG =
+  process.env.AGENT_ENGINE_STREAM_DEBUG === "true";
+const MIN_SAFE_OVERLAP_CHARS = 24;
+const MAX_DELTA_APPEND_CHARS = 120;
 
 function getBaseVertexUrl(engineId: string) {
   return `https://${VERTEX_LOCATION}-aiplatform.googleapis.com/v1/projects/${VERTEX_PROJECT_ID}/locations/${VERTEX_LOCATION}/reasoningEngines/${engineId}`;
+}
+
+function logStreamDebug(message: string, details?: Record<string, unknown>) {
+  if (!AGENT_ENGINE_STREAM_DEBUG) {
+    return;
+  }
+
+  if (details) {
+    console.debug(`[agent-engine-stream] ${message}`, details);
+    return;
+  }
+
+  console.debug(`[agent-engine-stream] ${message}`);
 }
 
 function extractTextFromContent(content: unknown): string | null {
@@ -58,7 +75,11 @@ function extractTextFromContent(content: unknown): string | null {
     }
 
     if (texts.length > 0) {
-      return texts.join("");
+      const hasTokenLikeParts =
+        texts.length > 8 &&
+        texts.filter((text) => text.length <= 12).length / texts.length > 0.7 &&
+        texts.filter((text) => !/\s/.test(text)).length / texts.length > 0.5;
+      return hasTokenLikeParts ? texts.join("") : texts.join("\n");
     }
 
     return null;
@@ -86,7 +107,11 @@ function extractTextFromContent(content: unknown): string | null {
     }
 
     if (texts.length > 0) {
-      return texts.join("");
+      const hasTokenLikeParts =
+        texts.length > 8 &&
+        texts.filter((text) => text.length <= 12).length / texts.length > 0.7 &&
+        texts.filter((text) => !/\s/.test(text)).length / texts.length > 0.5;
+      return hasTokenLikeParts ? texts.join("") : texts.join("\n");
     }
   }
 
@@ -897,14 +922,72 @@ function computeNextRawText(
     return incomingText;
   }
 
-  const maxOverlap = Math.min(accumulatedRawText.length, incomingText.length);
-  for (let size = maxOverlap; size > 0; size -= 1) {
-    if (accumulatedRawText.endsWith(incomingText.slice(0, size))) {
-      return `${accumulatedRawText}${incomingText.slice(size)}`;
+  const minLength = Math.min(accumulatedRawText.length, incomingText.length);
+  if (minLength >= 40) {
+    let commonPrefixLength = 0;
+    while (
+      commonPrefixLength < minLength &&
+      accumulatedRawText[commonPrefixLength] ===
+        incomingText[commonPrefixLength]
+    ) {
+      commonPrefixLength += 1;
+    }
+
+    let commonSuffixLength = 0;
+    while (
+      commonSuffixLength < minLength &&
+      accumulatedRawText.at(-(commonSuffixLength + 1)) ===
+        incomingText.at(-(commonSuffixLength + 1))
+    ) {
+      commonSuffixLength += 1;
+    }
+
+    const prefixRatio = commonPrefixLength / minLength;
+    const suffixRatio = commonSuffixLength / minLength;
+
+    if (prefixRatio >= 0.8 || suffixRatio >= 0.8) {
+      return incomingText.length >= accumulatedRawText.length
+        ? incomingText
+        : accumulatedRawText;
     }
   }
 
-  return `${accumulatedRawText}${incomingText}`;
+  const maxOverlap = Math.min(accumulatedRawText.length, incomingText.length);
+  let bestOverlap = 0;
+
+  for (let size = maxOverlap; size > 0; size -= 1) {
+    if (accumulatedRawText.endsWith(incomingText.slice(0, size))) {
+      bestOverlap = size;
+      break;
+    }
+  }
+
+  if (bestOverlap > 0) {
+    const minRequiredOverlap = Math.min(
+      MIN_SAFE_OVERLAP_CHARS,
+      Math.max(8, Math.floor(incomingText.length * 0.35))
+    );
+
+    if (bestOverlap >= minRequiredOverlap) {
+      return `${accumulatedRawText}${incomingText.slice(bestOverlap)}`;
+    }
+  }
+
+  if (incomingText.length <= MAX_DELTA_APPEND_CHARS) {
+    return `${accumulatedRawText}${incomingText}`;
+  }
+
+  logStreamDebug("Ambiguous long chunk discarded to avoid duplication.", {
+    accumulatedLength: accumulatedRawText.length,
+    incomingLength: incomingText.length,
+    bestOverlap,
+    accumulatedTail: accumulatedRawText.slice(-120),
+    incomingHead: incomingText.slice(0, 120),
+  });
+
+  return incomingText.length > accumulatedRawText.length
+    ? incomingText
+    : accumulatedRawText;
 }
 
 function extractVisibleDelta(
@@ -917,16 +1000,28 @@ function extractVisibleDelta(
     statusHistory
   );
 
-  if (nextVisibleText.startsWith(accumulatedVisibleText)) {
+  const mergedVisibleText = computeNextRawText(
+    nextVisibleText,
+    accumulatedVisibleText
+  );
+
+  if (mergedVisibleText.startsWith(accumulatedVisibleText)) {
     return {
-      delta: nextVisibleText.slice(accumulatedVisibleText.length),
-      nextVisibleText,
+      delta: mergedVisibleText.slice(accumulatedVisibleText.length),
+      nextVisibleText: mergedVisibleText,
+    };
+  }
+
+  if (accumulatedVisibleText.startsWith(mergedVisibleText)) {
+    return {
+      delta: "",
+      nextVisibleText: accumulatedVisibleText,
     };
   }
 
   return {
-    delta: nextVisibleText,
-    nextVisibleText,
+    delta: "",
+    nextVisibleText: accumulatedVisibleText,
   };
 }
 

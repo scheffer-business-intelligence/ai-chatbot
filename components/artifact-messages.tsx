@@ -118,6 +118,10 @@ function PureArtifactMessages({
             return true;
           }
 
+          if (part.type === "data-export-hint") {
+            return true;
+          }
+
           return part.type === "file";
         }) ?? false
       );

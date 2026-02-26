@@ -12,6 +12,7 @@ import {
   softDeleteSessionMessages,
   upsertChatMessageRow,
 } from "@/lib/gcp/bigquery";
+import { dedupeChatAssistantMessages } from "@/lib/messages/dedupe";
 import type { ChatMessage, ChatTools, CustomUIDataTypes } from "@/lib/types";
 import { sanitizeText } from "@/lib/utils";
 
@@ -178,10 +179,12 @@ export async function getChatMessagesByChatId({
   chatId,
   userId,
   fallbackUserId,
+  dedupeAssistantDuplicates = false,
 }: {
   chatId: string;
   userId: string;
   fallbackUserId?: string;
+  dedupeAssistantDuplicates?: boolean;
 }): Promise<ChatMessage[]> {
   try {
     const accessToken = await getBigQueryAccessToken();
@@ -222,13 +225,19 @@ export async function getChatMessagesByChatId({
       }
     }
 
-    return [...messagesById.values()]
+    const messages = [...messagesById.values()]
       .sort((messageA, messageB) => {
         const messageATimestamp = parseSortableTimestamp(messageA.created_at);
         const messageBTimestamp = parseSortableTimestamp(messageB.created_at);
         return messageATimestamp - messageBTimestamp;
       })
       .map((row) => toChatMessageFromBigQueryRow(row));
+
+    if (!dedupeAssistantDuplicates) {
+      return messages;
+    }
+
+    return dedupeChatAssistantMessages(messages);
   } catch (error) {
     console.error("Failed to load chat messages from BigQuery:", error);
     return [];

@@ -61,6 +61,7 @@ async function ChatPage({ params }: { params: Promise<{ id: string }> }) {
     chatId: id,
     userId: resolvedUserId,
     fallbackUserId: isOwner ? resolvedFallbackUserId : undefined,
+    dedupeAssistantDuplicates: !isOwner,
   });
 
   const cookieStore = await cookies();

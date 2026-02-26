@@ -1783,6 +1783,38 @@ export async function updateMessage({
   }
 }
 
+export async function updateMessageAnsweredIn({
+  id,
+  answeredIn,
+}: {
+  id: string;
+  answeredIn: number;
+}) {
+  const now = new Date().toISOString();
+
+  try {
+    await runQuery(
+      `
+        UPDATE \`${MESSAGES_TABLE_REF}\`
+        SET
+          answered_in = @answered_in,
+          updated_at = @updated_at
+        WHERE message_id = @message_id
+      `,
+      [
+        { name: "answered_in", type: "INT64", value: answeredIn },
+        { name: "updated_at", type: "STRING", value: now },
+        { name: "message_id", type: "STRING", value: id },
+      ]
+    );
+  } catch (_error) {
+    throw new ChatSDKError(
+      "bad_request:database",
+      "Failed to update message answered_in"
+    );
+  }
+}
+
 export async function getMessagesByChatId({ id }: { id: string }) {
   try {
     const rows = await queryRows(

@@ -9,6 +9,35 @@ const BQ_MESSAGES_TABLE = process.env.BQ_MESSAGES_TABLE || "chat_messages";
 const BQ_FEEDBACKS_TABLE = process.env.BQ_FEEDBACKS_TABLE || "feedbacks";
 const BQ_FILES_TABLE = process.env.BQ_FILES_TABLE || "chat_files";
 const BQ_BASE_URL = "https://bigquery.googleapis.com/bigquery/v2";
+const BQ_FALLBACK_BASE_URL = "https://www.googleapis.com/bigquery/v2";
+const BQ_REQUEST_TIMEOUT_MS = toPositiveInt(
+  process.env.BQ_REQUEST_TIMEOUT_MS,
+  15_000
+);
+const BQ_REQUEST_MAX_ATTEMPTS = toPositiveInt(
+  process.env.BQ_REQUEST_MAX_ATTEMPTS,
+  3
+);
+const BQ_REQUEST_BASE_DELAY_MS = toPositiveInt(
+  process.env.BQ_REQUEST_BASE_DELAY_MS,
+  300
+);
+const BQ_REQUEST_MAX_DELAY_MS = toPositiveInt(
+  process.env.BQ_REQUEST_MAX_DELAY_MS,
+  3000
+);
+const RETRYABLE_BIGQUERY_STATUSES = new Set([408, 429, 500, 502, 503, 504]);
+const RETRYABLE_BIGQUERY_NETWORK_CODES = new Set([
+  "UND_ERR_CONNECT_TIMEOUT",
+  "UND_ERR_HEADERS_TIMEOUT",
+  "UND_ERR_SOCKET",
+  "ECONNRESET",
+  "ECONNREFUSED",
+  "ENETUNREACH",
+  "EHOSTUNREACH",
+  "ETIMEDOUT",
+  "EAI_AGAIN",
+]);
 
 type BigQueryParameterType = "STRING" | "INT64" | "BOOL";
 
@@ -27,6 +56,146 @@ type BigQueryRow = {
 };
 
 type GenericBigQueryRow = Record<string, string | null>;
+
+class BigQueryRequestError extends Error {
+  retryable: boolean;
+
+  constructor(message: string, retryable: boolean) {
+    super(message);
+    this.name = "BigQueryRequestError";
+    this.retryable = retryable;
+  }
+}
+
+function toPositiveInt(value: string | undefined, fallback: number) {
+  const parsed = Number.parseInt(value ?? "", 10);
+
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return fallback;
+  }
+
+  return parsed;
+}
+
+function delay(ms: number) {
+  return new Promise((resolvePromise) => {
+    setTimeout(resolvePromise, ms);
+  });
+}
+
+function computeBackoffDelayMs(attempt: number) {
+  const exponential = BQ_REQUEST_BASE_DELAY_MS * 2 ** (attempt - 1);
+  const jitter = Math.floor(Math.random() * BQ_REQUEST_BASE_DELAY_MS);
+  return Math.min(exponential + jitter, BQ_REQUEST_MAX_DELAY_MS);
+}
+
+function extractErrorCode(error: unknown): string | undefined {
+  if (!error || typeof error !== "object") {
+    return undefined;
+  }
+
+  const typedError = error as {
+    code?: unknown;
+    cause?: { code?: unknown };
+  };
+
+  if (typeof typedError.code === "string") {
+    return typedError.code;
+  }
+
+  if (typedError.cause && typeof typedError.cause.code === "string") {
+    return typedError.cause.code;
+  }
+
+  return undefined;
+}
+
+function isRetryableBigQueryNetworkError(error: unknown): boolean {
+  if (error instanceof Error && error.name === "AbortError") {
+    return true;
+  }
+
+  const code = extractErrorCode(error);
+  if (code && RETRYABLE_BIGQUERY_NETWORK_CODES.has(code)) {
+    return true;
+  }
+
+  const reason =
+    error instanceof Error ? error.message.toLowerCase() : String(error);
+
+  return (
+    reason.includes("fetch failed") ||
+    reason.includes("socket hang up") ||
+    reason.includes("network") ||
+    reason.includes("timeout")
+  );
+}
+
+function resolveBigQueryBaseUrls() {
+  const configuredBaseUrl = process.env.BQ_BASE_URL?.trim();
+  const primaryBaseUrl =
+    configuredBaseUrl && configuredBaseUrl.length > 0
+      ? configuredBaseUrl.replace(/\/+$/, "")
+      : BQ_BASE_URL;
+
+  try {
+    const parsed = new URL(primaryBaseUrl);
+
+    if (
+      parsed.hostname === "bigquery.googleapis.com" &&
+      parsed.pathname === "/bigquery/v2"
+    ) {
+      return [primaryBaseUrl, BQ_FALLBACK_BASE_URL] as const;
+    }
+  } catch {
+    return [primaryBaseUrl] as const;
+  }
+
+  return [primaryBaseUrl] as const;
+}
+
+async function bigQueryRequestOnce(
+  baseUrl: string,
+  accessToken: string,
+  path: string,
+  body: Record<string, unknown>
+): Promise<Record<string, unknown>> {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), BQ_REQUEST_TIMEOUT_MS);
+  let response: Response;
+
+  try {
+    response = await fetch(`${baseUrl}/${path}`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        "Content-Type": "application/json",
+      },
+      signal: controller.signal,
+      body: JSON.stringify(body),
+    });
+  } catch (error) {
+    const retryable = isRetryableBigQueryNetworkError(error);
+    const reason = error instanceof Error ? error.message : "Unknown error";
+    throw new BigQueryRequestError(
+      `Failed to reach BigQuery endpoint (${baseUrl}/${path}): ${reason}`,
+      retryable
+    );
+  } finally {
+    clearTimeout(timeoutId);
+  }
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    const retryable = RETRYABLE_BIGQUERY_STATUSES.has(response.status);
+    throw new BigQueryRequestError(
+      `BigQuery error: ${response.status} - ${errorText}`,
+      retryable
+    );
+  }
+
+  return (await response.json()) as Record<string, unknown>;
+}
 
 export type BigQueryChatMessageRow = {
   message_id: string;
@@ -119,21 +288,34 @@ async function bigQueryRequest(
   path: string,
   body: Record<string, unknown>
 ): Promise<Record<string, unknown>> {
-  const response = await fetch(`${BQ_BASE_URL}/${path}`, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${accessToken}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify(body),
-  });
+  const baseUrls = resolveBigQueryBaseUrls();
+  let lastError: unknown;
 
-  if (!response.ok) {
-    const errorText = await response.text();
-    throw new Error(`BigQuery error: ${response.status} - ${errorText}`);
+  for (let attempt = 1; attempt <= BQ_REQUEST_MAX_ATTEMPTS; attempt += 1) {
+    const baseUrl = baseUrls[(attempt - 1) % baseUrls.length];
+
+    try {
+      return await bigQueryRequestOnce(baseUrl, accessToken, path, body);
+    } catch (error) {
+      lastError = error;
+
+      const retryable =
+        (error instanceof BigQueryRequestError && error.retryable) ||
+        isRetryableBigQueryNetworkError(error);
+
+      if (!retryable || attempt >= BQ_REQUEST_MAX_ATTEMPTS) {
+        throw error;
+      }
+
+      await delay(computeBackoffDelayMs(attempt));
+    }
   }
 
-  return (await response.json()) as Record<string, unknown>;
+  if (lastError instanceof Error) {
+    throw lastError;
+  }
+
+  throw new Error("Unable to complete BigQuery request.");
 }
 
 async function runQuery(

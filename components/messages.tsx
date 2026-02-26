@@ -1,6 +1,7 @@
 import type { UseChatHelpers } from "@ai-sdk/react";
 import { ArrowDownIcon } from "lucide-react";
 import { deleteTrailingMessages } from "@/app/(chat)/actions";
+import { useDataStream } from "@/components/data-stream-provider";
 import { useMessages } from "@/hooks/use-messages";
 import {
   type ExportContextSheet,
@@ -9,7 +10,6 @@ import {
 } from "@/lib/export-context";
 import type { ChatMessage } from "@/lib/types";
 import { sanitizeText } from "@/lib/utils";
-import { useDataStream } from "@/components/data-stream-provider";
 import { Greeting } from "./greeting";
 import { PreviewMessage, ThinkingMessage } from "./message";
 
@@ -119,6 +119,10 @@ function PureMessages({
           }
 
           if (part.type === "data-export-context") {
+            return true;
+          }
+
+          if (part.type === "data-export-hint") {
             return true;
           }
 
