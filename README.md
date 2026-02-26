@@ -1,85 +1,171 @@
-<a href="https://chat.vercel.ai/">
-  <img alt="Next.js 14 and App Router-ready AI chatbot." src="app/(chat)/opengraph-image.png">
-  <h1 align="center">Chat SDK</h1>
-</a>
+# Scheffer AI Chatbot
 
-<p align="center">
-    Chat SDK is a free, open-source template built with Next.js and the AI SDK that helps you quickly build powerful chatbot applications.
-</p>
+Aplicacao de chat interna da Scheffer, construida com Next.js, AI SDK e integracao com Vertex AI Agent Engine, BigQuery e Google Cloud Storage.
 
-<p align="center">
-  <a href="https://chat-sdk.dev"><strong>Read Docs</strong></a> ·
-  <a href="#features"><strong>Features</strong></a> ·
-  <a href="#model-providers"><strong>Model Providers</strong></a> ·
-  <a href="#deploy-your-own"><strong>Deploy Your Own</strong></a> ·
-  <a href="#running-locally"><strong>Running locally</strong></a>
-</p>
-<br/>
+## Creditos e origem (fork)
 
-## Features
+Este repositorio foi criado a partir de um fork de [vercel/chatbot](https://github.com/vercel/chatbot).
 
-- [Next.js](https://nextjs.org) App Router
-  - Advanced routing for seamless navigation and performance
-  - React Server Components (RSCs) and Server Actions for server-side rendering and increased performance
-- [AI SDK](https://ai-sdk.dev/docs/introduction)
-  - Unified API for generating text, structured objects, and tool calls with LLMs
-  - Hooks for building dynamic chat and generative user interfaces
-  - Supports xAI (default), OpenAI, Fireworks, and other model providers
-- [shadcn/ui](https://ui.shadcn.com)
-  - Styling with [Tailwind CSS](https://tailwindcss.com)
-  - Component primitives from [Radix UI](https://radix-ui.com) for accessibility and flexibility
-- Data Persistence
-  - [Neon Serverless Postgres](https://vercel.com/marketplace/neon) for saving chat history and user data
-  - [Vercel Blob](https://vercel.com/storage/blob) for efficient file storage
-- [Auth.js](https://authjs.dev)
-  - Simple and secure authentication
+Customizacoes principais neste fork:
 
-## Model Providers
+- Integracao com `google/scheffer-agent-engine` (Vertex AI Agent Engine).
+- Persistencia de mensagens e metadados em BigQuery.
+- Upload de arquivos para Google Cloud Storage (GCS).
+- Fluxo de autenticacao Google com restricao de dominio.
+- Ajustes de renderizacao e UX especificos do produto Scheffer.
 
-This project supports three model paths in the same UI:
+## Visao geral da arquitetura
 
-- `google/scheffer-agent-engine` via Vertex AI Agent Engine (service account auth).
-- Gemini models via direct Google API (`GOOGLE_GENERATIVE_AI_API_KEY`).
-- GPT models via direct OpenAI API (`OPENAI_API_KEY`).
+- Frontend e API: [Next.js App Router](https://nextjs.org/docs/app).
+- UI: `shadcn/ui` + Tailwind CSS.
+- Auth: `next-auth` com Google OAuth (dominio `scheffer.agr.br`).
+- Modelo principal: Vertex AI Agent Engine.
+- Modelos alternativos: Gemini direto e OpenAI direto.
+- Persistencia: BigQuery (`chat_messages`, `feedbacks`, `chat_files`).
+- Arquivos: Google Cloud Storage (`GCS_BUCKET_NAME`).
 
-`AI_GATEWAY_API_KEY` is optional and only needed if you decide to use Vercel AI Gateway-routed models.
+## Provedores de modelo suportados
 
-## Deploy Your Own
+| Caminho | Uso | Variaveis necessarias |
+| --- | --- | --- |
+| `google/scheffer-agent-engine` | Modelo principal no Agent Engine | `GOOGLE_SERVICE_ACCOUNT_KEY_FILE`, `VERTEX_PROJECT_ID`, `VERTEX_LOCATION`, `VERTEX_REASONING_ENGINE` |
+| `google/*` (Gemini direto) | Modelos Gemini via API direta | `GOOGLE_GENERATIVE_AI_API_KEY` |
+| `openai/*` | Modelos GPT via API direta | `OPENAI_API_KEY` |
 
-You can deploy your own version of the Next.js AI Chatbot to Vercel with one click:
+`AI_GATEWAY_API_KEY` e opcional (somente se voce quiser usar rotas via Vercel AI Gateway).
 
-[![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/templates/next.js/nextjs-ai-chatbot)
+## Requisitos
 
-## Running locally
+- Node.js 20+
+- `pnpm` (projeto usa `pnpm@10`)
+- Projeto GCP com acesso a:
+  - Vertex AI (Reasoning Engine)
+  - BigQuery
+  - Cloud Storage
+- Credenciais Google OAuth para login
 
-You will need to use the environment variables [defined in `.env.example`](.env.example) to run Next.js AI Chatbot. It's recommended you use [Vercel Environment Variables](https://vercel.com/docs/projects/environment-variables) for this, but a `.env` file is all that is necessary.
+## Configuracao de ambiente
 
-### Google ADK Agent Engine model
+Use as variaveis definidas em [.env.example](.env.example):
 
-To use the `Scheffer Agent Engine` model in the UI, also configure:
+```bash
+cp .env.example .env.local
+```
 
-- `GOOGLE_SERVICE_ACCOUNT_KEY_FILE` (for example `bi-scheffer.json`)
-- `VERTEX_PROJECT_ID`
-- `VERTEX_LOCATION`
-- `VERTEX_REASONING_ENGINE`
+### Variaveis principais
 
-The backend uses the service account file to obtain the Vertex access token.
+| Variavel | Obrigatoria | Descricao |
+| --- | --- | --- |
+| `AUTH_SECRET` | Sim | Segredo do NextAuth |
+| `AUTH_URL` | Sim | URL base da aplicacao (ex.: `http://localhost:3000`) |
+| `AUTH_GOOGLE_ID` / `AUTH_GOOGLE_SECRET` | Sim | OAuth Google |
+| `GOOGLE_SERVICE_ACCOUNT_KEY_FILE` | Sim (Agent Engine/BigQuery/GCS) | Credencial da service account (caminho de arquivo **ou** JSON inline) |
+| `VERTEX_PROJECT_ID` | Sim (Agent Engine) | Projeto GCP do Agent Engine |
+| `VERTEX_LOCATION` | Sim (Agent Engine) | Regiao Vertex (ex.: `us-central1`) |
+| `VERTEX_REASONING_ENGINE` | Sim (Agent Engine) | ID/caminho do Reasoning Engine |
+| `BQ_PROJECT_ID` / `BQ_DATASET` | Sim | BigQuery de persistencia |
+| `GCS_BUCKET_NAME` | Sim | Bucket para anexos |
+| `GOOGLE_GENERATIVE_AI_API_KEY` | Condicional | Necessaria para Gemini direto |
+| `OPENAI_API_KEY` | Condicional | Necessaria para OpenAI direto |
 
-To use direct Gemini and GPT models in the selector, also configure:
+### `GOOGLE_SERVICE_ACCOUNT_KEY_FILE`: dois formatos aceitos
 
-- `GOOGLE_GENERATIVE_AI_API_KEY`
-- `OPENAI_API_KEY`
+O backend aceita `GOOGLE_SERVICE_ACCOUNT_KEY_FILE` de duas formas:
 
-> Note: You should not commit your `.env` file or it will expose secrets that will allow others to control access to your various AI and authentication provider accounts.
+1. Como caminho para arquivo JSON:
 
-1. Install Vercel CLI: `npm i -g vercel`
-2. Link local instance with Vercel and GitHub accounts (creates `.vercel` directory): `vercel link`
-3. Download your environment variables: `vercel env pull`
+```env
+GOOGLE_SERVICE_ACCOUNT_KEY_FILE=bi-scheffer.json
+```
+
+2. Como JSON inline (string unica):
+
+```env
+GOOGLE_SERVICE_ACCOUNT_KEY_FILE='{"type":"service_account","project_id":"seu-projeto","private_key":"-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----\n","client_email":"svc@seu-projeto.iam.gserviceaccount.com","token_uri":"https://oauth2.googleapis.com/token"}'
+```
+
+Notas importantes:
+
+- No formato inline, mantenha o valor em uma linha.
+- Preserve `\n` escapado dentro de `private_key`.
+- Nunca versione este valor no Git.
+
+## Rodando localmente
 
 ```bash
 pnpm install
-pnpm db:migrate # Setup database or apply latest database changes
+pnpm db:migrate
 pnpm dev
 ```
 
-Your app template should now be running on [localhost:3000](http://localhost:3000).
+A aplicacao sobe em [http://localhost:3000](http://localhost:3000).
+
+Observacao: `pnpm db:migrate` e seguro mesmo sem Postgres configurado; se `POSTGRES_URL` nao estiver definido, o script apenas ignora migracoes e encerra.
+
+## Troubleshooting
+
+### Erro `ENAMETOOLONG` ao abrir credencial
+
+Sintoma comum:
+
+- Tentativa de abrir um "arquivo" cujo nome inteiro e o JSON da service account.
+
+Causa:
+
+- Variavel de credencial malformada ou versao sem suporte ao JSON inline.
+
+Como resolver:
+
+- Confirme que `GOOGLE_SERVICE_ACCOUNT_KEY_FILE` esta em um dos formatos suportados acima.
+- Se usar inline, valor deve comecar com `{` e terminar com `}`.
+- Reinicie o servidor (`pnpm dev`) apos alterar `.env.local`.
+
+### Erros `bad_request:database` / falhas de BigQuery
+
+Verifique:
+
+- `BQ_PROJECT_ID`, `BQ_DATASET` e tabelas (`BQ_*_TABLE`) corretos.
+- Permissoes da service account para consultar/gravar no BigQuery.
+- Conectividade de rede com APIs Google.
+
+### Timeout ou falha transitoria no BigQuery
+
+O projeto possui retry/cooldown configuravel:
+
+- `BQ_REQUEST_MAX_ATTEMPTS`
+- `BQ_REQUEST_BASE_DELAY_MS`
+- `BQ_REQUEST_MAX_DELAY_MS`
+- `BQ_RATE_LIMIT_COOLDOWN_MS`
+
+## Seguranca
+
+- Nunca commite `.env.local`, chaves JSON ou tokens.
+- Se alguma chave vazar em log/chat/git, rotacione imediatamente no GCP.
+- Prefira variaveis de ambiente seguras do provedor de deploy.
+
+## Deploy
+
+Voce pode fazer deploy em qualquer ambiente que suporte Next.js 16 (ex.: Vercel), desde que todas as variaveis de ambiente estejam configuradas.
+
+Fluxo comum na Vercel:
+
+```bash
+npm i -g vercel
+vercel link
+vercel env pull
+vercel --prod
+```
+
+## Scripts uteis
+
+| Comando | Descricao |
+| --- | --- |
+| `pnpm dev` | Sobe a aplicacao local |
+| `pnpm build` | Roda migracoes (se `POSTGRES_URL`) e gera build de producao |
+| `pnpm start` | Inicia build de producao |
+| `pnpm lint` | Checagem de qualidade (Ultracite/Biome) |
+| `pnpm test` | Suite Playwright |
+
+## Licenca
+
+Consulte [LICENSE](LICENSE).
