@@ -1,5 +1,10 @@
 import Link from "next/link";
 import { memo } from "react";
+import {
+  SidebarMenuAction,
+  SidebarMenuButton,
+  SidebarMenuItem,
+} from "@/components/ui/sidebar";
 import type { Chat } from "@/lib/db/schema";
 import { MoreHorizontalIcon, ShareIcon, TrashIcon } from "./icons";
 import {
@@ -9,11 +14,6 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "./ui/dropdown-menu";
-import {
-  SidebarMenuAction,
-  SidebarMenuButton,
-  SidebarMenuItem,
-} from "./ui/sidebar";
 
 const PureChatItem = ({
   chat,
@@ -48,7 +48,10 @@ const PureChatItem = ({
         </DropdownMenuTrigger>
 
         <DropdownMenuContent align="end" side="bottom">
-          <DropdownMenuItem className="cursor-pointer" onSelect={() => onShare(chat)}>
+          <DropdownMenuItem
+            className="cursor-pointer"
+            onSelect={() => onShare(chat)}
+          >
             <ShareIcon />
             <span>Compartilhar</span>
           </DropdownMenuItem>

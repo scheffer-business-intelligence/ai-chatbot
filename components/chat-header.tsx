@@ -5,8 +5,8 @@ import { memo } from "react";
 import { useWindowSize } from "usehooks-ts";
 import { SidebarToggle } from "@/components/sidebar-toggle";
 import { Button } from "@/components/ui/button";
+import { useSidebar } from "@/components/ui/sidebar";
 import { PlusIcon } from "./icons";
-import { useSidebar } from "./ui/sidebar";
 
 function PureChatHeader() {
   const router = useRouter();
