@@ -27,8 +27,9 @@ export async function GET(request: NextRequest) {
     return new ChatSDKError("unauthorized:chat").toResponse();
   }
 
-  const [bigQueryUserId, fallbackBigQueryUserId] =
-    getBigQueryUserIdCandidates(session.user);
+  const [bigQueryUserId, fallbackBigQueryUserId] = getBigQueryUserIdCandidates(
+    session.user
+  );
   if (!bigQueryUserId) {
     return new ChatSDKError("unauthorized:chat").toResponse();
   }
@@ -75,8 +76,9 @@ export async function DELETE() {
     return new ChatSDKError("unauthorized:chat").toResponse();
   }
 
-  const [bigQueryUserId, fallbackBigQueryUserId] =
-    getBigQueryUserIdCandidates(session.user);
+  const [bigQueryUserId, fallbackBigQueryUserId] = getBigQueryUserIdCandidates(
+    session.user
+  );
   if (!bigQueryUserId) {
     return new ChatSDKError("unauthorized:chat").toResponse();
   }
@@ -85,10 +87,29 @@ export async function DELETE() {
     ...new Set([bigQueryUserId, fallbackBigQueryUserId].filter(Boolean)),
   ] as string[];
   let deletedCount = 0;
+  let hasSuccess = false;
+  let lastError: unknown = null;
 
   for (const userId of distinctUserIds) {
-    const result = await deleteAllChatsByUserId({ userId });
-    deletedCount += result.deletedCount;
+    try {
+      const result = await deleteAllChatsByUserId({ userId });
+      deletedCount += result.deletedCount;
+      hasSuccess = true;
+    } catch (error) {
+      lastError = error;
+      console.warn("Failed to delete chats for user id.", { userId, error });
+    }
+  }
+
+  if (!hasSuccess) {
+    if (lastError instanceof ChatSDKError) {
+      return lastError.toResponse();
+    }
+
+    return new ChatSDKError(
+      "bad_request:database",
+      "Failed to delete all chats by user id"
+    ).toResponse();
   }
 
   return Response.json({ deletedCount }, { status: 200 });

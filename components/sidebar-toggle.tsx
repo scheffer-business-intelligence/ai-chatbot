@@ -19,7 +19,7 @@ export function SidebarToggle({
     <Tooltip>
       <TooltipTrigger asChild>
         <Button
-          className={cn("h-8 px-2 md:h-fit md:px-2", className)}
+          className={cn("h-8 cursor-pointer px-2 md:h-fit md:px-2", className)}
           data-testid="sidebar-toggle-button"
           onClick={toggleSidebar}
           variant="outline"

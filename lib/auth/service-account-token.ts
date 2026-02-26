@@ -20,7 +20,7 @@ const TOKEN_REFRESH_BUFFER_MS = 60_000;
 const TOKEN_REQUEST_TIMEOUT_MS = 10_000;
 const TOKEN_REQUEST_MAX_ATTEMPTS = 4;
 const TOKEN_REQUEST_BASE_DELAY_MS = 250;
-const TOKEN_REQUEST_MAX_DELAY_MS = 2_000;
+const TOKEN_REQUEST_MAX_DELAY_MS = 2000;
 const RETRYABLE_TOKEN_NETWORK_CODES = new Set([
   "ECONNRESET",
   "ECONNREFUSED",
@@ -121,14 +121,18 @@ function getServiceAccountKeyPath() {
   return process.env.GOOGLE_SERVICE_ACCOUNT_KEY_FILE || "bi-scheffer.json";
 }
 
-async function loadServiceAccountKey(): Promise<ServiceAccountKey> {
-  const configuredPath = getServiceAccountKeyPath();
-  const filePath = isAbsolute(configuredPath)
-    ? configuredPath
-    : resolve(process.cwd(), configuredPath);
+function normalizePrivateKey(privateKey: string) {
+  if (!privateKey) {
+    return privateKey;
+  }
 
-  const fileContent = await readFile(filePath, "utf-8");
-  const parsedKey = JSON.parse(fileContent) as Partial<ServiceAccountKey>;
+  return privateKey.includes("\\n")
+    ? privateKey.replace(/\\n/g, "\n")
+    : privateKey;
+}
+
+function parseServiceAccountKey(rawContent: string): ServiceAccountKey {
+  const parsedKey = JSON.parse(rawContent) as Partial<ServiceAccountKey>;
 
   if (!parsedKey.client_email || !parsedKey.private_key) {
     throw new Error(
@@ -138,9 +142,26 @@ async function loadServiceAccountKey(): Promise<ServiceAccountKey> {
 
   return {
     client_email: parsedKey.client_email,
-    private_key: parsedKey.private_key,
+    private_key: normalizePrivateKey(parsedKey.private_key),
     token_uri: parsedKey.token_uri || DEFAULT_TOKEN_URI,
   };
+}
+
+async function loadServiceAccountKey(): Promise<ServiceAccountKey> {
+  const configuredPath = getServiceAccountKeyPath().trim();
+  const looksLikeInlineJson =
+    configuredPath.startsWith("{") && configuredPath.endsWith("}");
+
+  if (looksLikeInlineJson) {
+    return parseServiceAccountKey(configuredPath);
+  }
+
+  const filePath = isAbsolute(configuredPath)
+    ? configuredPath
+    : resolve(process.cwd(), configuredPath);
+
+  const fileContent = await readFile(filePath, "utf-8");
+  return parseServiceAccountKey(fileContent);
 }
 
 function buildSignedJwt({

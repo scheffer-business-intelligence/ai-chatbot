@@ -44,6 +44,25 @@ export function AppSidebar({ user }: { user: User | undefined }) {
   const handleDeleteAll = () => {
     const deletePromise = fetch("/api/history", {
       method: "DELETE",
+    }).then(async (response) => {
+      let payload: { cause?: string; message?: string } | null = null;
+
+      try {
+        payload = (await response.json()) as {
+          cause?: string;
+          message?: string;
+        };
+      } catch {
+        payload = null;
+      }
+
+      if (!response.ok) {
+        throw new Error(
+          payload?.cause ?? payload?.message ?? "Failed to delete all chats"
+        );
+      }
+
+      return payload;
     });
 
     toast.promise(deletePromise, {
@@ -55,7 +74,8 @@ export function AppSidebar({ user }: { user: User | undefined }) {
         router.refresh();
         return "Todas as conversas foram apagadas com sucesso";
       },
-      error: "Failed to delete all chats",
+      error: (error) =>
+        error instanceof Error ? error.message : "Failed to delete all chats",
     });
   };
 
@@ -86,7 +106,7 @@ export function AppSidebar({ user }: { user: User | undefined }) {
                   <Tooltip>
                     <TooltipTrigger asChild>
                       <Button
-                        className="h-8 p-1 md:h-fit md:p-2"
+                        className="h-8 cursor-pointer p-1 md:h-fit md:p-2"
                         onClick={() => setShowDeleteAllDialog(true)}
                         type="button"
                         variant="ghost"
@@ -102,7 +122,7 @@ export function AppSidebar({ user }: { user: User | undefined }) {
                 <Tooltip>
                   <TooltipTrigger asChild>
                     <Button
-                      className="h-8 p-1 md:h-fit md:p-2"
+                      className="h-8 cursor-pointer p-1 md:h-fit md:p-2"
                       onClick={() => {
                         setOpenMobile(false);
                         router.push("/");

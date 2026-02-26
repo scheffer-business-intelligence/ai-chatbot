@@ -1250,50 +1250,66 @@ export async function deleteChatById({ id }: { id: string }) {
 }
 
 export async function deleteAllChatsByUserId({ userId }: { userId: string }) {
-  try {
-    const rows = await queryRows(
-      `
-        SELECT
-          message_id
-        FROM \`${MESSAGES_TABLE_REF}\`
-        WHERE STARTS_WITH(message_id, @chat_prefix)
-          AND role = 'system'
-          AND user_id = @user_id
-          AND (is_deleted IS NULL OR is_deleted = FALSE)
-      `,
-      [
-        { name: "chat_prefix", type: "STRING", value: CHAT_META_MESSAGE_PREFIX },
-        { name: "user_id", type: "STRING", value: userId },
-      ],
-      `
-        SELECT
-          message_id
-        FROM \`${MESSAGES_TABLE_REF}\`
-        WHERE STARTS_WITH(message_id, @chat_prefix)
-          AND role = 'system'
-          AND user_id = @user_id
-      `
-    );
+  const rows = await queryRows(
+    `
+      SELECT
+        message_id
+      FROM \`${MESSAGES_TABLE_REF}\`
+      WHERE STARTS_WITH(message_id, @chat_prefix)
+        AND role = 'system'
+        AND user_id = @user_id
+        AND (is_deleted IS NULL OR is_deleted = FALSE)
+    `,
+    [
+      { name: "chat_prefix", type: "STRING", value: CHAT_META_MESSAGE_PREFIX },
+      { name: "user_id", type: "STRING", value: userId },
+    ],
+    `
+      SELECT
+        message_id
+      FROM \`${MESSAGES_TABLE_REF}\`
+      WHERE STARTS_WITH(message_id, @chat_prefix)
+        AND role = 'system'
+        AND user_id = @user_id
+    `
+  );
 
-    const chatIds = rows
-      .map((row) => stripPrefix(row.message_id, "chat:"))
-      .filter((chatId) => chatId.length > 0);
+  const chatIds = rows
+    .map((row) => stripPrefix(row.message_id, "chat:"))
+    .filter((chatId) => chatId.length > 0);
 
-    if (chatIds.length === 0) {
-      return { deletedCount: 0 };
-    }
+  if (chatIds.length === 0) {
+    return { deletedCount: 0 };
+  }
 
-    for (const chatId of chatIds) {
+  let deletedCount = 0;
+  const failedChatIds: string[] = [];
+
+  for (const chatId of chatIds) {
+    try {
       await deleteChatById({ id: chatId });
+      deletedCount += 1;
+    } catch (error) {
+      failedChatIds.push(chatId);
+      console.warn(
+        "Failed to delete chat while deleting all chats by user id.",
+        {
+          userId,
+          chatId,
+          error,
+        }
+      );
     }
+  }
 
-    return { deletedCount: chatIds.length };
-  } catch (_error) {
+  if (deletedCount === 0 && failedChatIds.length > 0) {
     throw new ChatSDKError(
       "bad_request:database",
       "Failed to delete all chats by user id"
     );
   }
+
+  return { deletedCount };
 }
 
 export async function getChatsByUserId({
@@ -1347,7 +1363,11 @@ export async function getChatsByUserId({
         LIMIT @limit
       `,
       [
-        { name: "chat_prefix", type: "STRING", value: CHAT_META_MESSAGE_PREFIX },
+        {
+          name: "chat_prefix",
+          type: "STRING",
+          value: CHAT_META_MESSAGE_PREFIX,
+        },
         { name: "user_id", type: "STRING", value: id },
         ...(cursorCreatedAt
           ? [
