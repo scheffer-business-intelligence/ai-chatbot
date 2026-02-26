@@ -1,4 +1,7 @@
-import { parseChartContextFromText } from "@/lib/charts/context";
+import {
+  inferChartSpecFromTableText,
+  parseChartContextFromText,
+} from "@/lib/charts/context";
 import type { ChartSpecV1 } from "@/lib/charts/schema";
 import {
   type ExportContextSheet,
@@ -629,7 +632,10 @@ function stripContextBlock(text: string, tagName: string): string {
 
 function stripContextBlocksForStream(text: string): string {
   const withoutBqAndMarkers = sanitizeText(text);
-  return stripContextBlock(withoutBqAndMarkers, "CHART_CONTEXT").trimEnd();
+  return stripContextBlock(
+    stripContextBlock(withoutBqAndMarkers, "CHART_CONTEXT"),
+    "CHART"
+  ).trimEnd();
 }
 
 function toErrorText(error: unknown): string {
@@ -931,6 +937,7 @@ export async function* streamVertexQuery({
   message,
   signal,
   extractedContext,
+  allowTableChartFallback = false,
 }: {
   accessToken: string;
   sessionId: string;
@@ -938,6 +945,7 @@ export async function* streamVertexQuery({
   message: string | { role: "user"; parts: Record<string, unknown>[] };
   signal?: AbortSignal;
   extractedContext?: VertexExtractedContext;
+  allowTableChartFallback?: boolean;
 }): AsyncGenerator<VertexStreamEvent, void, void> {
   if (!VERTEX_PROJECT_ID) {
     throw new Error("VERTEX_PROJECT_ID is not configured");
@@ -1060,6 +1068,21 @@ export async function* streamVertexQuery({
 
     writeExtractedContext(accumulatedRawText);
 
+    if (
+      allowTableChartFallback &&
+      extractedContext &&
+      !extractedContext.chartSpec
+    ) {
+      const inferredChartSpec = inferChartSpecFromTableText(
+        accumulatedVisibleText
+      );
+      if (inferredChartSpec) {
+        extractedContext.chartSpec = inferredChartSpec;
+        extractedContext.chartError = null;
+        extractedContext.hasChartContext = true;
+      }
+    }
+
     if (!accumulatedVisibleText.trim()) {
       throw new Error("Vertex AI returned an empty response");
     }
@@ -1110,6 +1133,21 @@ export async function* streamVertexQuery({
   }
 
   writeExtractedContext(accumulatedRawText);
+
+  if (
+    allowTableChartFallback &&
+    extractedContext &&
+    !extractedContext.chartSpec
+  ) {
+    const inferredChartSpec = inferChartSpecFromTableText(
+      accumulatedVisibleText
+    );
+    if (inferredChartSpec) {
+      extractedContext.chartSpec = inferredChartSpec;
+      extractedContext.chartError = null;
+      extractedContext.hasChartContext = true;
+    }
+  }
 
   if (!accumulatedVisibleText.trim()) {
     if (rawSamples.length > 0) {

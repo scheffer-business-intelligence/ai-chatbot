@@ -175,6 +175,18 @@ function getLatestUserMessage(messages: ChatMessage[]) {
   return null;
 }
 
+function shouldAllowTableChartFallback(message: ChatMessage): boolean {
+  const userText = getTextFromMessage(message);
+
+  if (!userText.trim()) {
+    return false;
+  }
+
+  return /\b(gr[aá]fico|chart|plot|plotar|visualiza(?:r|ção))\b/i.test(
+    userText
+  );
+}
+
 function createLocalChatTitle(message: ChatMessage) {
   const normalized = getTextFromMessage(message).replace(/\s+/g, " ").trim();
   if (!normalized) {
@@ -614,6 +626,8 @@ export async function POST(request: Request) {
           latestUserMessage,
           request.signal
         );
+        const allowTableChartFallback =
+          shouldAllowTableChartFallback(latestUserMessage);
         const initialProviderSessionId: string = providerSessionId;
 
         stream = createUIMessageStream({
@@ -635,6 +649,7 @@ export async function POST(request: Request) {
                 message: vertexMessage,
                 signal: request.signal,
                 extractedContext,
+                allowTableChartFallback,
               })) {
                 if (event.type === "status") {
                   if (!event.status) {
@@ -715,10 +730,20 @@ export async function POST(request: Request) {
                 data: extractedContext.chartSpec,
               });
             } else if (extractedContext.chartError) {
-              dataStream.write({
-                type: "data-chart-warning",
-                data: extractedContext.chartError,
-              });
+              const normalizedChartError = extractedContext.chartError
+                .replace(/\s+/g, " ")
+                .trim()
+                .toLowerCase();
+              const isIncompleteChartBlockWarning =
+                normalizedChartError === "bloco de grafico incompleto." ||
+                normalizedChartError === "bloco chart_context incompleto.";
+
+              if (!isIncompleteChartBlockWarning) {
+                dataStream.write({
+                  type: "data-chart-warning",
+                  data: extractedContext.chartError,
+                });
+              }
             }
 
             if (extractedContext.contextSheets.length > 0) {

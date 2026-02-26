@@ -89,8 +89,10 @@ function stripDanglingTrailingEmphasisMarker(line: string): string {
     return line;
   }
 
+  const lineForMarkerCount =
+    marker === "*" ? trimmedRight.replace(/^(\s*)\*\s+/, "$1") : trimmedRight;
   const markerRegex = new RegExp(`(?<!\\\\)\\${marker}`, "g");
-  const markerCount = (trimmedRight.match(markerRegex) ?? []).length;
+  const markerCount = (lineForMarkerCount.match(markerRegex) ?? []).length;
 
   if (markerCount % 2 === 0) {
     return line;
@@ -99,6 +101,39 @@ function stripDanglingTrailingEmphasisMarker(line: string): string {
   const withoutTrailingMarker = trimmedRight.slice(0, -1);
   const trailingWhitespace = line.slice(trimmedRight.length);
   return `${withoutTrailingMarker}${trailingWhitespace}`;
+}
+
+function normalizeDanglingLabelEmphasis(line: string): string {
+  const match = line.match(
+    /^(\s*(?:(?:[-*+•▪])\s+|\d+[.)]\s+)?)(?:\*)([^*].*?)\s*$/
+  );
+  if (!match) {
+    return line;
+  }
+
+  const [fullMatch, prefix, content] = match;
+  const trimmedStart = line.trimStart();
+
+  // Preserve regular unordered-list markdown lines (e.g. "* item").
+  if (!prefix.trim() && /^\*\s+/.test(trimmedStart)) {
+    return line;
+  }
+
+  // Apply only for label-style lines that usually come malformed from stream.
+  if (!content.trim().endsWith(":")) {
+    return line;
+  }
+
+  const trailingSegment = fullMatch.slice(prefix.length + 1);
+  if (/(?<!\\)\*/.test(trailingSegment)) {
+    return line;
+  }
+
+  return `${prefix}**${content.trim()}**`;
+}
+
+function escapeMarkdownInlineText(value: string): string {
+  return value.replace(/([\\`*_[\]()])/g, "\\$1");
 }
 
 function isHorizontalRuleLine(line: string): boolean {
@@ -170,7 +205,11 @@ function normalizeTrailingSourceSection(markdown: string): string {
     bodyLines.push("");
   }
 
-  return [...bodyLines, `*Fonte: ${sourceText}*`, ...trailingLines].join("\n");
+  const escapedSourceText = escapeMarkdownInlineText(sourceText);
+
+  return [...bodyLines, `*Fonte: ${escapedSourceText}*`, ...trailingLines].join(
+    "\n"
+  );
 }
 
 export function normalizeMarkdownForRender(text: string): string {
@@ -202,7 +241,9 @@ export function normalizeMarkdownForRender(text: string): string {
     }
 
     const currentLine = stripDanglingTrailingEmphasisMarker(
-      normalizeEscapedPipesInTableLine(currentRaw)
+      normalizeDanglingLabelEmphasis(
+        normalizeEscapedPipesInTableLine(currentRaw)
+      )
     );
     const nextLine = normalizeEscapedPipesInTableLine(
       rawLines[index + 1] ?? ""

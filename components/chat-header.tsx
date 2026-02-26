@@ -5,18 +5,19 @@ import { memo } from "react";
 import { useWindowSize } from "usehooks-ts";
 import { SidebarToggle } from "@/components/sidebar-toggle";
 import { Button } from "@/components/ui/button";
-import { useSidebar } from "@/components/ui/sidebar";
+import { useSidebarOptional } from "@/components/ui/sidebar";
 import { PlusIcon } from "./icons";
 
 function PureChatHeader() {
   const router = useRouter();
-  const { open } = useSidebar();
+  const sidebar = useSidebarOptional();
+  const open = sidebar?.open ?? false;
 
   const { width: windowWidth } = useWindowSize();
 
   return (
     <header className="sticky top-0 flex items-center gap-2 bg-background px-2 py-1.5 md:px-2">
-      <SidebarToggle />
+      {sidebar ? <SidebarToggle /> : <div className="h-8 w-[42px] md:h-9" />}
 
       {(!open || windowWidth < 768) && (
         <Button

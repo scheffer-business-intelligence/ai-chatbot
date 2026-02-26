@@ -103,6 +103,8 @@ export function sanitizeText(text: string) {
   const bqContextCloseTag = '[/BQ_CONTEXT]';
   const chartContextOpenTag = '[CHART_CONTEXT]';
   const chartContextCloseTag = '[/CHART_CONTEXT]';
+  const chartOpenTag = '[CHART]';
+  const chartCloseTag = '[/CHART]';
 
   const getTrailingTagPrefixLength = (value: string, tag: string) => {
     const maxLength = Math.min(value.length, tag.length - 1);
@@ -131,13 +133,22 @@ export function sanitizeText(text: string) {
     .replace(/\[\/BQ_CONTEXT\]/g, '')
     .replace(/\[CHART_CONTEXT\][\s\S]*?\[\/CHART_CONTEXT\]/g, '')
     .replace(/\[CHART_CONTEXT\][\s\S]*$/g, '')
-    .replace(/\[\/CHART_CONTEXT\]/g, '');
+    .replace(/\[\/CHART_CONTEXT\]/g, '')
+    .replace(/\[CHART\][\s\S]*?\[\/CHART\]/g, '')
+    .replace(/\[CHART\][\s\S]*$/g, '')
+    .replace(/\[\/CHART\]/g, '');
 
   return stripTrailingPartialTag(
     stripTrailingPartialTag(
       stripTrailingPartialTag(
         stripTrailingPartialTag(
-          withoutContextBlocks.replace('<has_function_call>', ''),
+          stripTrailingPartialTag(
+            stripTrailingPartialTag(
+              withoutContextBlocks.replace('<has_function_call>', ''),
+              chartOpenTag,
+            ),
+            chartCloseTag,
+          ),
           chartContextOpenTag,
         ),
         chartContextCloseTag,
