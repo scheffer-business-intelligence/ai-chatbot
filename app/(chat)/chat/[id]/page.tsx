@@ -5,6 +5,7 @@ import { Suspense } from "react";
 import { auth } from "@/app/(auth)/auth";
 import { Chat } from "@/components/chat";
 import { DataStreamHandler } from "@/components/data-stream-handler";
+import { DataStreamProvider } from "@/components/data-stream-provider";
 import { chatModels, DEFAULT_CHAT_MODEL } from "@/lib/ai/models";
 import { getBigQueryUserIdCandidates } from "@/lib/auth/user-id";
 import { getChatMessagesByChatId } from "@/lib/chat-store";
@@ -72,7 +73,7 @@ async function ChatPage({ params }: { params: Promise<{ id: string }> }) {
 
   if (!chatModelFromCookie || selectedModelId === DEFAULT_CHAT_MODEL) {
     return (
-      <>
+      <DataStreamProvider>
         <Chat
           id={chat.id}
           initialChatModel={DEFAULT_CHAT_MODEL}
@@ -80,12 +81,12 @@ async function ChatPage({ params }: { params: Promise<{ id: string }> }) {
           isReadonly={!isOwner}
         />
         <DataStreamHandler />
-      </>
+      </DataStreamProvider>
     );
   }
 
   return (
-    <>
+    <DataStreamProvider>
       <Chat
         id={chat.id}
         initialChatModel={selectedModelId}
@@ -93,6 +94,6 @@ async function ChatPage({ params }: { params: Promise<{ id: string }> }) {
         isReadonly={!isOwner}
       />
       <DataStreamHandler />
-    </>
+    </DataStreamProvider>
   );
 }

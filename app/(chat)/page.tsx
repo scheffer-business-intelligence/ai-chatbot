@@ -2,6 +2,7 @@ import { cookies } from "next/headers";
 import { Suspense } from "react";
 import { Chat } from "@/components/chat";
 import { DataStreamHandler } from "@/components/data-stream-handler";
+import { DataStreamProvider } from "@/components/data-stream-provider";
 import { chatModels, DEFAULT_CHAT_MODEL } from "@/lib/ai/models";
 import { generateUUID } from "@/lib/utils";
 
@@ -25,7 +26,7 @@ async function NewChatPage() {
 
   if (!modelIdFromCookie || selectedModelId === DEFAULT_CHAT_MODEL) {
     return (
-      <>
+      <DataStreamProvider>
         <Chat
           id={id}
           initialChatModel={DEFAULT_CHAT_MODEL}
@@ -34,12 +35,12 @@ async function NewChatPage() {
           key={id}
         />
         <DataStreamHandler />
-      </>
+      </DataStreamProvider>
     );
   }
 
   return (
-    <>
+    <DataStreamProvider>
       <Chat
         id={id}
         initialChatModel={selectedModelId}
@@ -48,6 +49,6 @@ async function NewChatPage() {
         key={id}
       />
       <DataStreamHandler />
-    </>
+    </DataStreamProvider>
   );
 }
