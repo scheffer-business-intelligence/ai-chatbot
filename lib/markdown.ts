@@ -101,6 +101,78 @@ function stripDanglingTrailingEmphasisMarker(line: string): string {
   return `${withoutTrailingMarker}${trailingWhitespace}`;
 }
 
+function isHorizontalRuleLine(line: string): boolean {
+  return /^\s{0,3}(?:-{3,}|\*{3,}|_{3,})\s*$/.test(line);
+}
+
+function getLastNonEmptyLineIndex(lines: string[]): number {
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    if (lines[index]?.trim()) {
+      return index;
+    }
+  }
+
+  return -1;
+}
+
+function extractSourceText(line: string): string | null {
+  const sourceMatch = line
+    .trim()
+    .match(
+      /^(?:>\s*)?(?:[-*+]\s+|\d+[.)]\s+)?(?:\*\*|__|\*|_)?\s*['"`]*\s*fonte\s*[:：]\s*(?:\*\*|__|\*|_)?\s*(.+)$/i
+    );
+
+  if (!sourceMatch) {
+    return null;
+  }
+
+  const normalizedSourceText = sourceMatch[1]
+    .replace(/^\d+\s*['.)-]\s*/, "")
+    .replace(/^['"`]+/, "")
+    .replace(/[*_`]+$/, "")
+    .trim();
+
+  return normalizedSourceText.length > 0 ? normalizedSourceText : null;
+}
+
+function normalizeTrailingSourceSection(markdown: string): string {
+  const lines = markdown.split(/\r?\n/);
+  const lastNonEmptyIndex = getLastNonEmptyLineIndex(lines);
+
+  if (lastNonEmptyIndex < 0) {
+    return markdown;
+  }
+
+  const sourceText = extractSourceText(lines[lastNonEmptyIndex] ?? "");
+  if (!sourceText) {
+    return markdown;
+  }
+
+  const contentBeforeSource = lines.slice(0, lastNonEmptyIndex);
+  const trailingLines = lines.slice(lastNonEmptyIndex + 1);
+  const bodyLines = [...contentBeforeSource];
+
+  while (bodyLines.length > 0 && !bodyLines.at(-1)?.trim()) {
+    bodyLines.pop();
+  }
+
+  const lastBodyNonEmptyIndex = getLastNonEmptyLineIndex(bodyLines);
+  const hasSeparator =
+    lastBodyNonEmptyIndex >= 0 &&
+    isHorizontalRuleLine(bodyLines[lastBodyNonEmptyIndex] ?? "");
+
+  if (!hasSeparator && bodyLines.length > 0) {
+    bodyLines.push("");
+    bodyLines.push("---");
+  }
+
+  if (bodyLines.length > 0) {
+    bodyLines.push("");
+  }
+
+  return [...bodyLines, `*Fonte: ${sourceText}*`, ...trailingLines].join("\n");
+}
+
 export function normalizeMarkdownForRender(text: string): string {
   if (!text) {
     return text;
@@ -132,8 +204,10 @@ export function normalizeMarkdownForRender(text: string): string {
     const currentLine = stripDanglingTrailingEmphasisMarker(
       normalizeEscapedPipesInTableLine(currentRaw)
     );
-    const nextLine = normalizeEscapedPipesInTableLine(rawLines[index + 1] ?? "");
-    const previousLine = result[result.length - 1] ?? "";
+    const nextLine = normalizeEscapedPipesInTableLine(
+      rawLines[index + 1] ?? ""
+    );
+    const previousLine = result.at(-1) ?? "";
 
     if (
       isLikelyTableHeader(currentLine) &&
@@ -146,6 +220,6 @@ export function normalizeMarkdownForRender(text: string): string {
     result.push(currentLine);
   }
 
-  normalizedText = result.join("\n");
+  normalizedText = normalizeTrailingSourceSection(result.join("\n"));
   return normalizedText;
 }

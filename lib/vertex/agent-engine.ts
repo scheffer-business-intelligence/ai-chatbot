@@ -26,6 +26,7 @@ export type VertexStreamEvent =
 const DEFAULT_AGENT_STATUS_PREFIXES = [
   "Processando sua solicitação...",
   "Ativando o agente especialista",
+  "Ativando a agente especialista",
   "Obtendo os dados...",
   "Dados obtidos com sucesso!",
   "Dados obtidos com sucesso",
@@ -256,10 +257,7 @@ function extractTextFromVertexResponse(
     return contentText;
   }
 
-  return (
-    extractTextDeep(response) ||
-    extractTextDeep(output)
-  );
+  return extractTextDeep(response) || extractTextDeep(output);
 }
 
 function parseVertexResponsePayloads(
@@ -355,7 +353,8 @@ function extractKnownStatusesInOrder(text: string): string[] {
       format: (rawMatch) => ensureStatusSuffix(rawMatch),
     },
     {
-      regex: /ativando o agente especialista(?:\s*\([^)]+\))?\.{0,3}/gi,
+      regex:
+        /ativando(?:\s+(?:o|a))?\s+agente especialista(?:\s*\([^)]+\))?\.{0,3}/gi,
       format: (rawMatch) => ensureStatusSuffix(rawMatch),
     },
     {
@@ -524,7 +523,7 @@ function extractStatusUpdatesFromVertexResponse(
     for (const candidate of collectStatusCandidateTexts(source)) {
       const knownStatuses = extractKnownStatusesInOrder(candidate);
       if (knownStatuses.length > 0) {
-        latestStatus = knownStatuses[knownStatuses.length - 1] ?? latestStatus;
+        latestStatus = knownStatuses.at(-1) ?? latestStatus;
         continue;
       }
 
@@ -551,7 +550,7 @@ function stripLeadingAgentStatuses(
 
   const stripKnownStatusTokens = (value: string): string => {
     const knownStatusRegex =
-      /^\s*(?:processando sua solicitação|ativando o agente especialista(?:\s*\([^)]+\))?|obtendo os dados|dados obtidos com sucesso!?|gerando resposta)\s*\.{0,3}\s*/i;
+      /^\s*(?:processando sua solicitação|ativando(?:\s+(?:o|a))?\s+agente especialista(?:\s*\([^)]+\))?|obtendo os dados|dados obtidos com sucesso!?|gerando resposta)\s*\.{0,3}\s*/i;
     const agentTagRegex = /^\s*\([^)]+_agent\)\s*\.{0,3}\s*/i;
 
     let nextValue = value;
@@ -982,6 +981,27 @@ export async function* streamVertexQuery({
   let accumulatedVisibleText = "";
   let lastStatus: string | null = null;
   const statusHistory: string[] = [];
+  const seenStatuses = new Set<string>();
+  const collectNewStatuses = (candidates: string[]): string[] => {
+    const nextStatuses: string[] = [];
+
+    for (const candidate of candidates) {
+      const normalizedStatus = normalizeStatusText(candidate);
+      if (!normalizedStatus || seenStatuses.has(normalizedStatus)) {
+        continue;
+      }
+
+      seenStatuses.add(normalizedStatus);
+      statusHistory.push(normalizedStatus);
+
+      if (normalizedStatus !== lastStatus) {
+        nextStatuses.push(normalizedStatus);
+        lastStatus = normalizedStatus;
+      }
+    }
+
+    return nextStatuses;
+  };
   const writeExtractedContext = (rawText: string) => {
     if (!extractedContext) {
       return;
@@ -1006,12 +1026,10 @@ export async function* streamVertexQuery({
     }
 
     for (const payload of payloads) {
-      for (const status of extractStatusUpdatesFromVertexResponse(payload)) {
-        if (status && status !== lastStatus) {
-          yield { type: "status", status };
-          lastStatus = status;
-          statusHistory.push(status);
-        }
+      for (const status of collectNewStatuses(
+        extractStatusUpdatesFromVertexResponse(payload)
+      )) {
+        yield { type: "status", status };
       }
 
       const text = extractTextFromVertexResponse(payload);
@@ -1028,6 +1046,12 @@ export async function* streamVertexQuery({
 
       accumulatedRawText = nextRawText;
       accumulatedVisibleText = nextVisibleText;
+
+      for (const status of collectNewStatuses(
+        extractKnownStatusesInOrder(nextRawText)
+      )) {
+        yield { type: "status", status };
+      }
 
       if (delta) {
         yield { type: "text", delta };
@@ -1046,12 +1070,10 @@ export async function* streamVertexQuery({
   const rawSamples: string[] = [];
 
   for await (const data of parseJsonStream(response.body)) {
-    for (const status of extractStatusUpdatesFromVertexResponse(data)) {
-      if (status && status !== lastStatus) {
-        yield { type: "status", status };
-        lastStatus = status;
-        statusHistory.push(status);
-      }
+    for (const status of collectNewStatuses(
+      extractStatusUpdatesFromVertexResponse(data)
+    )) {
+      yield { type: "status", status };
     }
 
     const text = extractTextFromVertexResponse(data);
@@ -1075,6 +1097,12 @@ export async function* streamVertexQuery({
 
     accumulatedRawText = nextRawText;
     accumulatedVisibleText = nextVisibleText;
+
+    for (const status of collectNewStatuses(
+      extractKnownStatusesInOrder(nextRawText)
+    )) {
+      yield { type: "status", status };
+    }
 
     if (delta) {
       yield { type: "text", delta };

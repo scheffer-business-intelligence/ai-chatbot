@@ -653,16 +653,15 @@ export async function POST(request: Request) {
                   continue;
                 }
 
-                if (!delta.trim()) {
-                  continue;
-                }
-
                 dataStream.write({
                   type: "text-delta",
                   id: textPartId,
                   delta,
                 });
-                hasVisibleOutput = true;
+
+                if (delta.trim().length > 0) {
+                  hasVisibleOutput = true;
+                }
               }
             };
 
