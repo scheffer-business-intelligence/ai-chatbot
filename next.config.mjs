@@ -1,6 +1,5 @@
-import type { NextConfig } from "next";
-
-const nextConfig: NextConfig = {
+/** @type {import("next").NextConfig} */
+const nextConfig = {
   cacheComponents: true,
   images: {
     remotePatterns: [
@@ -9,7 +8,7 @@ const nextConfig: NextConfig = {
       },
       {
         protocol: "https",
-        //https://nextjs.org/docs/messages/next-image-unconfigured-host
+        // https://nextjs.org/docs/messages/next-image-unconfigured-host
         hostname: "*.public.blob.vercel-storage.com",
       },
     ],

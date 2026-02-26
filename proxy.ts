@@ -53,7 +53,8 @@ export async function proxy(request: NextRequest) {
     }
 
     const loginUrl = new URL("/login", request.url);
-    loginUrl.searchParams.set("callbackUrl", request.url);
+    const callbackPath = `${request.nextUrl.pathname}${request.nextUrl.search}`;
+    loginUrl.searchParams.set("callbackUrl", callbackPath || "/");
 
     return NextResponse.redirect(loginUrl);
   }

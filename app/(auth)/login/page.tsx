@@ -48,7 +48,14 @@ function LoginPage() {
     setIsSubmitting(true);
 
     try {
-      await signIn("google", { callbackUrl });
+      await signIn(
+        "google",
+        { callbackUrl },
+        {
+          prompt: "select_account",
+          hd: "scheffer.agr.br",
+        }
+      );
     } catch {
       setIsSubmitting(false);
     }

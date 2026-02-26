@@ -268,6 +268,7 @@ export function inferChartSpecFromTableText(text: string): ChartSpecV1 | null {
     ).slice(0, 80);
 
     const inferredSpec: ChartSpecV1 = {
+      version: "1.0",
       type: "bar",
       title: extractTableTitle(lines, index),
       subtitle: "Gerado automaticamente com base na tabela retornada.",
