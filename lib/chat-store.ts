@@ -18,6 +18,7 @@ import { sanitizeText } from "@/lib/utils";
 
 type PersistChatMessageParams = {
   chatId: string;
+  sessionId: string;
   userId: string;
   message: ChatMessage;
   visibility?: "private" | "public";
@@ -128,6 +129,7 @@ function toChatMessageFromBigQueryRow(
 
 function toBigQueryMessageRow({
   chatId,
+  sessionId,
   userId,
   message,
   visibility,
@@ -142,7 +144,9 @@ function toBigQueryMessageRow({
 
   return {
     message_id: message.id,
-    session_id: chatId,
+    // Keep chat_id for internal chat lookups while session_id tracks provider session.
+    session_id: sessionId,
+    chat_id: chatId,
     user_id: userId,
     role: message.role,
     content: getPlainTextFromMessage(message),
@@ -165,6 +169,10 @@ export async function persistMessageToBigQuery(
   params: PersistChatMessageParams
 ) {
   try {
+    if (!params.sessionId.trim()) {
+      throw new Error("Missing session id for message persistence.");
+    }
+
     const createdAt = parseCreatedAtFromMetadata(params.message);
     const accessToken = await getBigQueryAccessToken();
     const row = toBigQueryMessageRow({ ...params, createdAt });
@@ -313,7 +321,7 @@ export async function findMessageReferenceById({
       const createdAt = new Date(message.created_at);
       if (!Number.isNaN(createdAt.getTime())) {
         return {
-          chatId: message.session_id,
+          chatId: message.chat_id || message.session_id,
           createdAt,
         };
       }

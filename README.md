@@ -128,6 +128,52 @@ Verifique:
 - Permissoes da service account para consultar/gravar no BigQuery.
 - Conectividade de rede com APIs Google.
 
+### Correlacionar logs por `session_id` e `chat_id` (Agent Engine)
+
+Nos logs do Agent Engine e na tabela `chat_messages`:
+
+- `session_id` = sessao do provider (Vertex / Agent Engine).
+- `chat_id` = conversa interna da UI (UUID da rota `/chat/:id`).
+
+Se o projeto roda com `BQ_AUTO_CREATE_TABLES=false`, garanta que a coluna
+`chat_id` exista em `chat_messages`:
+
+```sql
+ALTER TABLE `SEU_PROJETO.SEU_DATASET.chat_messages`
+ADD COLUMN IF NOT EXISTS chat_id STRING;
+
+UPDATE `SEU_PROJETO.SEU_DATASET.chat_messages`
+SET chat_id = session_id
+WHERE chat_id IS NULL;
+```
+
+Eventos uteis para depuracao:
+
+- `provider_session_resolved` (reuso/criacao de sessao).
+- `vertex_stream_started` e `vertex_stream_finished`.
+- `provider_session_rotated` (sessao invalida recuperada).
+- `vertex_stream_failed`.
+
+Exemplo para listar eventos no Cloud Logging:
+
+```bash
+gcloud logging read \
+  'resource.type="cloud_run_revision" AND textPayload:"[agent-engine]" AND textPayload:"\"event\":\"vertex_stream_failed\""' \
+  --project="$PROJECT_ID" \
+  --limit=50 \
+  --freshness=2d
+```
+
+Exemplo para rastrear um `session_id` especifico:
+
+```bash
+gcloud logging read \
+  'resource.type="cloud_run_revision" AND textPayload:"[agent-engine]" AND textPayload:"\"session_id\":\"SEU_SESSION_ID\""' \
+  --project="$PROJECT_ID" \
+  --limit=100 \
+  --freshness=2d
+```
+
 ### Timeout ou falha transitoria no BigQuery
 
 O projeto possui retry/cooldown configuravel:

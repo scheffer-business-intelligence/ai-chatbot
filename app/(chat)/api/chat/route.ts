@@ -60,6 +60,28 @@ const AGENT_ENGINE_INLINE_XLSX_MIME_TYPE =
   "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
 const agentSessionRefreshLocks = new Map<string, Promise<string>>();
 
+function logAgentEngineEvent(
+  level: "info" | "warn" | "error",
+  payload: Record<string, unknown>
+) {
+  const logPayload = {
+    provider: AGENT_ENGINE_PROVIDER_ID,
+    ...payload,
+  };
+
+  if (level === "error") {
+    console.error("[agent-engine]", logPayload);
+    return;
+  }
+
+  if (level === "warn") {
+    console.warn("[agent-engine]", logPayload);
+    return;
+  }
+
+  console.info("[agent-engine]", logPayload);
+}
+
 function resetExtractedContext(context: VertexExtractedContext) {
   context.chartSpec = null;
   context.chartError = null;
@@ -75,10 +97,14 @@ async function refreshAgentEngineProviderSession({
   chatId,
   userId,
   previousSessionId,
+  requestId,
+  modelId,
 }: {
   chatId: string;
   userId: string;
   previousSessionId: string;
+  requestId: string;
+  modelId: string;
 }) {
   const lockKey = getAgentSessionRefreshLockKey(chatId);
   const inFlight = agentSessionRefreshLocks.get(lockKey);
@@ -98,16 +124,30 @@ async function refreshAgentEngineProviderSession({
         provider: AGENT_ENGINE_PROVIDER_ID,
       });
     } catch (error) {
-      console.warn(
-        "Unable to read current Agent Engine provider session before refresh. Proceeding with session recreation.",
-        { chatId, userId, error }
-      );
+      logAgentEngineEvent("warn", {
+        event: "provider_session_lookup_failed",
+        request_id: requestId,
+        chat_id: chatId,
+        session_id: previousSessionId,
+        user_id: userId,
+        model_id: modelId,
+        reason: error instanceof Error ? error.message : String(error),
+      });
     }
 
     if (
       latestProviderSession?.sessionId &&
       latestProviderSession.sessionId !== previousSessionId
     ) {
+      logAgentEngineEvent("info", {
+        event: "provider_session_resolved",
+        request_id: requestId,
+        chat_id: chatId,
+        session_id: latestProviderSession.sessionId,
+        user_id: userId,
+        model_id: modelId,
+        source: "existing",
+      });
       return latestProviderSession.sessionId;
     }
 
@@ -122,11 +162,26 @@ async function refreshAgentEngineProviderSession({
         userId,
       });
     } catch (error) {
-      console.warn(
-        "Failed to persist refreshed Agent Engine provider session. Continuing with in-memory session for this request.",
-        { chatId, userId, error }
-      );
+      logAgentEngineEvent("warn", {
+        event: "provider_session_persist_failed",
+        request_id: requestId,
+        chat_id: chatId,
+        session_id: nextSessionId,
+        user_id: userId,
+        model_id: modelId,
+        reason: error instanceof Error ? error.message : String(error),
+      });
     }
+
+    logAgentEngineEvent("info", {
+      event: "provider_session_resolved",
+      request_id: requestId,
+      chat_id: chatId,
+      session_id: nextSessionId,
+      user_id: userId,
+      model_id: modelId,
+      source: "created",
+    });
 
     return nextSessionId;
   })().finally(() => {
@@ -373,6 +428,7 @@ async function buildVertexMessageFromUserMessage(
 
 export async function POST(request: Request) {
   let requestBody: PostRequestBody;
+  const requestId = generateUUID();
 
   try {
     const json = await request.json();
@@ -463,6 +519,7 @@ export async function POST(request: Request) {
     const uiMessages = isToolApprovalFlow
       ? (messages as ChatMessage[])
       : [...messageHistory, message as ChatMessage];
+    const isAgentEngineRequest = isAgentEngineModel(selectedChatModel);
     const latestUserMessage =
       message?.role === "user"
         ? (message as ChatMessage)
@@ -478,20 +535,24 @@ export async function POST(request: Request) {
       country,
     };
 
-    if (message?.role === "user" && !isToolApprovalFlow) {
-      await saveMessages({
-        messages: [
-          {
+    const incomingUserDbMessage =
+      message?.role === "user"
+        ? {
             chatId: id,
             id: message.id,
-            role: "user",
+            role: "user" as const,
             parts: message.parts,
             attachments: [],
             chartSpec: null,
             chartError: null,
             createdAt: new Date(),
-          },
-        ],
+          }
+        : null;
+
+    if (incomingUserDbMessage && !isToolApprovalFlow && !isAgentEngineRequest) {
+      await saveMessages({
+        messages: [incomingUserDbMessage],
+        sessionId: id,
       });
     }
 
@@ -500,6 +561,21 @@ export async function POST(request: Request) {
       chartError: null,
       hasChartContext: false,
       contextSheets: [],
+    };
+    let providerSessionIdForPersistence: string | undefined;
+    const getPersistenceSessionId = () => {
+      if (!isAgentEngineRequest) {
+        return id;
+      }
+
+      if (!providerSessionIdForPersistence) {
+        throw new ChatSDKError(
+          "bad_request:agent_engine",
+          "Missing Vertex session id for message persistence."
+        );
+      }
+
+      return providerSessionIdForPersistence;
     };
 
     const handleOnFinish = async ({
@@ -516,7 +592,7 @@ export async function POST(request: Request) {
         for (const finishedMsg of finishedMessages) {
           const existingMsg = uiMessages.find((m) => m.id === finishedMsg.id);
           const shouldPersistChartContext =
-            isAgentEngineModel(selectedChatModel) &&
+            isAgentEngineRequest &&
             finishedMsg.role === "assistant" &&
             finishedMsg.id === lastAssistantMessageId;
 
@@ -549,6 +625,7 @@ export async function POST(request: Request) {
                   chatId: id,
                 },
               ],
+              sessionId: getPersistenceSessionId(),
             });
           }
         }
@@ -561,19 +638,20 @@ export async function POST(request: Request) {
             createdAt: new Date(),
             attachments: [],
             chartSpec:
-              isAgentEngineModel(selectedChatModel) &&
+              isAgentEngineRequest &&
               currentMessage.role === "assistant" &&
               currentMessage.id === lastAssistantMessageId
                 ? extractedContext.chartSpec
                 : null,
             chartError:
-              isAgentEngineModel(selectedChatModel) &&
+              isAgentEngineRequest &&
               currentMessage.role === "assistant" &&
               currentMessage.id === lastAssistantMessageId
                 ? extractedContext.chartError
                 : null,
             chatId: id,
           })),
+          sessionId: getPersistenceSessionId(),
         });
       }
 
@@ -587,7 +665,7 @@ export async function POST(request: Request) {
 
     let stream: ReadableStream<UIMessageChunk>;
 
-    if (isAgentEngineModel(selectedChatModel)) {
+    if (isAgentEngineRequest) {
       try {
         const serviceAccountAccessToken = await getServiceAccountAccessToken();
 
@@ -608,13 +686,18 @@ export async function POST(request: Request) {
             provider: AGENT_ENGINE_PROVIDER_ID,
           });
         } catch (error) {
-          console.warn(
-            "Failed to load Agent Engine provider session from BigQuery. A new Vertex session will be created.",
-            { chatId: id, userId: bigQueryUserId, error }
-          );
+          logAgentEngineEvent("warn", {
+            event: "provider_session_lookup_failed",
+            request_id: requestId,
+            chat_id: id,
+            user_id: bigQueryUserId,
+            model_id: selectedChatModel,
+            reason: error instanceof Error ? error.message : String(error),
+          });
         }
 
         let providerSessionId = existingProviderSession?.sessionId;
+        const providerSessionSource = providerSessionId ? "existing" : "created";
 
         if (!providerSessionId) {
           providerSessionId = await createVertexSession(
@@ -630,16 +713,38 @@ export async function POST(request: Request) {
               userId: bigQueryUserId,
             });
           } catch (error) {
-            console.warn(
-              "Failed to persist initial Agent Engine provider session. Continuing with in-memory session for this request.",
-              { chatId: id, userId: bigQueryUserId, error }
-            );
+            logAgentEngineEvent("warn", {
+              event: "provider_session_persist_failed",
+              request_id: requestId,
+              chat_id: id,
+              session_id: providerSessionId,
+              user_id: bigQueryUserId,
+              model_id: selectedChatModel,
+              reason: error instanceof Error ? error.message : String(error),
+            });
           }
         }
         if (!providerSessionId) {
           throw new Error(
             "Failed to initialize Agent Engine provider session."
           );
+        }
+        logAgentEngineEvent("info", {
+          event: "provider_session_resolved",
+          request_id: requestId,
+          chat_id: id,
+          session_id: providerSessionId,
+          user_id: bigQueryUserId,
+          model_id: selectedChatModel,
+          source: providerSessionSource,
+        });
+        providerSessionIdForPersistence = providerSessionId;
+
+        if (incomingUserDbMessage && !isToolApprovalFlow) {
+          await saveMessages({
+            messages: [incomingUserDbMessage],
+            sessionId: getPersistenceSessionId(),
+          });
         }
 
         const vertexMessage = await buildVertexMessageFromUserMessage(
@@ -668,6 +773,16 @@ export async function POST(request: Request) {
             const streamAgentEngineResponse = async (
               currentProviderSessionId: string
             ) => {
+              const streamStartedAtMs = Date.now();
+              logAgentEngineEvent("info", {
+                event: "vertex_stream_started",
+                request_id: requestId,
+                chat_id: id,
+                session_id: currentProviderSessionId,
+                user_id: bigQueryUserId,
+                model_id: selectedChatModel,
+              });
+
               for await (const event of streamVertexQuery({
                 accessToken: serviceAccountAccessToken,
                 sessionId: currentProviderSessionId,
@@ -704,6 +819,16 @@ export async function POST(request: Request) {
                   hasVisibleOutput = true;
                 }
               }
+
+              logAgentEngineEvent("info", {
+                event: "vertex_stream_finished",
+                request_id: requestId,
+                chat_id: id,
+                session_id: currentProviderSessionId,
+                user_id: bigQueryUserId,
+                model_id: selectedChatModel,
+                duration_ms: Date.now() - streamStartedAtMs,
+              });
             };
 
             for (
@@ -719,28 +844,47 @@ export async function POST(request: Request) {
                   attempt < AGENT_ENGINE_SESSION_RECOVERY_ATTEMPTS &&
                   !hasVisibleOutput &&
                   isInvalidVertexSessionError(error);
+                const errorReason =
+                  error instanceof Error ? error.message : String(error);
 
                 if (!canRecoverSession) {
+                  logAgentEngineEvent("error", {
+                    event: "vertex_stream_failed",
+                    request_id: requestId,
+                    chat_id: id,
+                    session_id: activeProviderSessionId,
+                    user_id: bigQueryUserId,
+                    model_id: selectedChatModel,
+                    attempt: attempt + 1,
+                    reason: errorReason,
+                  });
                   throw error;
                 }
 
-                console.warn(
-                  "Agent Engine session appears invalid. Recreating provider session.",
-                  {
-                    chatId: id,
-                    userId: bigQueryUserId,
-                    attempt: attempt + 1,
-                  }
-                );
-
                 resetExtractedContext(extractedContext);
+                const previousProviderSessionId = activeProviderSessionId;
                 activeProviderSessionId =
                   await refreshAgentEngineProviderSession({
                     chatId: id,
                     userId: bigQueryUserId,
                     previousSessionId: activeProviderSessionId,
+                    requestId,
+                    modelId: selectedChatModel,
                   });
                 providerSessionId = activeProviderSessionId;
+                providerSessionIdForPersistence = activeProviderSessionId;
+
+                logAgentEngineEvent("warn", {
+                  event: "provider_session_rotated",
+                  request_id: requestId,
+                  chat_id: id,
+                  session_id: activeProviderSessionId,
+                  previous_session_id: previousProviderSessionId,
+                  user_id: bigQueryUserId,
+                  model_id: selectedChatModel,
+                  attempt: attempt + 1,
+                  reason: errorReason,
+                });
               }
             }
 
@@ -791,7 +935,15 @@ export async function POST(request: Request) {
           generateId: generateUUID,
           onFinish: handleOnFinish,
           onError: (error) => {
-            console.error("Agent Engine stream error:", error);
+            logAgentEngineEvent("error", {
+              event: "vertex_stream_failed",
+              request_id: requestId,
+              chat_id: id,
+              session_id: providerSessionId,
+              user_id: bigQueryUserId,
+              model_id: selectedChatModel,
+              reason: error instanceof Error ? error.message : String(error),
+            });
             if (error instanceof Error) {
               return `Não consegui obter resposta do Scheffer Agente Engine: ${error.message}`;
             }
@@ -799,6 +951,14 @@ export async function POST(request: Request) {
           },
         });
       } catch (error) {
+        logAgentEngineEvent("error", {
+          event: "agent_engine_request_failed",
+          request_id: requestId,
+          chat_id: id,
+          user_id: bigQueryUserId,
+          model_id: selectedChatModel,
+          reason: error instanceof Error ? error.message : String(error),
+        });
         const cause =
           error instanceof Error
             ? error.message
@@ -943,7 +1103,12 @@ export async function POST(request: Request) {
       return new ChatSDKError("bad_request:activate_gateway").toResponse();
     }
 
-    console.error("Unhandled error in chat API:", error, { vercelId });
+    console.error("Unhandled error in chat API:", error, {
+      vercelId,
+      request_id: requestId,
+      chat_id: requestBody.id,
+      model_id: requestBody.selectedChatModel,
+    });
     return new ChatSDKError("offline:chat").toResponse();
   }
 }

@@ -75,6 +75,7 @@ export async function POST(request: Request) {
 
       await persistMessageToBigQuery({
         chatId: newChatId,
+        sessionId: newChatId,
         userId: bigQueryUserId,
         message: clonedMessage,
         visibility: "private",

@@ -137,6 +137,7 @@ const TABLE_DDL_STATEMENTS = [
     CREATE TABLE IF NOT EXISTS \`${MESSAGES_TABLE_REF}\` (
       message_id STRING,
       session_id STRING,
+      chat_id STRING,
       user_id STRING,
       role STRING,
       content STRING,
@@ -174,6 +175,10 @@ const TABLE_DDL_STATEMENTS = [
   `
     ALTER TABLE \`${MESSAGES_TABLE_REF}\`
     ADD COLUMN IF NOT EXISTS session_id STRING
+  `,
+  `
+    ALTER TABLE \`${MESSAGES_TABLE_REF}\`
+    ADD COLUMN IF NOT EXISTS chat_id STRING
   `,
   `
     ALTER TABLE \`${MESSAGES_TABLE_REF}\`
@@ -558,6 +563,7 @@ function buildMetaRow({
   return {
     message_id: messageId,
     session_id: sessionId,
+    chat_id: sessionId,
     user_id: userId,
     role: "system",
     content,
@@ -585,7 +591,7 @@ function mapMessageRowToDbMessage(row: GenericBigQueryRow): DBMessage {
 
   return {
     id: row.message_id ?? "",
-    chatId: row.session_id ?? "",
+    chatId: row.chat_id ?? row.session_id ?? "",
     role: (row.role ?? "assistant") as DBMessage["role"],
     parts,
     attachments: parseJsonOrFallback<DBMessage["attachments"]>(
@@ -604,17 +610,20 @@ function mapMessageRowToDbMessage(row: GenericBigQueryRow): DBMessage {
 function toBigQueryMessageRow({
   message,
   userId,
+  sessionId,
   visibility,
 }: {
   message: DBMessage;
   userId: string;
+  sessionId: string;
   visibility: VisibilityType;
 }): BigQueryChatMessageRow {
   const createdAt = toIsoString(message.createdAt);
 
   return {
     message_id: message.id,
-    session_id: message.chatId,
+    session_id: sessionId,
+    chat_id: message.chatId,
     user_id: userId,
     role: message.role,
     content: extractTextFromParts(message.parts),
@@ -920,7 +929,7 @@ async function getFallbackChatFromMessages(
   const rows = await queryRows(
     `
       SELECT
-        session_id,
+        COALESCE(chat_id, session_id) AS chat_id,
         ANY_VALUE(user_id) AS user_id,
         MIN(created_at) AS created_at,
         ANY_VALUE(visibility) AS visibility,
@@ -931,15 +940,15 @@ async function getFallbackChatFromMessages(
           LIMIT 1
         )[SAFE_OFFSET(0)] AS title
       FROM \`${MESSAGES_TABLE_REF}\`
-      WHERE session_id = @chat_id
+      WHERE (chat_id = @chat_id OR (chat_id IS NULL AND session_id = @chat_id))
         AND (is_deleted IS NULL OR is_deleted = FALSE)
-      GROUP BY session_id
+      GROUP BY COALESCE(chat_id, session_id)
       LIMIT 1
     `,
     [{ name: "chat_id", type: "STRING", value: chatId }],
     `
       SELECT
-        session_id,
+        session_id AS chat_id,
         ANY_VALUE(user_id) AS user_id,
         MIN(created_at) AS created_at,
         NULL AS visibility,
@@ -958,12 +967,12 @@ async function getFallbackChatFromMessages(
 
   const row = rows[0];
 
-  if (!row?.session_id || isMetaSessionId(row.session_id)) {
+  if (!row?.chat_id || isMetaSessionId(row.chat_id)) {
     return null;
   }
 
   return {
-    id: row.session_id,
+    id: row.chat_id,
     userId: row.user_id ?? "",
     title: row.title ?? "Nova Conversa",
     visibility: normalizeVisibility(row.visibility),
@@ -987,7 +996,7 @@ async function getSessionMetadata(chatId: string) {
         user_id,
         visibility
       FROM \`${MESSAGES_TABLE_REF}\`
-      WHERE session_id = @chat_id
+      WHERE (chat_id = @chat_id OR (chat_id IS NULL AND session_id = @chat_id))
         AND (is_deleted IS NULL OR is_deleted = FALSE)
       ORDER BY SAFE_CAST(created_at AS TIMESTAMP) DESC
       LIMIT 1
@@ -1197,13 +1206,23 @@ export async function deleteChatById({ id }: { id: string }) {
   try {
     const chat = await getChatById({ id });
 
-    await runQuery(
-      `
-        DELETE FROM \`${MESSAGES_TABLE_REF}\`
-        WHERE session_id = @chat_id
-      `,
-      [{ name: "chat_id", type: "STRING", value: id }]
-    );
+    try {
+      await runQuery(
+        `
+          DELETE FROM \`${MESSAGES_TABLE_REF}\`
+          WHERE (chat_id = @chat_id OR (chat_id IS NULL AND session_id = @chat_id))
+        `,
+        [{ name: "chat_id", type: "STRING", value: id }]
+      );
+    } catch {
+      await runQuery(
+        `
+          DELETE FROM \`${MESSAGES_TABLE_REF}\`
+          WHERE session_id = @chat_id
+        `,
+        [{ name: "chat_id", type: "STRING", value: id }]
+      );
+    }
 
     await runQuery(
       `
@@ -1413,7 +1432,7 @@ export async function getChatsByUserId({
     const derivedRows = await queryRows(
       `
         SELECT
-          session_id AS id,
+          COALESCE(chat_id, session_id) AS id,
           ANY_VALUE(user_id) AS user_id,
           MIN(created_at) AS created_at,
           NULL AS visibility,
@@ -1425,9 +1444,9 @@ export async function getChatsByUserId({
           )[SAFE_OFFSET(0)] AS title
         FROM \`${MESSAGES_TABLE_REF}\`
         WHERE user_id = @user_id
-          AND NOT STARTS_WITH(session_id, @meta_prefix)
+          AND NOT STARTS_WITH(COALESCE(chat_id, session_id), @meta_prefix)
           AND (is_deleted IS NULL OR is_deleted = FALSE)
-        GROUP BY session_id
+        GROUP BY COALESCE(chat_id, session_id)
         ${cursorOperator ? `HAVING MIN(SAFE_CAST(created_at AS TIMESTAMP)) ${cursorOperator} SAFE_CAST(@cursor_created_at AS TIMESTAMP)` : ""}
         ORDER BY MIN(SAFE_CAST(created_at AS TIMESTAMP)) DESC
         LIMIT @limit
@@ -1670,8 +1689,21 @@ export async function upsertProviderSession({
   }
 }
 
-export async function saveMessages({ messages }: { messages: DBMessage[] }) {
+export async function saveMessages({
+  messages,
+  sessionId,
+}: {
+  messages: DBMessage[];
+  sessionId: string;
+}) {
   try {
+    if (!sessionId.trim()) {
+      throw new ChatSDKError(
+        "bad_request:database",
+        "Missing session id for message persistence"
+      );
+    }
+
     const dedupedMessages = Array.from(
       new Map(
         messages.map((currentMessage) => [currentMessage.id, currentMessage])
@@ -1702,6 +1734,7 @@ export async function saveMessages({ messages }: { messages: DBMessage[] }) {
       const row = toBigQueryMessageRow({
         message,
         userId: metadata.userId,
+        sessionId,
         visibility: metadata.visibility,
       });
 
@@ -1822,6 +1855,7 @@ export async function getMessagesByChatId({ id }: { id: string }) {
         SELECT
           message_id,
           session_id,
+          chat_id,
           role,
           content,
           created_at,
@@ -1830,7 +1864,7 @@ export async function getMessagesByChatId({ id }: { id: string }) {
           chart_spec_json,
           chart_error
         FROM \`${MESSAGES_TABLE_REF}\`
-        WHERE session_id = @chat_id
+        WHERE (chat_id = @chat_id OR (chat_id IS NULL AND session_id = @chat_id))
           AND NOT STARTS_WITH(session_id, @meta_prefix)
           AND (is_deleted IS NULL OR is_deleted = FALSE)
         ORDER BY SAFE_CAST(created_at AS TIMESTAMP) ASC
@@ -1843,6 +1877,7 @@ export async function getMessagesByChatId({ id }: { id: string }) {
         SELECT
           message_id,
           session_id,
+          NULL AS chat_id,
           role,
           content,
           created_at,
@@ -2113,6 +2148,7 @@ export async function getMessageById({ id }: { id: string }) {
         SELECT
           message_id,
           session_id,
+          chat_id,
           role,
           content,
           created_at,
@@ -2130,6 +2166,7 @@ export async function getMessageById({ id }: { id: string }) {
         SELECT
           message_id,
           session_id,
+          NULL AS chat_id,
           role,
           content,
           created_at
@@ -2164,19 +2201,35 @@ export async function deleteMessagesByChatIdAfterTimestamp({
   try {
     const threshold = toIsoString(timestamp);
 
-    await runQuery(
-      `
-        DELETE FROM \`${MESSAGES_TABLE_REF}\`
-        WHERE session_id = @chat_id
-          AND NOT STARTS_WITH(session_id, @meta_prefix)
-          AND SAFE_CAST(created_at AS TIMESTAMP) >= SAFE_CAST(@threshold AS TIMESTAMP)
-      `,
-      [
-        { name: "chat_id", type: "STRING", value: chatId },
-        { name: "meta_prefix", type: "STRING", value: META_SESSION_PREFIX },
-        { name: "threshold", type: "STRING", value: threshold },
-      ]
-    );
+    try {
+      await runQuery(
+        `
+          DELETE FROM \`${MESSAGES_TABLE_REF}\`
+          WHERE (chat_id = @chat_id OR (chat_id IS NULL AND session_id = @chat_id))
+            AND NOT STARTS_WITH(session_id, @meta_prefix)
+            AND SAFE_CAST(created_at AS TIMESTAMP) >= SAFE_CAST(@threshold AS TIMESTAMP)
+        `,
+        [
+          { name: "chat_id", type: "STRING", value: chatId },
+          { name: "meta_prefix", type: "STRING", value: META_SESSION_PREFIX },
+          { name: "threshold", type: "STRING", value: threshold },
+        ]
+      );
+    } catch {
+      await runQuery(
+        `
+          DELETE FROM \`${MESSAGES_TABLE_REF}\`
+          WHERE session_id = @chat_id
+            AND NOT STARTS_WITH(session_id, @meta_prefix)
+            AND SAFE_CAST(created_at AS TIMESTAMP) >= SAFE_CAST(@threshold AS TIMESTAMP)
+        `,
+        [
+          { name: "chat_id", type: "STRING", value: chatId },
+          { name: "meta_prefix", type: "STRING", value: META_SESSION_PREFIX },
+          { name: "threshold", type: "STRING", value: threshold },
+        ]
+      );
+    }
   } catch (_error) {
     throw new ChatSDKError(
       "bad_request:database",
@@ -2223,20 +2276,37 @@ export async function updateChatVisibilityById({
     );
 
     try {
-      await runQuery(
-        `
-          UPDATE \`${MESSAGES_TABLE_REF}\`
-          SET
-            visibility = @visibility
-          WHERE session_id = @chat_id
-            AND NOT STARTS_WITH(session_id, @meta_prefix)
-        `,
-        [
-          { name: "visibility", type: "STRING", value: visibility },
-          { name: "chat_id", type: "STRING", value: chatId },
-          { name: "meta_prefix", type: "STRING", value: META_SESSION_PREFIX },
-        ]
-      );
+      try {
+        await runQuery(
+          `
+            UPDATE \`${MESSAGES_TABLE_REF}\`
+            SET
+              visibility = @visibility
+            WHERE (chat_id = @chat_id OR (chat_id IS NULL AND session_id = @chat_id))
+              AND NOT STARTS_WITH(session_id, @meta_prefix)
+          `,
+          [
+            { name: "visibility", type: "STRING", value: visibility },
+            { name: "chat_id", type: "STRING", value: chatId },
+            { name: "meta_prefix", type: "STRING", value: META_SESSION_PREFIX },
+          ]
+        );
+      } catch {
+        await runQuery(
+          `
+            UPDATE \`${MESSAGES_TABLE_REF}\`
+            SET
+              visibility = @visibility
+            WHERE session_id = @chat_id
+              AND NOT STARTS_WITH(session_id, @meta_prefix)
+          `,
+          [
+            { name: "visibility", type: "STRING", value: visibility },
+            { name: "chat_id", type: "STRING", value: chatId },
+            { name: "meta_prefix", type: "STRING", value: META_SESSION_PREFIX },
+          ]
+        );
+      }
     } catch (error) {
       // Share relies on chat metadata visibility; message-row visibility is best-effort.
       console.warn(

@@ -200,6 +200,7 @@ async function bigQueryRequestOnce(
 export type BigQueryChatMessageRow = {
   message_id: string;
   session_id: string;
+  chat_id: string;
   user_id: string;
   role: string;
   content: string;
@@ -360,6 +361,7 @@ function mapRowToChatMessage(row: GenericBigQueryRow): BigQueryChatMessageRow {
   return {
     message_id: row.message_id ?? "",
     session_id: row.session_id ?? "",
+    chat_id: row.chat_id ?? row.session_id ?? "",
     user_id: row.user_id ?? "",
     role: row.role ?? "",
     content: row.content ?? "",
@@ -408,6 +410,7 @@ async function insertChatMessageRow(
         json: {
           message_id: row.message_id,
           session_id: row.session_id,
+          chat_id: row.chat_id,
           user_id: row.user_id,
           role: row.role,
           content: row.content,
@@ -455,6 +458,7 @@ type ChatMessageTemporalCastMode =
   | "both";
 type ChatMessageMergeColumn =
   | "session_id"
+  | "chat_id"
   | "user_id"
   | "role"
   | "content"
@@ -470,6 +474,7 @@ type ChatMessageMergeColumn =
 
 const CHAT_MESSAGE_MERGE_COLUMNS: ChatMessageMergeColumn[] = [
   "session_id",
+  "chat_id",
   "user_id",
   "role",
   "content",
@@ -695,6 +700,7 @@ export async function upsertChatMessageRow(
       "session_id",
       { name: "session_id", type: "STRING", value: row.session_id },
     ],
+    ["chat_id", { name: "chat_id", type: "STRING", value: row.chat_id }],
     ["user_id", { name: "user_id", type: "STRING", value: row.user_id }],
     ["role", { name: "role", type: "STRING", value: row.role }],
     ["content", { name: "content", type: "STRING", value: row.content }],
@@ -822,13 +828,14 @@ export async function upsertChatMessageRow(
 export async function querySessionMessages(
   accessToken: string,
   userId: string,
-  sessionId: string
+  chatId: string
 ): Promise<BigQueryChatMessageRow[]> {
   const messagesTable = getMessagesTableRef();
   const fullQuery = `
     SELECT
       message_id,
       session_id,
+      chat_id,
       user_id,
       role,
       content,
@@ -843,7 +850,7 @@ export async function querySessionMessages(
       CAST(is_deleted AS STRING) AS is_deleted
     FROM \`${messagesTable}\`
     WHERE user_id = @user_id
-      AND session_id = @session_id
+      AND (chat_id = @chat_id OR (chat_id IS NULL AND session_id = @chat_id))
       AND role IN ('user', 'assistant')
       AND (is_deleted IS NULL OR is_deleted = FALSE)
     ORDER BY created_at
@@ -852,7 +859,7 @@ export async function querySessionMessages(
   try {
     const response = await runQuery(accessToken, fullQuery, [
       { name: "user_id", type: "STRING", value: userId },
-      { name: "session_id", type: "STRING", value: sessionId },
+      { name: "chat_id", type: "STRING", value: chatId },
     ]);
     const rows = mapRows(
       response.rows as BigQueryRow[] | undefined,
@@ -864,19 +871,20 @@ export async function querySessionMessages(
       SELECT
         message_id,
         session_id,
+        NULL AS chat_id,
         user_id,
         role,
         content,
         created_at
       FROM \`${messagesTable}\`
       WHERE user_id = @user_id
-        AND session_id = @session_id
+        AND session_id = @chat_id
         AND role IN ('user', 'assistant')
       ORDER BY created_at
     `;
     const response = await runQuery(accessToken, fallbackQuery, [
       { name: "user_id", type: "STRING", value: userId },
-      { name: "session_id", type: "STRING", value: sessionId },
+      { name: "chat_id", type: "STRING", value: chatId },
     ]);
     const rows = mapRows(
       response.rows as BigQueryRow[] | undefined,
@@ -896,6 +904,7 @@ export async function getChatMessageById(
     SELECT
       message_id,
       session_id,
+      chat_id,
       user_id,
       role,
       content,
@@ -932,6 +941,7 @@ export async function getChatMessageById(
       SELECT
         message_id,
         session_id,
+        NULL AS chat_id,
         user_id,
         role,
         content,
@@ -964,50 +974,90 @@ export async function getChatMessageById(
 export async function softDeleteMessagesAfterTimestamp(
   accessToken: string,
   userId: string,
-  sessionId: string,
+  chatId: string,
   createdAtIso: string
 ) {
   const messagesTable = getMessagesTableRef();
-  const query = `
+  const updatedAt = new Date().toISOString();
+  const fullQuery = `
     UPDATE \`${messagesTable}\`
     SET
       is_deleted = TRUE,
       updated_at = @updated_at
     WHERE user_id = @user_id
-      AND session_id = @session_id
+      AND (chat_id = @chat_id OR (chat_id IS NULL AND session_id = @chat_id))
       AND SAFE_CAST(created_at AS TIMESTAMP) >= SAFE_CAST(@created_at AS TIMESTAMP)
       AND (is_deleted IS NULL OR is_deleted = FALSE)
   `;
 
-  await runQuery(accessToken, query, [
-    { name: "updated_at", type: "STRING", value: new Date().toISOString() },
-    { name: "user_id", type: "STRING", value: userId },
-    { name: "session_id", type: "STRING", value: sessionId },
-    { name: "created_at", type: "STRING", value: createdAtIso },
-  ]);
+  try {
+    await runQuery(accessToken, fullQuery, [
+      { name: "updated_at", type: "STRING", value: updatedAt },
+      { name: "user_id", type: "STRING", value: userId },
+      { name: "chat_id", type: "STRING", value: chatId },
+      { name: "created_at", type: "STRING", value: createdAtIso },
+    ]);
+  } catch {
+    const fallbackQuery = `
+      UPDATE \`${messagesTable}\`
+      SET
+        is_deleted = TRUE,
+        updated_at = @updated_at
+      WHERE user_id = @user_id
+        AND session_id = @chat_id
+        AND SAFE_CAST(created_at AS TIMESTAMP) >= SAFE_CAST(@created_at AS TIMESTAMP)
+        AND (is_deleted IS NULL OR is_deleted = FALSE)
+    `;
+
+    await runQuery(accessToken, fallbackQuery, [
+      { name: "updated_at", type: "STRING", value: updatedAt },
+      { name: "user_id", type: "STRING", value: userId },
+      { name: "chat_id", type: "STRING", value: chatId },
+      { name: "created_at", type: "STRING", value: createdAtIso },
+    ]);
+  }
 }
 
 export async function softDeleteSessionMessages(
   accessToken: string,
   userId: string,
-  sessionId: string
+  chatId: string
 ) {
   const messagesTable = getMessagesTableRef();
-  const query = `
+  const updatedAt = new Date().toISOString();
+  const fullQuery = `
     UPDATE \`${messagesTable}\`
     SET
       is_deleted = TRUE,
       updated_at = @updated_at
     WHERE user_id = @user_id
-      AND session_id = @session_id
+      AND (chat_id = @chat_id OR (chat_id IS NULL AND session_id = @chat_id))
       AND (is_deleted IS NULL OR is_deleted = FALSE)
   `;
 
-  await runQuery(accessToken, query, [
-    { name: "updated_at", type: "STRING", value: new Date().toISOString() },
-    { name: "user_id", type: "STRING", value: userId },
-    { name: "session_id", type: "STRING", value: sessionId },
-  ]);
+  try {
+    await runQuery(accessToken, fullQuery, [
+      { name: "updated_at", type: "STRING", value: updatedAt },
+      { name: "user_id", type: "STRING", value: userId },
+      { name: "chat_id", type: "STRING", value: chatId },
+    ]);
+  } catch {
+    const fallbackQuery = `
+      UPDATE \`${messagesTable}\`
+      SET
+        is_deleted = TRUE,
+        updated_at = @updated_at
+      WHERE user_id = @user_id
+        AND session_id = @chat_id
+        AND (is_deleted IS NULL OR is_deleted = FALSE)
+    `;
+
+    await runQuery(accessToken, fallbackQuery, [
+      { name: "updated_at", type: "STRING", value: updatedAt },
+      { name: "user_id", type: "STRING", value: userId },
+      { name: "chat_id", type: "STRING", value: chatId },
+    ]);
+  }
 }
 
 export async function countUserMessagesSince(
