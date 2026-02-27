@@ -60,6 +60,8 @@ import { type PostRequestBody, postRequestBodySchema } from "./schema";
 export const maxDuration = 300;
 const DEFAULT_AGENT_ENGINE_MAX_INLINE_FILE_BYTES = 5 * 1024 * 1024;
 const AGENT_ENGINE_SESSION_RECOVERY_ATTEMPTS = 1;
+const AGENT_ENGINE_EMPTY_RESPONSE_FALLBACK_MESSAGE =
+  "Nao foi possivel obter resposta do Scheffer Agent Engine nesta tentativa. Tente novamente em alguns instantes.";
 const AGENT_ENGINE_INLINE_XLSX_MIME_TYPE =
   "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
 const agentSessionRefreshLocks = new Map<string, Promise<string>>();
@@ -940,7 +942,43 @@ export async function POST(request: Request) {
             ) {
               try {
                 await streamAgentEngineResponse(activeProviderSessionId);
-                break;
+
+                if (hasVisibleOutput) {
+                  break;
+                }
+
+                const canRetryEmptyResponse =
+                  attempt < AGENT_ENGINE_SESSION_RECOVERY_ATTEMPTS;
+                if (!canRetryEmptyResponse) {
+                  break;
+                }
+
+                resetExtractedContext(extractedContext);
+                const previousProviderSessionId = activeProviderSessionId;
+                activeProviderSessionId =
+                  await refreshAgentEngineProviderSession({
+                    chatId: id,
+                    userId: bigQueryUserId,
+                    previousSessionId: activeProviderSessionId,
+                    requestId,
+                    modelId: selectedChatModel,
+                  });
+                providerSessionId = activeProviderSessionId;
+                providerSessionIdForPersistence = activeProviderSessionId;
+
+                logAgentEngineEvent("warn", {
+                  event: "provider_session_rotated",
+                  request_id: requestId,
+                  chat_id: id,
+                  session_id: activeProviderSessionId,
+                  previous_session_id: previousProviderSessionId,
+                  user_id: bigQueryUserId,
+                  model_id: selectedChatModel,
+                  attempt: attempt + 1,
+                  reason: "Vertex AI returned an empty response",
+                });
+
+                continue;
               } catch (error) {
                 const canRecoverSession =
                   attempt < AGENT_ENGINE_SESSION_RECOVERY_ATTEMPTS &&
@@ -991,9 +1029,28 @@ export async function POST(request: Request) {
             }
 
             if (!hasVisibleOutput) {
-              throw new Error(
-                "Scheffer Agente Engine retornou resposta vazia."
-              );
+              resetExtractedContext(extractedContext);
+
+              dataStream.write({
+                type: "text-delta",
+                id: textPartId,
+                delta: AGENT_ENGINE_EMPTY_RESPONSE_FALLBACK_MESSAGE,
+              });
+
+              if (firstDeltaAtMs === null) {
+                firstDeltaAtMs = Date.now();
+              }
+
+              hasVisibleOutput = true;
+
+              logAgentEngineEvent("warn", {
+                event: "vertex_empty_response_fallback",
+                request_id: requestId,
+                chat_id: id,
+                session_id: activeProviderSessionId,
+                user_id: bigQueryUserId,
+                model_id: selectedChatModel,
+              });
             }
 
             if (extractedContext.chartSpecs.length > 1) {
@@ -1008,7 +1065,9 @@ export async function POST(request: Request) {
                 type: "data-chart-spec",
                 data: extractedContext.chartSpec,
               });
-            } else if (extractedContext.chartError) {
+            }
+
+            if (extractedContext.chartError) {
               const normalizedChartError = extractedContext.chartError
                 .replace(/\s+/g, " ")
                 .trim()

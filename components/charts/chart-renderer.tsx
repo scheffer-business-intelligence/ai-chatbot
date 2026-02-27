@@ -15,7 +15,6 @@ import {
   AreaChart,
   Bar,
   BarChart,
-  Brush,
   CartesianGrid,
   Cell,
   LabelList,
@@ -506,29 +505,6 @@ function SeriesLegend({
   );
 }
 
-function getBrushRange(
-  range: { startIndex?: number; endIndex?: number } | null | undefined,
-  total: number
-): ZoomRange | null {
-  if (
-    !range ||
-    range.startIndex === undefined ||
-    range.endIndex === undefined ||
-    total <= 0
-  ) {
-    return null;
-  }
-
-  const startIndex = Math.max(0, Math.min(range.startIndex, total - 1));
-  const endIndex = Math.max(startIndex, Math.min(range.endIndex, total - 1));
-
-  if (startIndex === 0 && endIndex === total - 1) {
-    return null;
-  }
-
-  return { startIndex, endIndex };
-}
-
 function ChartViewport({
   model,
   expanded,
@@ -632,12 +608,6 @@ function ChartViewport({
     );
   }
 
-  const totalPoints = model.rows.length;
-  const startIndex = zoomRange?.startIndex ?? 0;
-  const endIndex = zoomRange?.endIndex ?? Math.max(0, totalPoints - 1);
-
-  const brushEnabled = totalPoints > 6;
-
   return (
     <div ref={chartContainerRef}>
       <div className={cn("h-[340px] w-full", expanded && "h-[520px]")}>
@@ -709,19 +679,6 @@ function ChartViewport({
                 </Bar>
               ))}
 
-              {brushEnabled && (
-                <Brush
-                  dataKey="x"
-                  endIndex={endIndex}
-                  height={24}
-                  onChange={(range) =>
-                    onZoomRangeChange(getBrushRange(range, totalPoints))
-                  }
-                  startIndex={startIndex}
-                  stroke="#94a3b8"
-                  travellerWidth={10}
-                />
-              )}
             </BarChart>
           ) : model.chartType === "line" ? (
             <LineChart
@@ -784,19 +741,6 @@ function ChartViewport({
                 />
               ))}
 
-              {brushEnabled && (
-                <Brush
-                  dataKey="x"
-                  endIndex={endIndex}
-                  height={24}
-                  onChange={(range) =>
-                    onZoomRangeChange(getBrushRange(range, totalPoints))
-                  }
-                  startIndex={startIndex}
-                  stroke="#94a3b8"
-                  travellerWidth={10}
-                />
-              )}
             </LineChart>
           ) : (
             <AreaChart
@@ -860,19 +804,6 @@ function ChartViewport({
                 />
               ))}
 
-              {brushEnabled && (
-                <Brush
-                  dataKey="x"
-                  endIndex={endIndex}
-                  height={24}
-                  onChange={(range) =>
-                    onZoomRangeChange(getBrushRange(range, totalPoints))
-                  }
-                  startIndex={startIndex}
-                  stroke="#94a3b8"
-                  travellerWidth={10}
-                />
-              )}
             </AreaChart>
           )}
         </ResponsiveContainer>

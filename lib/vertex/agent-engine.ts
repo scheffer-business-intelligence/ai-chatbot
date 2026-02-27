@@ -1,5 +1,8 @@
 import {
-  inferChartSpecFromTableText,
+  inferChartSpecsFromTableText,
+  inferChartSpecsFromContextSheets,
+  inferChartSpecsFromInlineSeriesText,
+  inferChartSpecsFromBulletListText,
   parseChartContextFromText,
 } from "@/lib/charts/context";
 import type { ChartSpecV1 } from "@/lib/charts/schema";
@@ -1061,6 +1064,117 @@ function extractVisibleDelta(
   };
 }
 
+type ChartResolutionSource =
+  | "chart_context"
+  | "bq_context_fallback"
+  | "markdown_table_fallback"
+  | "inline_text_fallback"
+  | "bullet_list_fallback"
+  | "none";
+
+const CHART_FALLBACK_MISSING_CONTEXT_WARNING =
+  "Nao foi possivel montar o grafico automaticamente: resposta sem CHART_CONTEXT valido ou dados estruturados suficientes.";
+
+function setResolvedChartSpecs(
+  extractedContext: VertexExtractedContext,
+  specs: ChartSpecV1[]
+) {
+  extractedContext.chartSpecs = specs;
+  extractedContext.chartSpec = specs[0] ?? null;
+  extractedContext.chartError = null;
+}
+
+function resolveChartFromFallbacks(
+  visibleText: string,
+  extractedContext: VertexExtractedContext
+): ChartResolutionSource {
+  if (extractedContext.chartSpecs.length > 0) {
+    extractedContext.chartSpec = extractedContext.chartSpecs[0] ?? null;
+    return "chart_context";
+  }
+
+  const inferredFromSheets = inferChartSpecsFromContextSheets(
+    extractedContext.contextSheets
+  );
+  if (inferredFromSheets.length > 0) {
+    setResolvedChartSpecs(extractedContext, inferredFromSheets);
+    return "bq_context_fallback";
+  }
+
+  const inferredFromTable = inferChartSpecsFromTableText(visibleText);
+  if (inferredFromTable.length > 0) {
+    setResolvedChartSpecs(extractedContext, inferredFromTable);
+    return "markdown_table_fallback";
+  }
+
+  const inferredFromInline = inferChartSpecsFromInlineSeriesText(visibleText);
+  if (inferredFromInline.length > 0) {
+    setResolvedChartSpecs(extractedContext, inferredFromInline);
+    return "inline_text_fallback";
+  }
+
+  const inferredFromBulletList = inferChartSpecsFromBulletListText(visibleText);
+  if (inferredFromBulletList.length > 0) {
+    setResolvedChartSpecs(extractedContext, inferredFromBulletList);
+    return "bullet_list_fallback";
+  }
+
+  return "none";
+}
+
+function applyChartResolution({
+  allowFallback,
+  visibleText,
+  extractedContext,
+}: {
+  allowFallback: boolean;
+  visibleText: string;
+  extractedContext?: VertexExtractedContext;
+}): ChartResolutionSource {
+  if (!extractedContext) {
+    return "none";
+  }
+
+  let resolutionSource: ChartResolutionSource = "none";
+
+  if (extractedContext.chartSpecs.length > 0) {
+    extractedContext.chartSpec = extractedContext.chartSpecs[0] ?? null;
+    resolutionSource = "chart_context";
+  } else if (allowFallback) {
+    resolutionSource = resolveChartFromFallbacks(visibleText, extractedContext);
+  }
+
+  if (
+    allowFallback &&
+    resolutionSource === "none" &&
+    extractedContext.chartSpecs.length === 0 &&
+    !extractedContext.chartError
+  ) {
+    extractedContext.chartError = CHART_FALLBACK_MISSING_CONTEXT_WARNING;
+  }
+
+  const shouldLogChartResolution =
+    extractedContext.hasChartContext ||
+    allowFallback ||
+    extractedContext.chartSpecs.length > 0 ||
+    Boolean(extractedContext.chartError);
+
+  if (shouldLogChartResolution) {
+    console.info("[agent-engine] chart_resolution", {
+      source: resolutionSource,
+      allow_fallback: allowFallback,
+      visible_text_length: visibleText.length,
+      visible_text_sample: visibleText.slice(0, 800),
+      has_chart_context: extractedContext.hasChartContext,
+      chart_specs_count: extractedContext.chartSpecs.length,
+      context_sheets_count: extractedContext.contextSheets.length,
+      has_chart_error: Boolean(extractedContext.chartError),
+    });
+  }
+
+  return resolutionSource;
+}
+
 export async function* streamVertexQuery({
   accessToken,
   sessionId,
@@ -1205,22 +1319,11 @@ export async function* streamVertexQuery({
     }
 
     writeExtractedContext(accumulatedRawText);
-
-    if (
-      allowTableChartFallback &&
-      extractedContext &&
-      extractedContext.chartSpecs.length === 0
-    ) {
-      const inferredChartSpec = inferChartSpecFromTableText(
-        accumulatedVisibleText
-      );
-      if (inferredChartSpec) {
-        extractedContext.chartSpec = inferredChartSpec;
-        extractedContext.chartSpecs = [inferredChartSpec];
-        extractedContext.chartError = null;
-        extractedContext.hasChartContext = true;
-      }
-    }
+    applyChartResolution({
+      allowFallback: allowTableChartFallback,
+      visibleText: accumulatedVisibleText,
+      extractedContext,
+    });
 
     if (!accumulatedVisibleText.trim()) {
       throw new Error("Vertex AI returned an empty response");
@@ -1272,22 +1375,11 @@ export async function* streamVertexQuery({
   }
 
   writeExtractedContext(accumulatedRawText);
-
-  if (
-    allowTableChartFallback &&
-    extractedContext &&
-    extractedContext.chartSpecs.length === 0
-  ) {
-    const inferredChartSpec = inferChartSpecFromTableText(
-      accumulatedVisibleText
-    );
-    if (inferredChartSpec) {
-      extractedContext.chartSpec = inferredChartSpec;
-      extractedContext.chartSpecs = [inferredChartSpec];
-      extractedContext.chartError = null;
-      extractedContext.hasChartContext = true;
-    }
-  }
+  applyChartResolution({
+    allowFallback: allowTableChartFallback,
+    visibleText: accumulatedVisibleText,
+    extractedContext,
+  });
 
   if (!accumulatedVisibleText.trim()) {
     if (rawSamples.length > 0) {

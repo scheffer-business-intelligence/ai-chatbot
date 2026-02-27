@@ -564,7 +564,7 @@ export function Chat({
 
               <div className="rounded-md border bg-background p-3 text-sm">
                 <div className="mb-2 font-semibold">
-                  Recomendacao com Gemini Pro
+                  Recomendação com Gemini Pro
                 </div>
 
                 {agentEngineAnalysisStatus === "loading" && (

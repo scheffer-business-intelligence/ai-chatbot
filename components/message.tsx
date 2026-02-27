@@ -1,6 +1,10 @@
 "use client";
 import type { UseChatHelpers } from "@ai-sdk/react";
-import { useState } from "react";
+import { type ImgHTMLAttributes, useMemo, useState } from "react";
+import {
+  containsAllowedChartImageMarkdown,
+  isAllowedChartImageUrl,
+} from "@/lib/charts/image-fallback";
 import { useDataStream } from "@/components/data-stream-provider";
 import {
   DATA_FROM_CONTEXT_MARKER,
@@ -10,6 +14,7 @@ import {
 } from "@/lib/export-context";
 import type { ChatMessage } from "@/lib/types";
 import { cn, sanitizeText } from "@/lib/utils";
+import { ChartImageCard } from "./charts/chart-image-card";
 import { ChartRenderer } from "./charts/chart-renderer";
 import { DocumentPreview } from "./document-preview";
 import { MessageContent } from "./elements/message";
@@ -102,6 +107,25 @@ const PurePreviewMessage = ({
       : null) ??
     message.metadata?.chartError ??
     null;
+  const hasChartImageFallback = useMemo(() => {
+    if (message.role !== "assistant" || chartSpecs.length > 0) {
+      return false;
+    }
+
+    return (
+      message.parts.some((part) => {
+        if (part.type !== "text") {
+          return false;
+        }
+
+        const parsedText = parseExportAwareText(part.text);
+        const visibleText = sanitizeText(parsedText.cleanText);
+
+        return containsAllowedChartImageMarkdown(visibleText);
+      }) ?? false
+    );
+  }, [chartSpecs.length, message.parts, message.role]);
+  const resolvedChartWarning = hasChartImageFallback ? null : chartWarning;
   const exportContextSheetsFromParts = extractContextSheets(
     exportContextFromParts
   );
@@ -119,6 +143,51 @@ const PurePreviewMessage = ({
               : "Baixar os dados desta resposta em Excel.",
         }
       : null;
+  const responseComponents = useMemo(() => {
+    if (!hasChartImageFallback || message.role !== "assistant") {
+      return undefined;
+    }
+
+    return {
+      img: ({
+        alt,
+        className,
+        src,
+        ...props
+      }: ImgHTMLAttributes<HTMLImageElement>) => {
+        const imageSrc = typeof src === "string" ? src : "";
+
+        if (!imageSrc) {
+          return null;
+        }
+
+        if (!isAllowedChartImageUrl(imageSrc)) {
+          return (
+            // biome-ignore lint/performance/noImgElement: markdown image rendering
+            <img
+              {...props}
+              alt={typeof alt === "string" ? alt : ""}
+              className={cn("max-w-full rounded-lg", className)}
+              src={imageSrc}
+            />
+          );
+        }
+
+        const title =
+          typeof alt === "string" && alt.trim().length > 0
+            ? alt.trim()
+            : "Grafico";
+
+        return (
+          <ChartImageCard
+            alt={typeof alt === "string" ? alt : undefined}
+            src={imageSrc}
+            title={title}
+          />
+        );
+      },
+    };
+  }, [hasChartImageFallback, message.role]);
   const hasTextOrExportParts =
     message.parts?.some((part) => {
       if (part.type !== "text") {
@@ -148,7 +217,7 @@ const PurePreviewMessage = ({
     message.role !== "assistant" ||
     attachmentsFromMessage.length > 0 ||
     chartSpecs.length > 0 ||
-    typeof chartWarning === "string" ||
+    typeof resolvedChartWarning === "string" ||
     message.parts.some((part) => {
       if (part.type === "text") {
         const parsedText = parseExportAwareText(part.text);
@@ -180,10 +249,13 @@ const PurePreviewMessage = ({
 
       if (
         part.type === "data-chart-spec" ||
-        part.type === "data-chart-specs" ||
-        part.type === "data-chart-warning"
+        part.type === "data-chart-specs"
       ) {
         return true;
+      }
+
+      if (part.type === "data-chart-warning") {
+        return !hasChartImageFallback;
       }
 
       if (part.type === "data-export-context") {
@@ -229,7 +301,7 @@ const PurePreviewMessage = ({
                 (hasTextOrExportParts ||
                   message.parts?.some((p) => p.type.startsWith("tool-")) ||
                   chartSpecs.length > 0 ||
-                  typeof chartWarning === "string")) ||
+                  typeof resolvedChartWarning === "string")) ||
               mode === "edit",
             "w-fit max-w-[calc(100%-2.5rem)] sm:max-w-[80%]":
               message.role === "user" && mode !== "edit",
@@ -320,7 +392,10 @@ const PurePreviewMessage = ({
                             : undefined
                         }
                       >
-                        <Response mode={isLoading ? "streaming" : "static"}>
+                        <Response
+                          components={responseComponents}
+                          mode={isLoading ? "streaming" : "static"}
+                        >
                           {visibleText}
                         </Response>
                       </MessageContent>
@@ -505,13 +580,16 @@ const PurePreviewMessage = ({
                 {chartSpecs.map((chartSpec, index) => (
                   <ChartRenderer
                     chartSpec={chartSpec}
-                    chartWarning={index === 0 ? chartWarning : null}
+                    chartWarning={index === 0 ? resolvedChartWarning : null}
                     key={`chart-${message.id}-${index}`}
                   />
                 ))}
               </div>
             ) : (
-              <ChartRenderer chartSpec={null} chartWarning={chartWarning} />
+              <ChartRenderer
+                chartSpec={null}
+                chartWarning={resolvedChartWarning}
+              />
             ))}
 
           {!isReadonly && (
