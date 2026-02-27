@@ -469,7 +469,7 @@ function PureAttachmentsButton({
 
   return (
     <Button
-      className="aspect-square h-8 rounded-lg p-1 transition-colors hover:bg-accent"
+      className="aspect-square h-8 cursor-pointer rounded-lg p-1 transition-colors hover:bg-accent"
       data-testid="attachments-button"
       disabled={status !== "ready" || isReasoningModel}
       onClick={(event) => {
@@ -512,7 +512,10 @@ function PureModelSelectorCompact({
   return (
     <ModelSelector onOpenChange={setOpen} open={open}>
       <ModelSelectorTrigger asChild>
-        <Button className="h-8 w-[200px] justify-between px-2" variant="ghost">
+        <Button
+          className="h-8 w-[200px] cursor-pointer justify-between px-2"
+          variant="ghost"
+        >
           {provider && <ModelSelectorLogo provider={provider} />}
           <ModelSelectorName>{selectedModel.name}</ModelSelectorName>
         </Button>
@@ -530,6 +533,7 @@ function PureModelSelectorCompact({
                   const logoProvider = model.id.split("/")[0];
                   return (
                     <ModelSelectorItem
+                      className="cursor-pointer"
                       key={model.id}
                       onSelect={() => {
                         onModelChange?.(model.id);
