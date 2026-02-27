@@ -84,6 +84,7 @@ function logAgentEngineEvent(
 
 function resetExtractedContext(context: VertexExtractedContext) {
   context.chartSpec = null;
+  context.chartSpecs = [];
   context.chartError = null;
   context.hasChartContext = false;
   context.contextSheets = [];
@@ -571,6 +572,7 @@ export async function POST(request: Request) {
 
     const extractedContext: VertexExtractedContext = {
       chartSpec: null,
+      chartSpecs: [],
       chartError: null,
       hasChartContext: false,
       contextSheets: [],
@@ -988,6 +990,13 @@ export async function POST(request: Request) {
               throw new Error(
                 "Scheffer Agente Engine retornou resposta vazia."
               );
+            }
+
+            if (extractedContext.chartSpecs.length > 1) {
+              dataStream.write({
+                type: "data-chart-specs",
+                data: extractedContext.chartSpecs,
+              });
             }
 
             if (extractedContext.chartSpec) {

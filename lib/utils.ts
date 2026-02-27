@@ -127,16 +127,86 @@ export function sanitizeText(text: string) {
     return value.slice(0, value.length - partialLength);
   };
 
-  const withoutContextBlocks = text
-    .replace(/\[BQ_CONTEXT\][\s\S]*?\[\/BQ_CONTEXT\]/g, '')
-    .replace(/\[BQ_CONTEXT\][\s\S]*$/g, '')
-    .replace(/\[\/BQ_CONTEXT\]/g, '')
-    .replace(/\[CHART_CONTEXT\][\s\S]*?\[\/CHART_CONTEXT\]/g, '')
-    .replace(/\[CHART_CONTEXT\][\s\S]*$/g, '')
-    .replace(/\[\/CHART_CONTEXT\]/g, '')
-    .replace(/\[CHART\][\s\S]*?\[\/CHART\]/g, '')
-    .replace(/\[CHART\][\s\S]*$/g, '')
-    .replace(/\[\/CHART\]/g, '');
+  const escapeForRegex = (value: string) =>
+    value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+  const stripContextBlock = (value: string, tagName: string) => {
+    const escapedTag = escapeForRegex(tagName);
+    const blockRegex = new RegExp(
+      `(?:\\[\\s*${escapedTag}\\s*\\]|${escapedTag}\\])[\\s\\S]*?\\[\\s*\\/\\s*${escapedTag}\\s*\\]`,
+      'gi',
+    );
+    const danglingOpenRegex = new RegExp(
+      `(?:\\[\\s*${escapedTag}\\s*\\]|${escapedTag}\\])[\\s\\S]*$`,
+      'i',
+    );
+
+    const cleaned = value.replace(blockRegex, '');
+    const withoutDanglingOpen = cleaned.replace(danglingOpenRegex, '');
+
+    return withoutDanglingOpen.replace(
+      new RegExp(`\\[\\s*\\/\\s*${escapedTag}\\s*\\]`, 'gi'),
+      '',
+    );
+  };
+
+  const stripContextPayloadByClosingTag = (
+    value: string,
+    tagName: string,
+    payloadKey: string,
+  ) => {
+    const escapedTag = escapeForRegex(tagName);
+    const closingRegex = new RegExp(`\\[\\s*\\/\\s*${escapedTag}\\s*\\]`, 'i');
+    const closingMatch = closingRegex.exec(value);
+
+    if (!closingMatch) {
+      return value;
+    }
+
+    const beforeClose = value.slice(0, closingMatch.index);
+    const afterClose = value.slice(closingMatch.index + closingMatch[0].length);
+    const openTagRegex = new RegExp(
+      `(?:\\[\\s*${escapedTag}\\s*\\]|${escapedTag}\\])`,
+      'i',
+    );
+
+    if (openTagRegex.test(beforeClose)) {
+      return value;
+    }
+
+    const payloadIndex = beforeClose.lastIndexOf(payloadKey);
+    if (payloadIndex === -1) {
+      return value;
+    }
+
+    const braceIndex = beforeClose.lastIndexOf('{', payloadIndex);
+    const cutIndex = braceIndex !== -1 ? braceIndex : payloadIndex;
+
+    return `${beforeClose.slice(0, cutIndex)}${afterClose}`.trimEnd();
+  };
+
+  let withoutContextBlocks = text;
+  withoutContextBlocks = stripContextPayloadByClosingTag(
+    withoutContextBlocks,
+    'BQ_CONTEXT',
+    '"query"',
+  );
+  withoutContextBlocks = stripContextPayloadByClosingTag(
+    withoutContextBlocks,
+    'CHART_CONTEXT',
+    '"type"',
+  );
+  withoutContextBlocks = stripContextPayloadByClosingTag(
+    withoutContextBlocks,
+    'CHART',
+    '"type"',
+  );
+  withoutContextBlocks = stripContextBlock(withoutContextBlocks, 'BQ_CONTEXT');
+  withoutContextBlocks = stripContextBlock(
+    withoutContextBlocks,
+    'CHART_CONTEXT',
+  );
+  withoutContextBlocks = stripContextBlock(withoutContextBlocks, 'CHART');
 
   return stripTrailingPartialTag(
     stripTrailingPartialTag(

@@ -73,7 +73,9 @@ function extractContextBlock(
 export type ParsedChartContext = {
   cleanText: string;
   chartSpec: ChartSpecV1 | null;
+  chartSpecs: ChartSpecV1[];
   chartError: string | null;
+  chartErrorDetails: string | null;
   hasChartContext: boolean;
 };
 
@@ -314,18 +316,20 @@ function tryParseChartPayload(payload: string): unknown {
       // Try the next candidate.
     }
 
-    const firstBraceIndex = candidate.indexOf("{");
-    const lastBraceIndex = candidate.lastIndexOf("}");
+    const sliceStrategies: Array<{ open: string; close: string }> = [
+      { open: "{", close: "}" },
+      { open: "[", close: "]" },
+    ];
 
-    if (
-      firstBraceIndex >= 0 &&
-      lastBraceIndex > firstBraceIndex &&
-      lastBraceIndex < candidate.length
-    ) {
-      const jsonSlice = candidate
-        .slice(firstBraceIndex, lastBraceIndex + 1)
-        .trim();
+    for (const { open, close } of sliceStrategies) {
+      const firstIndex = candidate.indexOf(open);
+      const lastIndex = candidate.lastIndexOf(close);
 
+      if (firstIndex < 0 || lastIndex <= firstIndex) {
+        continue;
+      }
+
+      const jsonSlice = candidate.slice(firstIndex, lastIndex + 1).trim();
       if (!jsonSlice) {
         continue;
       }
@@ -339,6 +343,144 @@ function tryParseChartPayload(payload: string): unknown {
   }
 
   throw new Error("JSON invalido no bloco de grafico");
+}
+
+const GENERIC_CHART_WARNING =
+  "Nao foi possivel montar o grafico desta resposta.";
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function looksLikeChartSpecCandidate(value: Record<string, unknown>): boolean {
+  const chartSpecHints = [
+    "type",
+    "data",
+    "xKey",
+    "yKey",
+    "seriesKey",
+    "series",
+    "nameKey",
+    "valueKey",
+  ];
+
+  return chartSpecHints.some((hint) => hint in value);
+}
+
+function collectChartSpecCandidates(root: unknown): unknown[] {
+  const queue: unknown[] = [root];
+  const visited = new Set<object>();
+  const candidates: unknown[] = [];
+
+  const wrapperKeys = [
+    "chart",
+    "chartSpec",
+    "chart_spec",
+    "spec",
+    "charts",
+    "chartSpecs",
+    "chartContext",
+    "chart_context",
+    "payload",
+    "result",
+    "output",
+  ];
+
+  while (queue.length > 0) {
+    const current = queue.shift();
+    if (current === null || current === undefined) {
+      continue;
+    }
+
+    if (typeof current === "string") {
+      const trimmed = current.trim();
+      if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+        try {
+          queue.push(JSON.parse(trimmed));
+        } catch {
+          // Ignore invalid JSON fragments.
+        }
+      }
+      continue;
+    }
+
+    if (Array.isArray(current)) {
+      queue.push(...current);
+      continue;
+    }
+
+    if (!isRecord(current)) {
+      continue;
+    }
+
+    if (visited.has(current)) {
+      continue;
+    }
+
+    visited.add(current);
+
+    if (looksLikeChartSpecCandidate(current)) {
+      candidates.push(current);
+    }
+
+    for (const key of wrapperKeys) {
+      if (!(key in current)) {
+        continue;
+      }
+
+      queue.push(current[key]);
+    }
+  }
+
+  if (candidates.length === 0 && isRecord(root)) {
+    candidates.push(root);
+  }
+
+  return candidates;
+}
+
+function dedupeChartSpecs(specs: ChartSpecV1[]): ChartSpecV1[] {
+  const seen = new Set<string>();
+  const deduped: ChartSpecV1[] = [];
+
+  for (const spec of specs) {
+    const key = JSON.stringify(spec);
+    if (seen.has(key)) {
+      continue;
+    }
+
+    seen.add(key);
+    deduped.push(spec);
+  }
+
+  return deduped;
+}
+
+function parseChartSpecsFromPayload(payload: unknown): {
+  chartSpecs: ChartSpecV1[];
+  firstIssue: string | null;
+} {
+  const candidates = collectChartSpecCandidates(payload);
+  const chartSpecs: ChartSpecV1[] = [];
+  let firstIssue: string | null = null;
+
+  for (const candidate of candidates) {
+    const validation = chartSpecSchema.safeParse(candidate);
+
+    if (validation.success) {
+      chartSpecs.push(validation.data);
+      continue;
+    }
+
+    if (!firstIssue) {
+      firstIssue = validation.error.issues[0]?.message ?? "schema invalido";
+    }
+  }
+
+  return {
+    chartSpecs: dedupeChartSpecs(chartSpecs),
+    firstIssue,
+  };
 }
 
 export function parseChartContextFromText(text: string): ParsedChartContext {
@@ -355,7 +497,9 @@ export function parseChartContextFromText(text: string): ParsedChartContext {
     return {
       cleanText: cleanedText,
       chartSpec: null,
+      chartSpecs: [],
       chartError: null,
+      chartErrorDetails: null,
       hasChartContext: false,
     };
   }
@@ -364,7 +508,9 @@ export function parseChartContextFromText(text: string): ParsedChartContext {
     return {
       cleanText: cleanedText,
       chartSpec: null,
+      chartSpecs: [],
       chartError: "Bloco de grafico incompleto.",
+      chartErrorDetails: "Bloco de grafico incompleto.",
       hasChartContext: true,
     };
   }
@@ -378,27 +524,31 @@ export function parseChartContextFromText(text: string): ParsedChartContext {
     return {
       cleanText: cleanedText,
       chartSpec: null,
-      chartError: `Nao foi possivel interpretar bloco de grafico: ${message}`,
+      chartSpecs: [],
+      chartError: GENERIC_CHART_WARNING,
+      chartErrorDetails: `Nao foi possivel interpretar bloco de grafico: ${message}`,
       hasChartContext: true,
     };
   }
 
-  const validation = chartSpecSchema.safeParse(parsedPayload);
-
-  if (!validation.success) {
-    const firstIssue = validation.error.issues[0];
+  const parsedSpecs = parseChartSpecsFromPayload(parsedPayload);
+  if (parsedSpecs.chartSpecs.length === 0) {
     return {
       cleanText: cleanedText,
       chartSpec: null,
-      chartError: `CHART_CONTEXT invalido: ${firstIssue?.message ?? "schema invalido"}`,
+      chartSpecs: [],
+      chartError: GENERIC_CHART_WARNING,
+      chartErrorDetails: `CHART_CONTEXT invalido: ${parsedSpecs.firstIssue ?? "schema invalido"}`,
       hasChartContext: true,
     };
   }
 
   return {
     cleanText: cleanedText,
-    chartSpec: validation.data,
+    chartSpec: parsedSpecs.chartSpecs[0] ?? null,
+    chartSpecs: parsedSpecs.chartSpecs,
     chartError: null,
+    chartErrorDetails: null,
     hasChartContext: true,
   };
 }

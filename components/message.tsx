@@ -53,6 +53,11 @@ const PurePreviewMessage = ({
   const attachmentsFromMessage = message.parts.filter(
     (part) => part.type === "file"
   );
+  const chartSpecsFromParts = (
+    message.parts.find((part) => part.type === "data-chart-specs") as
+      | { type: "data-chart-specs"; data?: unknown }
+      | undefined
+  )?.data;
   const chartSpecFromParts = (
     message.parts.find((part) => part.type === "data-chart-spec") as
       | { type: "data-chart-spec"; data?: unknown }
@@ -76,7 +81,21 @@ const PurePreviewMessage = ({
         }
       | undefined
   )?.data;
-  const chartSpec = chartSpecFromParts ?? message.metadata?.chartSpec ?? null;
+  const chartSpecs =
+    Array.isArray(chartSpecsFromParts) && chartSpecsFromParts.length > 0
+      ? chartSpecsFromParts.filter(
+          (item): item is Record<string, unknown> =>
+            typeof item === "object" && item !== null
+        )
+      : chartSpecFromParts &&
+          typeof chartSpecFromParts === "object" &&
+          chartSpecFromParts !== null
+        ? [chartSpecFromParts as Record<string, unknown>]
+        : message.metadata?.chartSpec &&
+            typeof message.metadata.chartSpec === "object" &&
+            message.metadata.chartSpec !== null
+          ? [message.metadata.chartSpec as Record<string, unknown>]
+          : [];
   const chartWarning =
     (typeof chartWarningFromParts === "string"
       ? chartWarningFromParts
@@ -128,7 +147,7 @@ const PurePreviewMessage = ({
   const hasVisibleAssistantContent =
     message.role !== "assistant" ||
     attachmentsFromMessage.length > 0 ||
-    chartSpec !== null ||
+    chartSpecs.length > 0 ||
     typeof chartWarning === "string" ||
     message.parts.some((part) => {
       if (part.type === "text") {
@@ -161,6 +180,7 @@ const PurePreviewMessage = ({
 
       if (
         part.type === "data-chart-spec" ||
+        part.type === "data-chart-specs" ||
         part.type === "data-chart-warning"
       ) {
         return true;
@@ -208,7 +228,7 @@ const PurePreviewMessage = ({
               (message.role === "assistant" &&
                 (hasTextOrExportParts ||
                   message.parts?.some((p) => p.type.startsWith("tool-")) ||
-                  chartSpec !== null ||
+                  chartSpecs.length > 0 ||
                   typeof chartWarning === "string")) ||
               mode === "edit",
             "w-fit max-w-[calc(100%-2.5rem)] sm:max-w-[80%]":
@@ -479,9 +499,20 @@ const PurePreviewMessage = ({
             return null;
           })}
 
-          {message.role === "assistant" && (
-            <ChartRenderer chartSpec={chartSpec} chartWarning={chartWarning} />
-          )}
+          {message.role === "assistant" &&
+            (chartSpecs.length > 0 ? (
+              <div className="flex w-full flex-col gap-3">
+                {chartSpecs.map((chartSpec, index) => (
+                  <ChartRenderer
+                    chartSpec={chartSpec}
+                    chartWarning={index === 0 ? chartWarning : null}
+                    key={`chart-${message.id}-${index}`}
+                  />
+                ))}
+              </div>
+            ) : (
+              <ChartRenderer chartSpec={null} chartWarning={chartWarning} />
+            ))}
 
           {!isReadonly && (
             <MessageActions

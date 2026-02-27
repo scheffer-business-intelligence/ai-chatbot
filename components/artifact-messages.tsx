@@ -109,6 +109,7 @@ function PureArtifactMessages({
 
           if (
             part.type === "data-chart-spec" ||
+            part.type === "data-chart-specs" ||
             part.type === "data-chart-warning"
           ) {
             return true;

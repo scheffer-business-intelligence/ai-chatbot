@@ -17,6 +17,7 @@ export const VERTEX_REASONING_ENGINE =
 
 export type VertexExtractedContext = {
   chartSpec: ChartSpecV1 | null;
+  chartSpecs: ChartSpecV1[];
   chartError: string | null;
   hasChartContext: boolean;
   contextSheets: ExportContextSheet[];
@@ -655,8 +656,43 @@ function stripContextBlock(text: string, tagName: string): string {
   );
 }
 
+function stripContextPayloadByClosingTag(
+  text: string,
+  tagName: string,
+  payloadKey: string
+): string {
+  const tag = tagName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const closingRegex = new RegExp(`\\[\\s*\\/\\s*${tag}\\s*\\]`, "i");
+  const closingMatch = closingRegex.exec(text);
+
+  if (!closingMatch) {
+    return text;
+  }
+
+  const beforeClose = text.slice(0, closingMatch.index);
+  const afterClose = text.slice(closingMatch.index + closingMatch[0].length);
+  const openTagRegex = new RegExp(`(?:\\[\\s*${tag}\\s*\\]|${tag}\\])`, "i");
+
+  if (openTagRegex.test(beforeClose)) {
+    return text;
+  }
+
+  const payloadIndex = beforeClose.lastIndexOf(payloadKey);
+  if (payloadIndex === -1) {
+    return text;
+  }
+
+  const braceIndex = beforeClose.lastIndexOf("{", payloadIndex);
+  const cutIndex = braceIndex !== -1 ? braceIndex : payloadIndex;
+
+  return `${beforeClose.slice(0, cutIndex)}${afterClose}`.trimEnd();
+}
+
 function stripContextBlocksForStream(text: string): string {
-  const withoutBqAndMarkers = sanitizeText(text);
+  let cleaned = stripContextPayloadByClosingTag(text, "BQ_CONTEXT", "\"query\"");
+  cleaned = stripContextPayloadByClosingTag(cleaned, "CHART_CONTEXT", "\"type\"");
+  cleaned = stripContextPayloadByClosingTag(cleaned, "CHART", "\"type\"");
+  const withoutBqAndMarkers = sanitizeText(cleaned);
   return stripContextBlock(
     stripContextBlock(withoutBqAndMarkers, "CHART_CONTEXT"),
     "CHART"
@@ -1112,9 +1148,16 @@ export async function* streamVertexQuery({
     const parsedContext = parseChartContextFromText(rawText);
     const parsedBqContext = parseBqContextFromText(rawText);
     extractedContext.chartSpec = parsedContext.chartSpec;
+    extractedContext.chartSpecs = parsedContext.chartSpecs;
     extractedContext.chartError = parsedContext.chartError;
     extractedContext.hasChartContext = parsedContext.hasChartContext;
     extractedContext.contextSheets = parsedBqContext.contextSheets;
+
+    if (parsedContext.chartErrorDetails) {
+      console.warn("[agent-engine] chart_context_parse_issue", {
+        error: parsedContext.chartErrorDetails,
+      });
+    }
   };
 
   if (!response.body) {
@@ -1166,13 +1209,14 @@ export async function* streamVertexQuery({
     if (
       allowTableChartFallback &&
       extractedContext &&
-      !extractedContext.chartSpec
+      extractedContext.chartSpecs.length === 0
     ) {
       const inferredChartSpec = inferChartSpecFromTableText(
         accumulatedVisibleText
       );
       if (inferredChartSpec) {
         extractedContext.chartSpec = inferredChartSpec;
+        extractedContext.chartSpecs = [inferredChartSpec];
         extractedContext.chartError = null;
         extractedContext.hasChartContext = true;
       }
@@ -1232,13 +1276,14 @@ export async function* streamVertexQuery({
   if (
     allowTableChartFallback &&
     extractedContext &&
-    !extractedContext.chartSpec
+    extractedContext.chartSpecs.length === 0
   ) {
     const inferredChartSpec = inferChartSpecFromTableText(
       accumulatedVisibleText
     );
     if (inferredChartSpec) {
       extractedContext.chartSpec = inferredChartSpec;
+      extractedContext.chartSpecs = [inferredChartSpec];
       extractedContext.chartError = null;
       extractedContext.hasChartContext = true;
     }
