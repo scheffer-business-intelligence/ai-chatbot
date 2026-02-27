@@ -247,3 +247,26 @@ Configure no GitHub (Repository Variables):
 - `GCP_REGION`: `$REGION`
 - `CLOUD_RUN_SERVICE`: `$SERVICE_NAME`
 - `CLOUD_RUN_RUNTIME_SA`: `$RUNTIME_SA_EMAIL`
+- `CLOUD_RUN_MIN_INSTANCES` (opcional): ex. `1`
+- `CLOUD_RUN_CONCURRENCY` (opcional): ex. `40`
+
+## 9) Tuning de latencia no Cloud Run (recomendado)
+
+Para reduzir cold start e variacao de latencia (p95), ajuste a revisao com:
+
+```fish
+gcloud run services update "$SERVICE_NAME" \
+  --project="$PROJECT_ID" \
+  --region="$REGION" \
+  --min-instances=1 \
+  --concurrency=40
+```
+
+Se ainda houver variacao alta no p95, teste:
+
+```fish
+gcloud run services update "$SERVICE_NAME" \
+  --project="$PROJECT_ID" \
+  --region="$REGION" \
+  --min-instances=2
+```

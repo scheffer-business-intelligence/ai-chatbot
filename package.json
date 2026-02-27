@@ -16,7 +16,8 @@
     "db:pull": "drizzle-kit pull",
     "db:check": "drizzle-kit check",
     "db:up": "drizzle-kit up",
-    "test": "export PLAYWRIGHT=True && pnpm exec playwright test"
+    "test": "export PLAYWRIGHT=True && pnpm exec playwright test",
+    "bench:chat-latency": "node scripts/bench/chat-latency.mjs"
   },
   "dependencies": {
     "@ai-sdk/gateway": "^3.0.15",

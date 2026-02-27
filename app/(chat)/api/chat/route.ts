@@ -441,6 +441,7 @@ export async function POST(request: Request) {
     const { id, message, messages, selectedChatModel } = requestBody;
     const requestStartedAtMs = Date.now();
     const chatVisibility = "private" as const;
+    const isAgentEngineRequest = isAgentEngineModel(selectedChatModel);
 
     const session = await auth();
 
@@ -461,27 +462,26 @@ export async function POST(request: Request) {
 
     const userType: UserType = session.user.type;
 
-    const messageCount = await countRecentUserMessages({
-      userId: bigQueryUserId,
-      fallbackUserId: fallbackBigQueryUserId,
-      differenceInHours: 24,
-    });
+    const [messageCount, chat] = await Promise.all([
+      countRecentUserMessages({
+        userId: bigQueryUserId,
+        fallbackUserId: fallbackBigQueryUserId,
+        differenceInHours: 24,
+      }),
+      getChatById({ id }).catch((error) => {
+        console.warn(
+          "Failed to resolve chat by id before handling request, proceeding as new chat:",
+          error
+        );
+        return null;
+      }),
+    ]);
 
     if (messageCount > entitlementsByUserType[userType].maxMessagesPerDay) {
       return new ChatSDKError("rate_limit:chat").toResponse();
     }
 
     const isToolApprovalFlow = Boolean(messages);
-
-    let chat: Awaited<ReturnType<typeof getChatById>> = null;
-    try {
-      chat = await getChatById({ id });
-    } catch (error) {
-      console.warn(
-        "Failed to resolve chat by id before handling request, proceeding as new chat:",
-        error
-      );
-    }
     let messageHistory: ChatMessage[] = [];
     let titlePromise: Promise<string> | null = null;
 
@@ -489,7 +489,7 @@ export async function POST(request: Request) {
       if (!chatOwnerIds.has(chat.userId)) {
         return new ChatSDKError("forbidden:chat").toResponse();
       }
-      if (!isToolApprovalFlow) {
+      if (!isToolApprovalFlow && !isAgentEngineRequest) {
         messageHistory = await getChatMessagesByChatId({
           chatId: id,
           userId: bigQueryUserId,
@@ -519,7 +519,6 @@ export async function POST(request: Request) {
     const uiMessages = isToolApprovalFlow
       ? (messages as ChatMessage[])
       : [...messageHistory, message as ChatMessage];
-    const isAgentEngineRequest = isAgentEngineModel(selectedChatModel);
     const latestUserMessage =
       message?.role === "user"
         ? (message as ChatMessage)
@@ -534,6 +533,7 @@ export async function POST(request: Request) {
       city,
       country,
     };
+    let preflightDoneAtMs: number | null = null;
 
     const incomingUserDbMessage =
       message?.role === "user"
@@ -556,6 +556,19 @@ export async function POST(request: Request) {
       });
     }
 
+    if (isAgentEngineRequest) {
+      preflightDoneAtMs = Date.now();
+      logAgentEngineEvent("info", {
+        event: "preflight_done",
+        request_id: requestId,
+        chat_id: id,
+        user_id: bigQueryUserId,
+        model_id: selectedChatModel,
+        preflight_done_ms: preflightDoneAtMs - requestStartedAtMs,
+        is_tool_approval_flow: isToolApprovalFlow,
+      });
+    }
+
     const extractedContext: VertexExtractedContext = {
       chartSpec: null,
       chartError: null,
@@ -563,6 +576,28 @@ export async function POST(request: Request) {
       contextSheets: [],
     };
     let providerSessionIdForPersistence: string | undefined;
+    let providerSessionReadyAtMs: number | null = null;
+    let streamOpenedAtMs: number | null = null;
+    let firstDeltaAtMs: number | null = null;
+    const pendingPersistenceTasks: Promise<void>[] = [];
+
+    const queuePersistenceTask = (task: Promise<void>, context: string) => {
+      const trackedTask = task.catch((error) => {
+        logAgentEngineEvent("warn", {
+          event: "message_persist_failed",
+          request_id: requestId,
+          chat_id: id,
+          session_id: providerSessionIdForPersistence,
+          user_id: bigQueryUserId,
+          model_id: selectedChatModel,
+          context,
+          reason: error instanceof Error ? error.message : String(error),
+        });
+      });
+
+      pendingPersistenceTasks.push(trackedTask);
+    };
+
     const getPersistenceSessionId = () => {
       if (!isAgentEngineRequest) {
         return id;
@@ -583,6 +618,10 @@ export async function POST(request: Request) {
     }: {
       messages: ChatMessage[];
     }) => {
+      if (pendingPersistenceTasks.length > 0) {
+        await Promise.allSettled([...pendingPersistenceTasks]);
+      }
+
       const answeredInMs = Math.max(Date.now() - requestStartedAtMs, 0);
       const lastAssistantMessageId = [...finishedMessages]
         .reverse()
@@ -661,40 +700,60 @@ export async function POST(request: Request) {
           answeredIn: answeredInMs,
         });
       }
+
+      if (isAgentEngineRequest) {
+        logAgentEngineEvent("info", {
+          event: "request_latency_summary",
+          request_id: requestId,
+          chat_id: id,
+          session_id: providerSessionIdForPersistence,
+          user_id: bigQueryUserId,
+          model_id: selectedChatModel,
+          preflight_done_ms: preflightDoneAtMs
+            ? preflightDoneAtMs - requestStartedAtMs
+            : null,
+          provider_session_ready_ms: providerSessionReadyAtMs
+            ? providerSessionReadyAtMs - requestStartedAtMs
+            : null,
+          stream_opened_ms: streamOpenedAtMs
+            ? streamOpenedAtMs - requestStartedAtMs
+            : null,
+          first_delta_ms: firstDeltaAtMs
+            ? firstDeltaAtMs - requestStartedAtMs
+            : null,
+          total_request_ms: Date.now() - requestStartedAtMs,
+        });
+      }
     };
 
     let stream: ReadableStream<UIMessageChunk>;
 
     if (isAgentEngineRequest) {
       try {
-        const serviceAccountAccessToken = await getServiceAccountAccessToken();
-
         if (!latestUserMessage) {
           return new ChatSDKError(
             "bad_request:api",
             "No user message found for Agent Engine request."
           ).toResponse();
         }
-
-        let existingProviderSession: Awaited<
-          ReturnType<typeof getProviderSessionByChatId>
-        > = null;
-
-        try {
-          existingProviderSession = await getProviderSessionByChatId({
-            chatId: id,
-            provider: AGENT_ENGINE_PROVIDER_ID,
-          });
-        } catch (error) {
-          logAgentEngineEvent("warn", {
-            event: "provider_session_lookup_failed",
-            request_id: requestId,
-            chat_id: id,
-            user_id: bigQueryUserId,
-            model_id: selectedChatModel,
-            reason: error instanceof Error ? error.message : String(error),
-          });
-        }
+        const [serviceAccountAccessToken, existingProviderSession] =
+          await Promise.all([
+            getServiceAccountAccessToken(),
+            getProviderSessionByChatId({
+              chatId: id,
+              provider: AGENT_ENGINE_PROVIDER_ID,
+            }).catch((error) => {
+              logAgentEngineEvent("warn", {
+                event: "provider_session_lookup_failed",
+                request_id: requestId,
+                chat_id: id,
+                user_id: bigQueryUserId,
+                model_id: selectedChatModel,
+                reason: error instanceof Error ? error.message : String(error),
+              });
+              return null;
+            }),
+          ]);
 
         let providerSessionId = existingProviderSession?.sessionId;
         const providerSessionSource = providerSessionId ? "existing" : "created";
@@ -739,12 +798,25 @@ export async function POST(request: Request) {
           source: providerSessionSource,
         });
         providerSessionIdForPersistence = providerSessionId;
+        providerSessionReadyAtMs = Date.now();
+        logAgentEngineEvent("info", {
+          event: "provider_session_ready",
+          request_id: requestId,
+          chat_id: id,
+          session_id: providerSessionIdForPersistence,
+          user_id: bigQueryUserId,
+          model_id: selectedChatModel,
+          provider_session_ready_ms: providerSessionReadyAtMs - requestStartedAtMs,
+        });
 
         if (incomingUserDbMessage && !isToolApprovalFlow) {
-          await saveMessages({
-            messages: [incomingUserDbMessage],
-            sessionId: getPersistenceSessionId(),
-          });
+          queuePersistenceTask(
+            saveMessages({
+              messages: [incomingUserDbMessage],
+              sessionId: getPersistenceSessionId(),
+            }),
+            "incoming_user_before_stream"
+          );
         }
 
         const vertexMessage = await buildVertexMessageFromUserMessage(
@@ -761,6 +833,18 @@ export async function POST(request: Request) {
             const textPartId = generateUUID();
             let hasVisibleOutput = false;
             let activeProviderSessionId = initialProviderSessionId;
+            if (streamOpenedAtMs === null) {
+              streamOpenedAtMs = Date.now();
+              logAgentEngineEvent("info", {
+                event: "stream_opened",
+                request_id: requestId,
+                chat_id: id,
+                session_id: activeProviderSessionId,
+                user_id: bigQueryUserId,
+                model_id: selectedChatModel,
+                stream_opened_ms: streamOpenedAtMs - requestStartedAtMs,
+              });
+            }
             dataStream.write({ type: "start" });
             dataStream.write({ type: "text-start", id: textPartId });
             if (exportHint) {
@@ -816,6 +900,18 @@ export async function POST(request: Request) {
                 });
 
                 if (delta.trim().length > 0) {
+                  if (firstDeltaAtMs === null) {
+                    firstDeltaAtMs = Date.now();
+                    logAgentEngineEvent("info", {
+                      event: "first_delta",
+                      request_id: requestId,
+                      chat_id: id,
+                      session_id: currentProviderSessionId,
+                      user_id: bigQueryUserId,
+                      model_id: selectedChatModel,
+                      first_delta_ms: firstDeltaAtMs - requestStartedAtMs,
+                    });
+                  }
                   hasVisibleOutput = true;
                 }
               }
@@ -942,6 +1038,19 @@ export async function POST(request: Request) {
               session_id: providerSessionId,
               user_id: bigQueryUserId,
               model_id: selectedChatModel,
+              preflight_done_ms: preflightDoneAtMs
+                ? preflightDoneAtMs - requestStartedAtMs
+                : null,
+              provider_session_ready_ms: providerSessionReadyAtMs
+                ? providerSessionReadyAtMs - requestStartedAtMs
+                : null,
+              stream_opened_ms: streamOpenedAtMs
+                ? streamOpenedAtMs - requestStartedAtMs
+                : null,
+              first_delta_ms: firstDeltaAtMs
+                ? firstDeltaAtMs - requestStartedAtMs
+                : null,
+              total_request_ms: Date.now() - requestStartedAtMs,
               reason: error instanceof Error ? error.message : String(error),
             });
             if (error instanceof Error) {
@@ -957,6 +1066,19 @@ export async function POST(request: Request) {
           chat_id: id,
           user_id: bigQueryUserId,
           model_id: selectedChatModel,
+          preflight_done_ms: preflightDoneAtMs
+            ? preflightDoneAtMs - requestStartedAtMs
+            : null,
+          provider_session_ready_ms: providerSessionReadyAtMs
+            ? providerSessionReadyAtMs - requestStartedAtMs
+            : null,
+          stream_opened_ms: streamOpenedAtMs
+            ? streamOpenedAtMs - requestStartedAtMs
+            : null,
+          first_delta_ms: firstDeltaAtMs
+            ? firstDeltaAtMs - requestStartedAtMs
+            : null,
+          total_request_ms: Date.now() - requestStartedAtMs,
           reason: error instanceof Error ? error.message : String(error),
         });
         const cause =
@@ -1072,7 +1194,12 @@ export async function POST(request: Request) {
       });
     }
 
-    return createUIMessageStreamResponse({ stream });
+    return createUIMessageStreamResponse({
+      stream,
+      headers: {
+        "x-chat-request-id": requestId,
+      },
+    });
   } catch (error) {
     const vercelId = request.headers.get("x-vercel-id");
 

@@ -20,6 +20,8 @@ jobs:
       GCP_REGION: ${{ vars.GCP_REGION }}
       CLOUD_RUN_SERVICE: ${{ vars.CLOUD_RUN_SERVICE }}
       CLOUD_RUN_RUNTIME_SA: ${{ vars.CLOUD_RUN_RUNTIME_SA }}
+      CLOUD_RUN_MIN_INSTANCES: ${{ vars.CLOUD_RUN_MIN_INSTANCES }}
+      CLOUD_RUN_CONCURRENCY: ${{ vars.CLOUD_RUN_CONCURRENCY }}
 
     steps:
       - name: Checkout
@@ -51,11 +53,22 @@ jobs:
 
       - name: Deploy new revision to existing service
         run: |
+          EXTRA_FLAGS=()
+
+          if [ -n "${CLOUD_RUN_MIN_INSTANCES}" ]; then
+            EXTRA_FLAGS+=("--min-instances=${CLOUD_RUN_MIN_INSTANCES}")
+          fi
+
+          if [ -n "${CLOUD_RUN_CONCURRENCY}" ]; then
+            EXTRA_FLAGS+=("--concurrency=${CLOUD_RUN_CONCURRENCY}")
+          fi
+
           gcloud run deploy "${CLOUD_RUN_SERVICE}" \
             --project="${GCP_PROJECT_ID}" \
             --region="${GCP_REGION}" \
             --source=. \
             --service-account="${CLOUD_RUN_RUNTIME_SA}" \
+            "${EXTRA_FLAGS[@]}" \
             --quiet
 
       - name: Show deployed URL

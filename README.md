@@ -211,6 +211,34 @@ vercel --prod
 | `pnpm start` | Inicia build de producao |
 | `pnpm lint` | Checagem de qualidade (Ultracite/Biome) |
 | `pnpm test` | Suite Playwright |
+| `pnpm bench:chat-latency` | Benchmark A/B de latencia (`/api/chat`) entre novo e legado |
+
+## Benchmark A/B de latencia (novo vs legado)
+
+O script `scripts/bench/chat-latency.mjs` mede:
+
+- `ttft_ms` (tempo ate o primeiro `text-delta`)
+- `total_ms` (tempo total ate `finish`)
+- taxa de erro por endpoint
+- melhoria percentual do novo endpoint vs legado
+
+Exemplo:
+
+```bash
+pnpm bench:chat-latency -- \
+  --new-base-url "https://ai-chatbot-XXXX.us-central1.run.app" \
+  --legacy-base-url "https://agent-ui-stg-XXXX.us-central1.run.app" \
+  --new-cookie "next-auth.session-token=..." \
+  --legacy-cookie "next-auth.session-token=..." \
+  --model "google/scheffer-agent-engine" \
+  --runs 8 \
+  --warmup 2 \
+  --prompts-file "scripts/bench/prompts.json"
+```
+
+Saida em JSON:
+
+- `artifacts/bench/chat-latency-*.json`
 
 ## Licenca
 
