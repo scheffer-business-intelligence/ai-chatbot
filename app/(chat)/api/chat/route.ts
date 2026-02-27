@@ -22,6 +22,10 @@ import { updateDocument } from "@/lib/ai/tools/update-document";
 import { getServiceAccountAccessToken } from "@/lib/auth/service-account-token";
 import { getBigQueryUserIdCandidates } from "@/lib/auth/user-id";
 import {
+  buildAgentEngineErrorEnvelope,
+  type AgentEngineErrorStage,
+} from "@/lib/agent-engine/error-envelope";
+import {
   countRecentUserMessages,
   getChatMessagesByChatId,
   softDeleteSessionMessagesByChatId,
@@ -1040,6 +1044,15 @@ export async function POST(request: Request) {
           generateId: generateUUID,
           onFinish: handleOnFinish,
           onError: (error) => {
+            const stage: AgentEngineErrorStage =
+              firstDeltaAtMs === null ? "stream_open" : "stream_runtime";
+            const envelope = buildAgentEngineErrorEnvelope({
+              requestId,
+              modelId: selectedChatModel,
+              sessionId: providerSessionIdForPersistence ?? providerSessionId,
+              stage,
+              error,
+            });
             logAgentEngineEvent("error", {
               event: "vertex_stream_failed",
               request_id: requestId,
@@ -1061,14 +1074,19 @@ export async function POST(request: Request) {
                 : null,
               total_request_ms: Date.now() - requestStartedAtMs,
               reason: error instanceof Error ? error.message : String(error),
+              error_envelope: envelope,
             });
-            if (error instanceof Error) {
-              return `Não consegui obter resposta do Scheffer Agente Engine: ${error.message}`;
-            }
-            return "Não consegui obter resposta do Scheffer Agente Engine.";
+            return envelope;
           },
         });
       } catch (error) {
+        const envelope = buildAgentEngineErrorEnvelope({
+          requestId,
+          modelId: selectedChatModel,
+          sessionId: providerSessionIdForPersistence,
+          stage: "request_setup",
+          error,
+        });
         logAgentEngineEvent("error", {
           event: "agent_engine_request_failed",
           request_id: requestId,
@@ -1089,12 +1107,9 @@ export async function POST(request: Request) {
             : null,
           total_request_ms: Date.now() - requestStartedAtMs,
           reason: error instanceof Error ? error.message : String(error),
+          error_envelope: envelope,
         });
-        const cause =
-          error instanceof Error
-            ? error.message
-            : "Unexpected Agent Engine error";
-        return new ChatSDKError("bad_request:agent_engine", cause).toResponse();
+        return new ChatSDKError("bad_request:agent_engine", envelope).toResponse();
       }
     } else if (isDirectProviderModel(selectedChatModel)) {
       stream = createUIMessageStream({

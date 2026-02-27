@@ -9,6 +9,14 @@ import { unstable_serialize } from "swr/infinite";
 import { ChatHeader } from "@/components/chat-header";
 import { useDataStream } from "@/components/data-stream-provider";
 import {
+  type AgentEngineErrorAnalysis,
+  agentEngineErrorAnalysisResponseSchema,
+} from "@/lib/agent-engine/error-analysis";
+import {
+  parseAgentEngineErrorFromUnknown,
+  type AgentEngineErrorEnvelope,
+} from "@/lib/agent-engine/error-envelope";
+import {
   AlertDialog,
   AlertDialogAction,
   AlertDialogCancel,
@@ -19,6 +27,14 @@ import {
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
 import { Button } from "@/components/ui/button";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import { useArtifactSelector } from "@/hooks/use-artifact";
 import { ChatSDKError } from "@/lib/errors";
 import type { Attachment, ChatMessage } from "@/lib/types";
@@ -61,6 +77,18 @@ export function Chat({
   const [isContinuingSharedChat, setIsContinuingSharedChat] = useState(false);
   const [currentModelId, setCurrentModelId] = useState(initialChatModel);
   const [agentStatus, setAgentStatus] = useState<string | null>(null);
+  const [agentEngineError, setAgentEngineError] =
+    useState<AgentEngineErrorEnvelope | null>(null);
+  const [showAgentEngineErrorDialog, setShowAgentEngineErrorDialog] =
+    useState(false);
+  const [agentEngineAnalysis, setAgentEngineAnalysis] =
+    useState<AgentEngineErrorAnalysis | null>(null);
+  const [agentEngineAnalysisStatus, setAgentEngineAnalysisStatus] = useState<
+    "idle" | "loading" | "success" | "error"
+  >("idle");
+  const [agentEngineAnalysisError, setAgentEngineAnalysisError] = useState<
+    string | null
+  >(null);
   const currentModelIdRef = useRef(currentModelId);
   const hasStreamedAssistantTextRef = useRef(false);
 
@@ -144,6 +172,22 @@ export function Chat({
     onError: (error) => {
       hasStreamedAssistantTextRef.current = false;
       setAgentStatus(null);
+
+      const parsedAgentEngineError = parseAgentEngineErrorFromUnknown(error);
+      if (parsedAgentEngineError) {
+        setAgentEngineError(parsedAgentEngineError);
+        setAgentEngineAnalysis(null);
+        setAgentEngineAnalysisStatus("idle");
+        setAgentEngineAnalysisError(null);
+        setShowAgentEngineErrorDialog(true);
+
+        toast({
+          type: "error",
+          description: `${parsedAgentEngineError.reasonLabel}. Request ID: ${parsedAgentEngineError.requestId}`,
+        });
+        return;
+      }
+
       if (error instanceof ChatSDKError) {
         if (
           error.message?.includes("AI Gateway requires a valid credit card")
@@ -172,6 +216,89 @@ export function Chat({
       });
     },
   });
+
+  const handleCopyAgentEngineErrorDetails = useCallback(async () => {
+    if (!agentEngineError) {
+      return;
+    }
+
+    const detailLines = [
+      `Request ID: ${agentEngineError.requestId}`,
+      `Motivo: ${agentEngineError.reasonLabel} (${agentEngineError.reasonCode})`,
+      `Mensagem: ${agentEngineError.message}`,
+      `Modelo: ${agentEngineError.modelId}`,
+      `Sessao: ${agentEngineError.sessionId ?? "-"}`,
+      `Etapa: ${agentEngineError.stage}`,
+      `Timestamp: ${agentEngineError.timestamp}`,
+    ];
+
+    try {
+      await navigator.clipboard.writeText(detailLines.join("\n"));
+      toast({
+        type: "success",
+        description: "Detalhes do erro copiados para a area de transferencia.",
+      });
+    } catch {
+      toast({
+        type: "error",
+        description: "Nao foi possivel copiar os detalhes do erro.",
+      });
+    }
+  }, [agentEngineError]);
+
+  const handleAnalyzeWithGemini = useCallback(async () => {
+    if (!agentEngineError || agentEngineAnalysisStatus === "loading") {
+      return;
+    }
+
+    try {
+      setAgentEngineAnalysisStatus("loading");
+      setAgentEngineAnalysisError(null);
+
+      const response = await fetch("/api/chat/error-analysis", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(agentEngineError),
+      });
+
+      const payload = (await response.json().catch(() => null)) as
+        | {
+            analysis?: unknown;
+            model?: unknown;
+            message?: unknown;
+            cause?: unknown;
+          }
+        | null;
+
+      if (!response.ok) {
+        const cause =
+          typeof payload?.cause === "string"
+            ? payload.cause
+            : typeof payload?.message === "string"
+              ? payload.message
+              : "Falha ao solicitar analise com Gemini.";
+        throw new Error(cause);
+      }
+
+      const validated =
+        agentEngineErrorAnalysisResponseSchema.safeParse(payload);
+      if (!validated.success) {
+        throw new Error("Resposta de analise do Gemini em formato invalido.");
+      }
+
+      setAgentEngineAnalysis(validated.data.analysis);
+      setAgentEngineAnalysisStatus("success");
+    } catch (error) {
+      setAgentEngineAnalysisStatus("error");
+      setAgentEngineAnalysisError(
+        error instanceof Error
+          ? error.message
+          : "Falha ao analisar erro com Gemini."
+      );
+    }
+  }, [agentEngineError, agentEngineAnalysisStatus]);
 
   useEffect(() => {
     const lastMessage = messages.at(-1);
@@ -377,6 +504,139 @@ export function Chat({
         status={status}
         stop={stop}
       />
+
+      <Dialog
+        onOpenChange={setShowAgentEngineErrorDialog}
+        open={showAgentEngineErrorDialog}
+      >
+        <DialogContent className="max-h-[92vh] max-w-[95vw] overflow-auto sm:max-w-2xl">
+          <DialogHeader>
+            <DialogTitle>Falha no Scheffer Agent Engine</DialogTitle>
+            <DialogDescription>
+              Exibindo detalhes tecnicos sanitizados para depuracao.
+            </DialogDescription>
+          </DialogHeader>
+
+          {agentEngineError && (
+            <div className="space-y-3">
+              <div className="rounded-md border bg-muted/25 p-3 text-sm">
+                <div>
+                  <span className="font-semibold">Motivo:</span>{" "}
+                  {agentEngineError.reasonLabel}
+                </div>
+                <div>
+                  <span className="font-semibold">Codigo:</span>{" "}
+                  <span className="font-mono text-xs">
+                    {agentEngineError.reasonCode}
+                  </span>
+                </div>
+                <div>
+                  <span className="font-semibold">Request ID:</span>{" "}
+                  <span className="font-mono text-xs">
+                    {agentEngineError.requestId}
+                  </span>
+                </div>
+                <div>
+                  <span className="font-semibold">Modelo:</span>{" "}
+                  <span className="font-mono text-xs">
+                    {agentEngineError.modelId}
+                  </span>
+                </div>
+                <div>
+                  <span className="font-semibold">Sessao:</span>{" "}
+                  <span className="font-mono text-xs">
+                    {agentEngineError.sessionId ?? "-"}
+                  </span>
+                </div>
+                <div>
+                  <span className="font-semibold">Etapa:</span>{" "}
+                  <span className="font-mono text-xs">
+                    {agentEngineError.stage}
+                  </span>
+                </div>
+                <div>
+                  <span className="font-semibold">Mensagem:</span>{" "}
+                  <span className="font-mono text-xs">
+                    {agentEngineError.message}
+                  </span>
+                </div>
+              </div>
+
+              <div className="rounded-md border bg-background p-3 text-sm">
+                <div className="mb-2 font-semibold">
+                  Recomendacao com Gemini Pro
+                </div>
+
+                {agentEngineAnalysisStatus === "loading" && (
+                  <div className="text-muted-foreground">
+                    Gerando analise automatica...
+                  </div>
+                )}
+
+                {agentEngineAnalysisStatus === "error" && (
+                  <div className="text-destructive">
+                    {agentEngineAnalysisError ??
+                      "Nao foi possivel gerar analise com Gemini."}
+                  </div>
+                )}
+
+                {agentEngineAnalysisStatus === "success" && agentEngineAnalysis && (
+                  <div className="space-y-2 text-sm">
+                    <div>
+                      <span className="font-semibold">Diagnostico:</span>{" "}
+                      {agentEngineAnalysis.diagnosisSummary}
+                    </div>
+                    <div>
+                      <span className="font-semibold">Confianca:</span>{" "}
+                      {agentEngineAnalysis.confidence}
+                    </div>
+                    <div>
+                      <span className="font-semibold">Causas provaveis:</span>{" "}
+                      {agentEngineAnalysis.likelyCauses.join(" | ")}
+                    </div>
+                    <div>
+                      <span className="font-semibold">Acoes recomendadas:</span>{" "}
+                      {agentEngineAnalysis.recommendedActions.join(" | ")}
+                    </div>
+                    <div>
+                      <span className="font-semibold">Checks sugeridos:</span>{" "}
+                      {agentEngineAnalysis.checksToRun.join(" | ")}
+                    </div>
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+
+          <DialogFooter className="gap-2">
+            <Button
+              onClick={handleCopyAgentEngineErrorDetails}
+              type="button"
+              variant="outline"
+            >
+              Copiar detalhes
+            </Button>
+            <Button
+              disabled={
+                !agentEngineError || agentEngineAnalysisStatus === "loading"
+              }
+              onClick={handleAnalyzeWithGemini}
+              type="button"
+              variant="outline"
+            >
+              {agentEngineAnalysisStatus === "loading"
+                ? "Analisando..."
+                : "Analisar com Gemini"}
+            </Button>
+            <Button
+              onClick={() => setShowAgentEngineErrorDialog(false)}
+              type="button"
+            >
+              Fechar
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
 
       <AlertDialog
         onOpenChange={setShowCreditCardAlert}
