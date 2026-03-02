@@ -450,6 +450,27 @@ export async function POST(request: Request) {
     const chatVisibility = "private" as const;
     const isAgentEngineRequest = isAgentEngineModel(selectedChatModel);
 
+    // Early promise kickoff (Agent Engine only): these have no dependency
+    // on auth() and can run in parallel with it. Starting the service
+    // account token early also warms the singleton cache used by all
+    // downstream BigQuery operations (getBigQueryAccessToken delegates
+    // to getServiceAccountAccessToken).
+    const earlyServiceAccountTokenPromise = isAgentEngineRequest
+      ? getServiceAccountAccessToken()
+      : null;
+    const earlyProviderSessionPromise = isAgentEngineRequest
+      ? getProviderSessionByChatId({
+          chatId: id,
+          provider: AGENT_ENGINE_PROVIDER_ID,
+        }).catch((error) => {
+          console.warn(
+            "[chat/route] Early provider session lookup failed, will retry later:",
+            error instanceof Error ? error.message : String(error)
+          );
+          return null;
+        })
+      : null;
+
     const session = await auth();
 
     if (!session?.user) {
@@ -491,6 +512,24 @@ export async function POST(request: Request) {
     const isToolApprovalFlow = Boolean(messages);
     let messageHistory: ChatMessage[] = [];
     let titlePromise: Promise<string> | null = null;
+    const pendingPersistenceTasks: Promise<void>[] = [];
+
+    const queuePersistenceTask = (task: Promise<void>, context: string) => {
+      const trackedTask = task.catch((error) => {
+        logAgentEngineEvent("warn", {
+          event: "message_persist_failed",
+          request_id: requestId,
+          chat_id: id,
+          session_id: providerSessionIdForPersistence,
+          user_id: bigQueryUserId,
+          model_id: selectedChatModel,
+          context,
+          reason: error instanceof Error ? error.message : String(error),
+        });
+      });
+
+      pendingPersistenceTasks.push(trackedTask);
+    };
 
     if (chat) {
       if (!chatOwnerIds.has(chat.userId)) {
@@ -505,12 +544,17 @@ export async function POST(request: Request) {
         });
       }
     } else if (message?.role === "user") {
-      await saveChat({
+      const saveChatTask = saveChat({
         id,
         userId: bigQueryUserId,
         title: "Nova Conversa",
         visibility: chatVisibility,
       });
+      if (isAgentEngineRequest) {
+        queuePersistenceTask(saveChatTask as Promise<void>, "deferred_save_chat");
+      } else {
+        await saveChatTask;
+      }
       if (
         isAgentEngineModel(selectedChatModel) ||
         isDirectProviderModel(selectedChatModel)
@@ -587,24 +631,6 @@ export async function POST(request: Request) {
     let providerSessionReadyAtMs: number | null = null;
     let streamOpenedAtMs: number | null = null;
     let firstDeltaAtMs: number | null = null;
-    const pendingPersistenceTasks: Promise<void>[] = [];
-
-    const queuePersistenceTask = (task: Promise<void>, context: string) => {
-      const trackedTask = task.catch((error) => {
-        logAgentEngineEvent("warn", {
-          event: "message_persist_failed",
-          request_id: requestId,
-          chat_id: id,
-          session_id: providerSessionIdForPersistence,
-          user_id: bigQueryUserId,
-          model_id: selectedChatModel,
-          context,
-          reason: error instanceof Error ? error.message : String(error),
-        });
-      });
-
-      pendingPersistenceTasks.push(trackedTask);
-    };
 
     const getPersistenceSessionId = () => {
       if (!isAgentEngineRequest) {
@@ -744,24 +770,21 @@ export async function POST(request: Request) {
             "No user message found for Agent Engine request."
           ).toResponse();
         }
+        // Await the early-started promises (started before auth, likely
+        // already resolved by now).
         const [serviceAccountAccessToken, existingProviderSession] =
           await Promise.all([
-            getServiceAccountAccessToken(),
-            getProviderSessionByChatId({
-              chatId: id,
-              provider: AGENT_ENGINE_PROVIDER_ID,
-            }).catch((error) => {
-              logAgentEngineEvent("warn", {
-                event: "provider_session_lookup_failed",
-                request_id: requestId,
-                chat_id: id,
-                user_id: bigQueryUserId,
-                model_id: selectedChatModel,
-                reason: error instanceof Error ? error.message : String(error),
-              });
-              return null;
-            }),
+            earlyServiceAccountTokenPromise!,
+            earlyProviderSessionPromise!,
           ]);
+
+        // Start building the vertex message immediately — it depends only
+        // on the user message and request signal, NOT on the provider session.
+        // This overlaps file download/encoding with session creation.
+        const vertexMessagePromise = buildVertexMessageFromUserMessage(
+          latestUserMessage,
+          request.signal
+        );
 
         let providerSessionId = existingProviderSession?.sessionId;
         const providerSessionSource = providerSessionId ? "existing" : "created";
@@ -772,24 +795,26 @@ export async function POST(request: Request) {
             bigQueryUserId
           );
 
-          try {
-            await upsertProviderSession({
+          // Defer persistence — the stream only needs the in-memory session ID.
+          queuePersistenceTask(
+            upsertProviderSession({
               chatId: id,
               provider: AGENT_ENGINE_PROVIDER_ID,
               sessionId: providerSessionId,
               userId: bigQueryUserId,
-            });
-          } catch (error) {
-            logAgentEngineEvent("warn", {
-              event: "provider_session_persist_failed",
-              request_id: requestId,
-              chat_id: id,
-              session_id: providerSessionId,
-              user_id: bigQueryUserId,
-              model_id: selectedChatModel,
-              reason: error instanceof Error ? error.message : String(error),
-            });
-          }
+            }).catch((error) => {
+              logAgentEngineEvent("warn", {
+                event: "provider_session_persist_failed",
+                request_id: requestId,
+                chat_id: id,
+                session_id: providerSessionId,
+                user_id: bigQueryUserId,
+                model_id: selectedChatModel,
+                reason: error instanceof Error ? error.message : String(error),
+              });
+            }) as Promise<void>,
+            "provider_session_persist"
+          );
         }
         if (!providerSessionId) {
           throw new Error(
@@ -827,10 +852,9 @@ export async function POST(request: Request) {
           );
         }
 
-        const vertexMessage = await buildVertexMessageFromUserMessage(
-          latestUserMessage,
-          request.signal
-        );
+        // Await the vertex message (likely already resolved if no attachments,
+        // or ran in parallel with createVertexSession if session was new).
+        const vertexMessage = await vertexMessagePromise;
         const allowTableChartFallback =
           shouldAllowTableChartFallback(latestUserMessage);
         const initialProviderSessionId: string = providerSessionId;
