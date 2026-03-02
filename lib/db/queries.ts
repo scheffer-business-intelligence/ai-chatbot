@@ -1209,7 +1209,8 @@ export async function deleteChatById({ id }: { id: string }) {
     try {
       await runQuery(
         `
-          DELETE FROM \`${MESSAGES_TABLE_REF}\`
+          UPDATE \`${MESSAGES_TABLE_REF}\`
+          SET is_deleted = TRUE
           WHERE (chat_id = @chat_id OR (chat_id IS NULL AND session_id = @chat_id))
         `,
         [{ name: "chat_id", type: "STRING", value: id }]
@@ -1217,7 +1218,8 @@ export async function deleteChatById({ id }: { id: string }) {
     } catch {
       await runQuery(
         `
-          DELETE FROM \`${MESSAGES_TABLE_REF}\`
+          UPDATE \`${MESSAGES_TABLE_REF}\`
+          SET is_deleted = TRUE
           WHERE session_id = @chat_id
         `,
         [{ name: "chat_id", type: "STRING", value: id }]
@@ -1226,7 +1228,8 @@ export async function deleteChatById({ id }: { id: string }) {
 
     await runQuery(
       `
-        DELETE FROM \`${MESSAGES_TABLE_REF}\`
+        UPDATE \`${MESSAGES_TABLE_REF}\`
+        SET is_deleted = TRUE
         WHERE STARTS_WITH(message_id, @provider_prefix)
           AND (session_id = @chat_id OR session_id = @provider_session)
       `,
@@ -1247,7 +1250,8 @@ export async function deleteChatById({ id }: { id: string }) {
 
     await runQuery(
       `
-        DELETE FROM \`${MESSAGES_TABLE_REF}\`
+        UPDATE \`${MESSAGES_TABLE_REF}\`
+        SET is_deleted = TRUE
         WHERE message_id = @message_id
           AND role = 'system'
           AND (session_id = @chat_id OR session_id = @chats_session)
