@@ -260,6 +260,10 @@ export const MessageActions = memo(
       return false;
     }
 
+    if (prevProps.message !== nextProps.message) {
+      return false;
+    }
+
     return true;
   }
 );
