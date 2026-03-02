@@ -1421,92 +1421,118 @@ export async function getChatsByUserId({
       .map(mapChatMetaRowToChat)
       .filter((chat): chat is Chat => Boolean(chat));
 
-    if (mappedMetaChats.length > 0) {
-      const hasMore = mappedMetaChats.length > limit;
-      return {
-        chats: hasMore ? mappedMetaChats.slice(0, limit) : mappedMetaChats,
-        hasMore,
-      };
+    // Collect IDs from meta chats to deduplicate against derived chats.
+    const metaChatIds = new Set(mappedMetaChats.map((chat) => chat.id));
+
+    // Query derived chats (from actual messages) so conversations created
+    // before the meta-message system are included in the sidebar.
+    // Wrapped in its own try-catch so a failure here still returns meta chats.
+    let derivedChats: Chat[] = [];
+    try {
+      const derivedRows = await queryRows(
+        `
+          SELECT id, user_id, created_at, visibility, title
+          FROM (
+            SELECT
+              COALESCE(chat_id, session_id) AS id,
+              ANY_VALUE(user_id) AS user_id,
+              MIN(created_at) AS created_at,
+              NULL AS visibility,
+              ARRAY_AGG(
+                IF(role = 'user', content, NULL)
+                IGNORE NULLS
+                ORDER BY SAFE_CAST(created_at AS TIMESTAMP)
+                LIMIT 1
+              )[SAFE_OFFSET(0)] AS title
+            FROM \`${MESSAGES_TABLE_REF}\`
+            WHERE user_id = @user_id
+              AND role != 'system'
+              AND NOT STARTS_WITH(COALESCE(chat_id, session_id), @meta_prefix)
+              AND (is_deleted IS NULL OR is_deleted = FALSE)
+            GROUP BY COALESCE(chat_id, session_id)
+          )
+          WHERE TRUE
+            ${cursorOperator ? `AND SAFE_CAST(created_at AS TIMESTAMP) ${cursorOperator} SAFE_CAST(@cursor_created_at AS TIMESTAMP)` : ""}
+          ORDER BY SAFE_CAST(created_at AS TIMESTAMP) DESC
+          LIMIT @limit
+        `,
+        [
+          { name: "user_id", type: "STRING", value: id },
+          { name: "meta_prefix", type: "STRING", value: META_SESSION_PREFIX },
+          ...(cursorCreatedAt
+            ? [
+                {
+                  name: "cursor_created_at",
+                  type: "STRING" as const,
+                  value: cursorCreatedAt,
+                },
+              ]
+            : []),
+          { name: "limit", type: "INT64", value: extendedLimit },
+        ],
+        `
+          SELECT id, user_id, created_at, visibility, title
+          FROM (
+            SELECT
+              session_id AS id,
+              ANY_VALUE(user_id) AS user_id,
+              MIN(created_at) AS created_at,
+              NULL AS visibility,
+              ARRAY_AGG(
+                IF(role = 'user', content, NULL)
+                IGNORE NULLS
+                ORDER BY created_at
+                LIMIT 1
+              )[SAFE_OFFSET(0)] AS title
+            FROM \`${MESSAGES_TABLE_REF}\`
+            WHERE user_id = @user_id
+              AND role != 'system'
+              AND NOT STARTS_WITH(session_id, @meta_prefix)
+            GROUP BY session_id
+          )
+          WHERE TRUE
+            ${cursorOperator ? `AND created_at ${cursorOperator} @cursor_created_at` : ""}
+          ORDER BY created_at DESC
+          LIMIT @limit
+        `
+      );
+
+      derivedChats = derivedRows
+        .map((row) => {
+          if (!row.id || isMetaSessionId(row.id)) {
+            return null;
+          }
+
+          // Skip if already covered by a meta chat record.
+          if (metaChatIds.has(row.id)) {
+            return null;
+          }
+
+          return {
+            id: row.id,
+            userId: row.user_id ?? "",
+            title: row.title ?? "Nova Conversa",
+            visibility: normalizeVisibility(row.visibility),
+            createdAt: parseDate(row.created_at),
+          } satisfies Chat;
+        })
+        .filter((chat): chat is Chat => Boolean(chat));
+    } catch (derivedError) {
+      console.warn(
+        "Failed to query derived chats from BigQuery, returning meta chats only:",
+        derivedError
+      );
     }
 
-    const derivedRows = await queryRows(
-      `
-        SELECT
-          COALESCE(chat_id, session_id) AS id,
-          ANY_VALUE(user_id) AS user_id,
-          MIN(created_at) AS created_at,
-          NULL AS visibility,
-          ARRAY_AGG(
-            IF(role = 'user', content, NULL)
-            IGNORE NULLS
-            ORDER BY SAFE_CAST(created_at AS TIMESTAMP)
-            LIMIT 1
-          )[SAFE_OFFSET(0)] AS title
-        FROM \`${MESSAGES_TABLE_REF}\`
-        WHERE user_id = @user_id
-          AND NOT STARTS_WITH(COALESCE(chat_id, session_id), @meta_prefix)
-          AND (is_deleted IS NULL OR is_deleted = FALSE)
-        GROUP BY COALESCE(chat_id, session_id)
-        ${cursorOperator ? `HAVING MIN(SAFE_CAST(created_at AS TIMESTAMP)) ${cursorOperator} SAFE_CAST(@cursor_created_at AS TIMESTAMP)` : ""}
-        ORDER BY MIN(SAFE_CAST(created_at AS TIMESTAMP)) DESC
-        LIMIT @limit
-      `,
-      [
-        { name: "user_id", type: "STRING", value: id },
-        { name: "meta_prefix", type: "STRING", value: META_SESSION_PREFIX },
-        ...(cursorCreatedAt
-          ? [
-              {
-                name: "cursor_created_at",
-                type: "STRING" as const,
-                value: cursorCreatedAt,
-              },
-            ]
-          : []),
-        { name: "limit", type: "INT64", value: extendedLimit },
-      ],
-      `
-        SELECT
-          session_id AS id,
-          ANY_VALUE(user_id) AS user_id,
-          MIN(created_at) AS created_at,
-          NULL AS visibility,
-          ARRAY_AGG(
-            IF(role = 'user', content, NULL)
-            IGNORE NULLS
-            ORDER BY created_at
-            LIMIT 1
-          )[SAFE_OFFSET(0)] AS title
-        FROM \`${MESSAGES_TABLE_REF}\`
-        WHERE user_id = @user_id
-          AND NOT STARTS_WITH(session_id, @meta_prefix)
-        GROUP BY session_id
-        ${cursorOperator ? `HAVING MIN(created_at) ${cursorOperator} @cursor_created_at` : ""}
-        ORDER BY MIN(created_at) DESC
-        LIMIT @limit
-      `
+    // Merge both sources and sort by creation date (newest first).
+    const allChats = [...mappedMetaChats, ...derivedChats].sort(
+      (a, b) => b.createdAt.getTime() - a.createdAt.getTime()
     );
 
-    const derivedChats = derivedRows
-      .map((row) => {
-        if (!row.id || isMetaSessionId(row.id)) {
-          return null;
-        }
-
-        return {
-          id: row.id,
-          userId: row.user_id ?? "",
-          title: row.title ?? "Nova Conversa",
-          visibility: normalizeVisibility(row.visibility),
-          createdAt: parseDate(row.created_at),
-        } satisfies Chat;
-      })
-      .filter((chat): chat is Chat => Boolean(chat));
-
-    const hasMore = derivedChats.length > limit;
+    const hasMore = allChats.length > limit;
 
     return {
-      chats: hasMore ? derivedChats.slice(0, limit) : derivedChats,
+      chats: hasMore ? allChats.slice(0, limit) : allChats,
       hasMore,
     };
   } catch (error) {
