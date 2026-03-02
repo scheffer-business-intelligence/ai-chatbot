@@ -612,9 +612,8 @@ const PurePreviewMessage = ({
 export const PreviewMessage = PurePreviewMessage;
 
 export const ThinkingMessage = ({ statusText }: { statusText?: string }) => {
-  const normalizedStatus = statusText?.trim();
-  const showThinkingDots = !normalizedStatus;
-  const label = normalizedStatus ?? "Pensando";
+  // Strip trailing dots/ellipsis from status text so we can animate them
+  const label = (statusText?.trim().replace(/\.{2,}$|…$/g, "") || "Pensando").trim();
 
   return (
     <div
@@ -631,18 +630,12 @@ export const ThinkingMessage = ({ statusText }: { statusText?: string }) => {
 
         <div className="flex w-full flex-col gap-2 md:gap-4">
           <div className="flex items-center gap-1 p-0 text-muted-foreground text-sm">
-            <span className="animate-pulse">{label}</span>
-            {showThinkingDots && (
-              <span className="inline-flex">
-                <span className="animate-bounce [animation-delay:0ms]">.</span>
-                <span className="animate-bounce [animation-delay:150ms]">
-                  .
-                </span>
-                <span className="animate-bounce [animation-delay:300ms]">
-                  .
-                </span>
-              </span>
-            )}
+            <span>{label}</span>
+            <span className="inline-flex w-4">
+              <span className="animate-bounce [animation-delay:0ms]">.</span>
+              <span className="animate-bounce [animation-delay:150ms]">.</span>
+              <span className="animate-bounce [animation-delay:300ms]">.</span>
+            </span>
           </div>
         </div>
       </div>
