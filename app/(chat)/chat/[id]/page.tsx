@@ -2,6 +2,7 @@ import { cookies } from "next/headers";
 import { notFound, redirect } from "next/navigation";
 import { Suspense } from "react";
 
+import type { Session } from "next-auth";
 import { auth } from "@/app/(auth)/auth";
 import { Chat } from "@/components/chat";
 import { ChatSkeleton } from "@/components/chat-skeleton";
@@ -42,7 +43,7 @@ async function ChatPage({ params }: { params: Promise<{ id: string }> }) {
     redirect("/");
   }
 
-  let session: Awaited<ReturnType<typeof auth>>;
+  let session: Session | null = null;
   try {
     session = await auth();
   } catch (error) {
