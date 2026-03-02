@@ -884,6 +884,25 @@ async function upsertMetaMessage(row: BigQueryChatMessageRow) {
 async function getChatMetaById(chatId: string): Promise<Chat | null> {
   const rows = await queryRows(
     `
+      WITH latest_meta AS (
+        SELECT
+          message_id,
+          user_id,
+          content,
+          parts_json,
+          visibility,
+          created_at,
+          is_deleted,
+          ROW_NUMBER() OVER(
+            PARTITION BY message_id 
+            ORDER BY COALESCE(SAFE_CAST(updated_at AS TIMESTAMP), SAFE_CAST(created_at AS TIMESTAMP)) DESC, 
+                     is_deleted DESC
+          ) as rn
+        FROM \`${MESSAGES_TABLE_REF}\`
+        WHERE message_id = @message_id
+          AND role = 'system'
+          AND (session_id = @chat_session_id OR session_id = @legacy_session_id)
+      )
       SELECT
         message_id,
         user_id,
@@ -891,11 +910,8 @@ async function getChatMetaById(chatId: string): Promise<Chat | null> {
         parts_json,
         visibility,
         created_at
-      FROM \`${MESSAGES_TABLE_REF}\`
-      WHERE message_id = @message_id
-        AND role = 'system'
-        AND (session_id = @chat_session_id OR session_id = @legacy_session_id)
-        AND (is_deleted IS NULL OR is_deleted = FALSE)
+      FROM latest_meta
+      WHERE rn = 1 AND (is_deleted IS NULL OR is_deleted = FALSE)
       LIMIT 1
     `,
     [
@@ -904,17 +920,34 @@ async function getChatMetaById(chatId: string): Promise<Chat | null> {
       { name: "message_id", type: "STRING", value: `chat:${chatId}` },
     ],
     `
+      WITH latest_meta AS (
+        SELECT
+          message_id,
+          user_id,
+          content,
+          parts_json,
+          NULL AS visibility,
+          created_at,
+          is_deleted,
+          ROW_NUMBER() OVER(
+            PARTITION BY message_id 
+            ORDER BY COALESCE(SAFE_CAST(updated_at AS TIMESTAMP), SAFE_CAST(created_at AS TIMESTAMP)) DESC, 
+                     is_deleted DESC
+          ) as rn
+        FROM \`${MESSAGES_TABLE_REF}\`
+        WHERE message_id = @message_id
+          AND role = 'system'
+          AND (session_id = @chat_session_id OR session_id = @legacy_session_id)
+      )
       SELECT
         message_id,
         user_id,
         content,
         parts_json,
-        NULL AS visibility,
+        visibility,
         created_at
-      FROM \`${MESSAGES_TABLE_REF}\`
-      WHERE message_id = @message_id
-        AND role = 'system'
-        AND (session_id = @chat_session_id OR session_id = @legacy_session_id)
+      FROM latest_meta
+      WHERE rn = 1 AND (is_deleted IS NULL OR is_deleted = FALSE)
       LIMIT 1
     `
   );
@@ -1209,18 +1242,22 @@ export async function deleteChatById({ id }: { id: string }) {
     try {
       await runQuery(
         `
-          UPDATE \`${MESSAGES_TABLE_REF}\`
-          SET is_deleted = TRUE
+          INSERT INTO \`${MESSAGES_TABLE_REF}\` (message_id, session_id, role, content, created_at, user_id, is_deleted, answered_in, updated_at, parts_json, attachments_json, chart_spec_json, chart_error, visibility, chat_id)
+          SELECT message_id, session_id, role, content, created_at, user_id, TRUE as is_deleted, answered_in, CURRENT_TIMESTAMP() as updated_at, parts_json, attachments_json, chart_spec_json, chart_error, visibility, chat_id
+          FROM \`${MESSAGES_TABLE_REF}\`
           WHERE (chat_id = @chat_id OR (chat_id IS NULL AND session_id = @chat_id))
+            AND (is_deleted IS NULL OR is_deleted = FALSE)
         `,
         [{ name: "chat_id", type: "STRING", value: id }]
       );
     } catch {
       await runQuery(
         `
-          UPDATE \`${MESSAGES_TABLE_REF}\`
-          SET is_deleted = TRUE
+          INSERT INTO \`${MESSAGES_TABLE_REF}\` (message_id, session_id, role, content, created_at, user_id, is_deleted, answered_in, updated_at, parts_json, attachments_json, chart_spec_json, chart_error, visibility, chat_id)
+          SELECT message_id, session_id, role, content, created_at, user_id, TRUE as is_deleted, answered_in, CURRENT_TIMESTAMP() as updated_at, parts_json, attachments_json, chart_spec_json, chart_error, visibility, chat_id
+          FROM \`${MESSAGES_TABLE_REF}\`
           WHERE session_id = @chat_id
+            AND (is_deleted IS NULL OR is_deleted = FALSE)
         `,
         [{ name: "chat_id", type: "STRING", value: id }]
       );
@@ -1228,10 +1265,12 @@ export async function deleteChatById({ id }: { id: string }) {
 
     await runQuery(
       `
-        UPDATE \`${MESSAGES_TABLE_REF}\`
-        SET is_deleted = TRUE
+        INSERT INTO \`${MESSAGES_TABLE_REF}\` (message_id, session_id, role, content, created_at, user_id, is_deleted, answered_in, updated_at, parts_json, attachments_json, chart_spec_json, chart_error, visibility, chat_id)
+        SELECT message_id, session_id, role, content, created_at, user_id, TRUE as is_deleted, answered_in, CURRENT_TIMESTAMP() as updated_at, parts_json, attachments_json, chart_spec_json, chart_error, visibility, chat_id
+        FROM \`${MESSAGES_TABLE_REF}\`
         WHERE STARTS_WITH(message_id, @provider_prefix)
           AND (session_id = @chat_id OR session_id = @provider_session)
+          AND (is_deleted IS NULL OR is_deleted = FALSE)
       `,
       [
         {
@@ -1250,11 +1289,13 @@ export async function deleteChatById({ id }: { id: string }) {
 
     await runQuery(
       `
-        UPDATE \`${MESSAGES_TABLE_REF}\`
-        SET is_deleted = TRUE
+        INSERT INTO \`${MESSAGES_TABLE_REF}\` (message_id, session_id, role, content, created_at, user_id, is_deleted, answered_in, updated_at, parts_json, attachments_json, chart_spec_json, chart_error, visibility, chat_id)
+        SELECT message_id, session_id, role, content, created_at, user_id, TRUE as is_deleted, answered_in, CURRENT_TIMESTAMP() as updated_at, parts_json, attachments_json, chart_spec_json, chart_error, visibility, chat_id
+        FROM \`${MESSAGES_TABLE_REF}\`
         WHERE message_id = @message_id
           AND role = 'system'
           AND (session_id = @chat_id OR session_id = @chats_session)
+          AND (is_deleted IS NULL OR is_deleted = FALSE)
       `,
       [
         { name: "chat_id", type: "STRING", value: id },
@@ -1369,6 +1410,25 @@ export async function getChatsByUserId({
 
     const metaRows = await queryRows(
       `
+        WITH latest_meta AS (
+          SELECT
+            message_id,
+            user_id,
+            content,
+            parts_json,
+            visibility,
+            created_at,
+            is_deleted,
+            ROW_NUMBER() OVER(
+              PARTITION BY message_id 
+              ORDER BY COALESCE(SAFE_CAST(updated_at AS TIMESTAMP), SAFE_CAST(created_at AS TIMESTAMP)) DESC, 
+                       is_deleted DESC
+            ) as rn
+          FROM \`${MESSAGES_TABLE_REF}\`
+          WHERE STARTS_WITH(message_id, @chat_prefix)
+            AND role = 'system'
+            AND user_id = @user_id
+        )
         SELECT
           message_id,
           user_id,
@@ -1376,11 +1436,8 @@ export async function getChatsByUserId({
           parts_json,
           visibility,
           created_at
-        FROM \`${MESSAGES_TABLE_REF}\`
-        WHERE STARTS_WITH(message_id, @chat_prefix)
-          AND role = 'system'
-          AND user_id = @user_id
-          AND (is_deleted IS NULL OR is_deleted = FALSE)
+        FROM latest_meta
+        WHERE rn = 1 AND (is_deleted IS NULL OR is_deleted = FALSE)
           ${cursorOperator ? `AND SAFE_CAST(created_at AS TIMESTAMP) ${cursorOperator} SAFE_CAST(@cursor_created_at AS TIMESTAMP)` : ""}
         ORDER BY SAFE_CAST(created_at AS TIMESTAMP) DESC
         LIMIT @limit
@@ -1404,17 +1461,34 @@ export async function getChatsByUserId({
         { name: "limit", type: "INT64", value: extendedLimit },
       ],
       `
+        WITH latest_meta AS (
+          SELECT
+            message_id,
+            user_id,
+            content,
+            parts_json,
+            NULL AS visibility,
+            created_at,
+            is_deleted,
+            ROW_NUMBER() OVER(
+              PARTITION BY message_id 
+              ORDER BY COALESCE(SAFE_CAST(updated_at AS TIMESTAMP), SAFE_CAST(created_at AS TIMESTAMP)) DESC, 
+                       is_deleted DESC
+            ) as rn
+          FROM \`${MESSAGES_TABLE_REF}\`
+          WHERE STARTS_WITH(message_id, @chat_prefix)
+            AND role = 'system'
+            AND user_id = @user_id
+        )
         SELECT
           message_id,
           user_id,
           content,
           parts_json,
-          NULL AS visibility,
+          visibility,
           created_at
-        FROM \`${MESSAGES_TABLE_REF}\`
-        WHERE STARTS_WITH(message_id, @chat_prefix)
-          AND role = 'system'
-          AND user_id = @user_id
+        FROM latest_meta
+        WHERE rn = 1 AND (is_deleted IS NULL OR is_deleted = FALSE)
           ${cursorOperator ? `AND created_at ${cursorOperator} @cursor_created_at` : ""}
         ORDER BY created_at DESC
         LIMIT @limit
@@ -1435,6 +1509,26 @@ export async function getChatsByUserId({
     try {
       const derivedRows = await queryRows(
         `
+          WITH latest_messages AS (
+            SELECT
+              message_id,
+              session_id,
+              chat_id,
+              role,
+              content,
+              created_at,
+              user_id,
+              is_deleted,
+              ROW_NUMBER() OVER(
+                PARTITION BY message_id 
+                ORDER BY COALESCE(SAFE_CAST(updated_at AS TIMESTAMP), SAFE_CAST(created_at AS TIMESTAMP)) DESC, 
+                         is_deleted DESC
+              ) as rn
+            FROM \`${MESSAGES_TABLE_REF}\`
+            WHERE user_id = @user_id
+              AND role != 'system'
+              AND NOT STARTS_WITH(COALESCE(chat_id, session_id), @meta_prefix)
+          )
           SELECT id, user_id, created_at, visibility, title
           FROM (
             SELECT
@@ -1448,11 +1542,8 @@ export async function getChatsByUserId({
                 ORDER BY SAFE_CAST(created_at AS TIMESTAMP)
                 LIMIT 1
               )[SAFE_OFFSET(0)] AS title
-            FROM \`${MESSAGES_TABLE_REF}\`
-            WHERE user_id = @user_id
-              AND role != 'system'
-              AND NOT STARTS_WITH(COALESCE(chat_id, session_id), @meta_prefix)
-              AND (is_deleted IS NULL OR is_deleted = FALSE)
+            FROM latest_messages
+            WHERE rn = 1 AND (is_deleted IS NULL OR is_deleted = FALSE)
             GROUP BY COALESCE(chat_id, session_id)
           )
           WHERE TRUE
@@ -1475,6 +1566,25 @@ export async function getChatsByUserId({
           { name: "limit", type: "INT64", value: extendedLimit },
         ],
         `
+          WITH latest_messages AS (
+            SELECT
+              message_id,
+              session_id,
+              role,
+              content,
+              created_at,
+              user_id,
+              is_deleted,
+              ROW_NUMBER() OVER(
+                PARTITION BY message_id 
+                ORDER BY COALESCE(SAFE_CAST(updated_at AS TIMESTAMP), SAFE_CAST(created_at AS TIMESTAMP)) DESC, 
+                         is_deleted DESC
+              ) as rn
+            FROM \`${MESSAGES_TABLE_REF}\`
+            WHERE user_id = @user_id
+              AND role != 'system'
+              AND NOT STARTS_WITH(session_id, @meta_prefix)
+          )
           SELECT id, user_id, created_at, visibility, title
           FROM (
             SELECT
@@ -1488,10 +1598,8 @@ export async function getChatsByUserId({
                 ORDER BY created_at
                 LIMIT 1
               )[SAFE_OFFSET(0)] AS title
-            FROM \`${MESSAGES_TABLE_REF}\`
-            WHERE user_id = @user_id
-              AND role != 'system'
-              AND NOT STARTS_WITH(session_id, @meta_prefix)
+            FROM latest_messages
+            WHERE rn = 1 AND (is_deleted IS NULL OR is_deleted = FALSE)
             GROUP BY session_id
           )
           WHERE TRUE
@@ -1882,7 +1990,29 @@ export async function getMessagesByChatId({ id }: { id: string }) {
   try {
     const rows = await queryRows(
       `
-        SELECT
+        WITH latest_messages AS (
+          SELECT
+            message_id,
+            session_id,
+            chat_id,
+            role,
+            content,
+            created_at,
+            parts_json,
+            attachments_json,
+            chart_spec_json,
+            chart_error,
+            is_deleted,
+            ROW_NUMBER() OVER(
+              PARTITION BY message_id 
+              ORDER BY COALESCE(SAFE_CAST(updated_at AS TIMESTAMP), SAFE_CAST(created_at AS TIMESTAMP)) DESC, 
+                       is_deleted DESC
+            ) as rn
+          FROM \`${MESSAGES_TABLE_REF}\`
+          WHERE (chat_id = @chat_id OR (chat_id IS NULL AND session_id = @chat_id))
+            AND NOT STARTS_WITH(session_id, @meta_prefix)
+        )
+        SELECT 
           message_id,
           session_id,
           chat_id,
@@ -1893,10 +2023,8 @@ export async function getMessagesByChatId({ id }: { id: string }) {
           attachments_json,
           chart_spec_json,
           chart_error
-        FROM \`${MESSAGES_TABLE_REF}\`
-        WHERE (chat_id = @chat_id OR (chat_id IS NULL AND session_id = @chat_id))
-          AND NOT STARTS_WITH(session_id, @meta_prefix)
-          AND (is_deleted IS NULL OR is_deleted = FALSE)
+        FROM latest_messages
+        WHERE rn = 1 AND (is_deleted IS NULL OR is_deleted = FALSE)
         ORDER BY SAFE_CAST(created_at AS TIMESTAMP) ASC
       `,
       [
@@ -1904,20 +2032,41 @@ export async function getMessagesByChatId({ id }: { id: string }) {
         { name: "meta_prefix", type: "STRING", value: META_SESSION_PREFIX },
       ],
       `
-        SELECT
+        WITH latest_messages AS (
+          SELECT
+            message_id,
+            session_id,
+            NULL AS chat_id,
+            role,
+            content,
+            created_at,
+            NULL AS parts_json,
+            '[]' AS attachments_json,
+            NULL AS chart_spec_json,
+            NULL AS chart_error,
+            is_deleted,
+            ROW_NUMBER() OVER(
+              PARTITION BY message_id 
+              ORDER BY COALESCE(SAFE_CAST(updated_at AS TIMESTAMP), SAFE_CAST(created_at AS TIMESTAMP)) DESC, 
+                       is_deleted DESC
+            ) as rn
+          FROM \`${MESSAGES_TABLE_REF}\`
+          WHERE session_id = @chat_id
+            AND NOT STARTS_WITH(session_id, @meta_prefix)
+        )
+        SELECT 
           message_id,
           session_id,
-          NULL AS chat_id,
+          chat_id,
           role,
           content,
           created_at,
-          NULL AS parts_json,
-          '[]' AS attachments_json,
-          NULL AS chart_spec_json,
-          NULL AS chart_error
-        FROM \`${MESSAGES_TABLE_REF}\`
-        WHERE session_id = @chat_id
-          AND NOT STARTS_WITH(session_id, @meta_prefix)
+          parts_json,
+          attachments_json,
+          chart_spec_json,
+          chart_error
+        FROM latest_messages
+        WHERE rn = 1 AND (is_deleted IS NULL OR is_deleted = FALSE)
         ORDER BY created_at ASC
       `
     );
@@ -2234,10 +2383,13 @@ export async function deleteMessagesByChatIdAfterTimestamp({
     try {
       await runQuery(
         `
-          DELETE FROM \`${MESSAGES_TABLE_REF}\`
+          INSERT INTO \`${MESSAGES_TABLE_REF}\` (message_id, session_id, role, content, created_at, user_id, is_deleted, answered_in, updated_at, parts_json, attachments_json, chart_spec_json, chart_error, visibility, chat_id)
+          SELECT message_id, session_id, role, content, created_at, user_id, TRUE as is_deleted, answered_in, CURRENT_TIMESTAMP() as updated_at, parts_json, attachments_json, chart_spec_json, chart_error, visibility, chat_id
+          FROM \`${MESSAGES_TABLE_REF}\`
           WHERE (chat_id = @chat_id OR (chat_id IS NULL AND session_id = @chat_id))
             AND NOT STARTS_WITH(session_id, @meta_prefix)
             AND SAFE_CAST(created_at AS TIMESTAMP) >= SAFE_CAST(@threshold AS TIMESTAMP)
+            AND (is_deleted IS NULL OR is_deleted = FALSE)
         `,
         [
           { name: "chat_id", type: "STRING", value: chatId },
@@ -2248,10 +2400,13 @@ export async function deleteMessagesByChatIdAfterTimestamp({
     } catch {
       await runQuery(
         `
-          DELETE FROM \`${MESSAGES_TABLE_REF}\`
+          INSERT INTO \`${MESSAGES_TABLE_REF}\` (message_id, session_id, role, content, created_at, user_id, is_deleted, answered_in, updated_at, parts_json, attachments_json, chart_spec_json, chart_error, visibility, chat_id)
+          SELECT message_id, session_id, role, content, created_at, user_id, TRUE as is_deleted, answered_in, CURRENT_TIMESTAMP() as updated_at, parts_json, attachments_json, chart_spec_json, chart_error, visibility, chat_id
+          FROM \`${MESSAGES_TABLE_REF}\`
           WHERE session_id = @chat_id
             AND NOT STARTS_WITH(session_id, @meta_prefix)
             AND SAFE_CAST(created_at AS TIMESTAMP) >= SAFE_CAST(@threshold AS TIMESTAMP)
+            AND (is_deleted IS NULL OR is_deleted = FALSE)
         `,
         [
           { name: "chat_id", type: "STRING", value: chatId },
