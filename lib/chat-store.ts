@@ -1,7 +1,10 @@
 import "server-only";
 
 import type { UIMessagePart } from "ai";
-import { deleteMessagesByChatIdAfterTimestamp } from "@/lib/db/queries";
+import {
+  deleteMessagesByChatIdAfterTimestamp,
+  getProviderSessionByChatId,
+} from "@/lib/db/queries";
 import {
   type BigQueryChatMessageRow,
   countUserMessagesSince,
@@ -15,6 +18,8 @@ import {
 import { dedupeChatAssistantMessages } from "@/lib/messages/dedupe";
 import type { ChatMessage, ChatTools, CustomUIDataTypes } from "@/lib/types";
 import { sanitizeText } from "@/lib/utils";
+
+const AGENT_ENGINE_PROVIDER = "google-agent-engine";
 
 type PersistChatMessageParams = {
   chatId: string;
@@ -204,6 +209,7 @@ export async function getChatMessagesByChatId({
 
     const messagesById = new Map<string, BigQueryChatMessageRow>();
 
+    // ── Primary lookup: query by chatId (matches chat_id or session_id) ──
     for (const candidateUserId of userIds) {
       const candidateRows = await querySessionMessages(
         accessToken,
@@ -212,24 +218,44 @@ export async function getChatMessagesByChatId({
       );
 
       for (const candidateRow of candidateRows) {
-        const existingRow = messagesById.get(candidateRow.message_id);
-        if (!existingRow) {
-          messagesById.set(candidateRow.message_id, candidateRow);
-          continue;
-        }
+        mergeMessageRow(messagesById, candidateRow);
+      }
+    }
 
-        const existingUpdatedAt = parseSortableTimestamp(existingRow.updated_at);
-        const nextUpdatedAt = parseSortableTimestamp(candidateRow.updated_at);
-        const existingCreatedAt = parseSortableTimestamp(existingRow.created_at);
-        const nextCreatedAt = parseSortableTimestamp(candidateRow.created_at);
+    // ── Fallback: if no messages found, look up the provider (Vertex) session
+    //    ID for this chat and re-query. This handles the case where the BigQuery
+    //    table does not have a `chat_id` column and messages are stored under the
+    //    Vertex provider session_id instead of the chat UUID. ──
+    if (messagesById.size === 0) {
+      try {
+        const providerSession = await getProviderSessionByChatId({
+          chatId,
+          provider: AGENT_ENGINE_PROVIDER,
+        });
 
-        if (
-          nextUpdatedAt > existingUpdatedAt ||
-          (nextUpdatedAt === existingUpdatedAt &&
-            nextCreatedAt > existingCreatedAt)
-        ) {
-          messagesById.set(candidateRow.message_id, candidateRow);
+        if (providerSession?.sessionId && providerSession.sessionId !== chatId) {
+          console.log(
+            "[getChatMessagesByChatId] No messages found by chatId, retrying with provider sessionId:",
+            { chatId, providerSessionId: providerSession.sessionId }
+          );
+
+          for (const candidateUserId of userIds) {
+            const candidateRows = await querySessionMessages(
+              accessToken,
+              candidateUserId,
+              providerSession.sessionId
+            );
+
+            for (const candidateRow of candidateRows) {
+              mergeMessageRow(messagesById, candidateRow);
+            }
+          }
         }
+      } catch (providerError) {
+        console.warn(
+          "[getChatMessagesByChatId] Provider session lookup failed:",
+          providerError
+        );
       }
     }
 
@@ -249,6 +275,30 @@ export async function getChatMessagesByChatId({
   } catch (error) {
     console.error("Failed to load chat messages from BigQuery:", error);
     return [];
+  }
+}
+
+function mergeMessageRow(
+  messagesById: Map<string, BigQueryChatMessageRow>,
+  candidateRow: BigQueryChatMessageRow
+) {
+  const existingRow = messagesById.get(candidateRow.message_id);
+  if (!existingRow) {
+    messagesById.set(candidateRow.message_id, candidateRow);
+    return;
+  }
+
+  const existingUpdatedAt = parseSortableTimestamp(existingRow.updated_at);
+  const nextUpdatedAt = parseSortableTimestamp(candidateRow.updated_at);
+  const existingCreatedAt = parseSortableTimestamp(existingRow.created_at);
+  const nextCreatedAt = parseSortableTimestamp(candidateRow.created_at);
+
+  if (
+    nextUpdatedAt > existingUpdatedAt ||
+    (nextUpdatedAt === existingUpdatedAt &&
+      nextCreatedAt > existingCreatedAt)
+  ) {
+    messagesById.set(candidateRow.message_id, candidateRow);
   }
 }
 

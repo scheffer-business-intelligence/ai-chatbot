@@ -20,14 +20,35 @@ export default function Page(props: { params: Promise<{ id: string }> }) {
 }
 
 async function ChatPage({ params }: { params: Promise<{ id: string }> }) {
-  const { id } = await params;
-  const chat = await getChatById({ id });
+  let id: string;
+
+  try {
+    id = (await params).id;
+  } catch (error) {
+    console.error("[ChatPage] Failed to resolve params:", error);
+    redirect("/");
+  }
+
+  let chat: Awaited<ReturnType<typeof getChatById>>;
+  try {
+    chat = await getChatById({ id });
+  } catch (error) {
+    console.error("[ChatPage] getChatById error:", error);
+    redirect("/");
+  }
 
   if (!chat) {
     redirect("/");
   }
 
-  const session = await auth();
+  let session: Awaited<ReturnType<typeof auth>>;
+  try {
+    session = await auth();
+  } catch (error) {
+    console.error("[ChatPage] auth() error:", error);
+    redirect(`/login?callbackUrl=${encodeURIComponent(`/chat/${id}`)}`);
+  }
+
   const sessionUser = session?.user;
 
   let isOwner = false;
@@ -57,12 +78,18 @@ async function ChatPage({ params }: { params: Promise<{ id: string }> }) {
     redirect(`/login?callbackUrl=${encodeURIComponent(`/chat/${id}`)}`);
   }
 
-  const uiMessages = await getChatMessagesByChatId({
-    chatId: id,
-    userId: resolvedUserId,
-    fallbackUserId: isOwner ? resolvedFallbackUserId : undefined,
-    dedupeAssistantDuplicates: !isOwner,
-  });
+  let uiMessages: Awaited<ReturnType<typeof getChatMessagesByChatId>>;
+  try {
+    uiMessages = await getChatMessagesByChatId({
+      chatId: id,
+      userId: resolvedUserId,
+      fallbackUserId: isOwner ? resolvedFallbackUserId : undefined,
+      dedupeAssistantDuplicates: !isOwner,
+    });
+  } catch (error) {
+    console.error("[ChatPage] getChatMessagesByChatId error:", error);
+    uiMessages = [];
+  }
 
   const cookieStore = await cookies();
   const chatModelFromCookie = cookieStore.get("chat-model");
@@ -74,12 +101,13 @@ async function ChatPage({ params }: { params: Promise<{ id: string }> }) {
 
   if (!chatModelFromCookie || selectedModelId === DEFAULT_CHAT_MODEL) {
     return (
-      <DataStreamProvider>
+      <DataStreamProvider key={chat.id}>
         <Chat
           id={chat.id}
           initialChatModel={DEFAULT_CHAT_MODEL}
           initialMessages={uiMessages}
           isReadonly={!isOwner}
+          key={chat.id}
         />
         <DataStreamHandler />
       </DataStreamProvider>
@@ -87,12 +115,13 @@ async function ChatPage({ params }: { params: Promise<{ id: string }> }) {
   }
 
   return (
-    <DataStreamProvider>
+    <DataStreamProvider key={chat.id}>
       <Chat
         id={chat.id}
         initialChatModel={selectedModelId}
         initialMessages={uiMessages}
         isReadonly={!isOwner}
+        key={chat.id}
       />
       <DataStreamHandler />
     </DataStreamProvider>
