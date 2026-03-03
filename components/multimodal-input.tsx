@@ -325,6 +325,8 @@ function PureMultimodalInput({
     return () => textarea.removeEventListener("paste", handlePaste);
   }, [handlePaste]);
 
+  const isGenerating = status === "submitted" || status === "streaming";
+
   return (
     <div className={cn("relative flex w-full flex-col gap-4", className)}>
       {messages.length === 0 &&
@@ -417,7 +419,7 @@ function PureMultimodalInput({
             />
           </PromptInputTools>
 
-          {status === "submitted" ? (
+          {isGenerating ? (
             <StopButton setMessages={setMessages} stop={stop} />
           ) : (
             <PromptInputSubmit
@@ -570,7 +572,7 @@ function PureStopButton({
 }) {
   return (
     <Button
-      className="size-7 rounded-full bg-foreground p-1 text-background transition-colors duration-200 hover:bg-foreground/90 disabled:bg-muted disabled:text-muted-foreground"
+      className="size-7 cursor-pointer rounded-full bg-foreground p-1 text-background transition-colors duration-200 hover:bg-foreground/90 disabled:bg-muted disabled:text-muted-foreground"
       data-testid="stop-button"
       onClick={(event) => {
         event.preventDefault();

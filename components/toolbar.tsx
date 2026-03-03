@@ -374,6 +374,8 @@ const PureToolbar = ({
     return null;
   }
 
+  const isGenerating = status === "submitted" || status === "streaming";
+
   return (
     <TooltipProvider delayDuration={0}>
       <motion.div
@@ -423,10 +425,10 @@ const PureToolbar = ({
         ref={toolbarRef}
         transition={{ type: "spring", stiffness: 300, damping: 25 }}
       >
-        {status === "streaming" ? (
+        {isGenerating ? (
           <motion.div
             animate={{ scale: 1.4 }}
-            className="p-3"
+            className="cursor-pointer p-3"
             exit={{ scale: 1 }}
             initial={{ scale: 1 }}
             key="stop-icon"
