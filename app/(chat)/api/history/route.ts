@@ -87,21 +87,34 @@ export async function DELETE() {
     ...new Set([bigQueryUserId, fallbackBigQueryUserId].filter(Boolean)),
   ] as string[];
   let deletedCount = 0;
-  let hasSuccess = false;
+  let succeededUserIds = 0;
+  let hadFailure = false;
   let lastError: unknown = null;
 
   for (const userId of distinctUserIds) {
     try {
       const result = await deleteAllChatsByUserId({ userId });
       deletedCount += result.deletedCount;
-      hasSuccess = true;
+      succeededUserIds += 1;
     } catch (error) {
+      hadFailure = true;
       lastError = error;
       console.warn("Failed to delete chats for user id.", { userId, error });
     }
   }
 
-  if (!hasSuccess) {
+  if (succeededUserIds === 0) {
+    if (lastError instanceof ChatSDKError) {
+      return lastError.toResponse();
+    }
+
+    return new ChatSDKError(
+      "bad_request:database",
+      "Failed to delete all chats by user id"
+    ).toResponse();
+  }
+
+  if (hadFailure && deletedCount === 0) {
     if (lastError instanceof ChatSDKError) {
       return lastError.toResponse();
     }

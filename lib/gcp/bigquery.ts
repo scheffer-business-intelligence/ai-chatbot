@@ -446,7 +446,9 @@ function isTimestampColumnAssignmentError(error: unknown) {
 
   return (
     normalized.includes("cannot be assigned to created_at") ||
-    normalized.includes("cannot be assigned to updated_at")
+    normalized.includes("cannot be assigned to updated_at") ||
+    normalized.includes("cannot be inserted into column created_at") ||
+    normalized.includes("cannot be inserted into column updated_at")
   );
 }
 
@@ -534,7 +536,7 @@ function parseTemporalCastRequirements(
   const normalized = error.message.toLowerCase();
   const requirements: Partial<Record<TemporalColumn, boolean>> = {};
   const assignmentPattern =
-    /value of type\s+([a-z0-9_]+)\s+cannot be assigned to\s+(created_at|updated_at),\s+which has type\s+([a-z0-9_]+)/g;
+    /value(?:\s+has)?\s+type\s+([a-z0-9_]+)\s+which cannot be\s+(?:assigned to|inserted into column)\s+(created_at|updated_at),\s+which has type\s+([a-z0-9_]+)/g;
 
   let match = assignmentPattern.exec(normalized);
   while (match) {

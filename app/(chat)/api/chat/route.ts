@@ -281,6 +281,151 @@ function buildExportHintFromUserMessage(message: ChatMessage | null) {
   };
 }
 
+function isIncompleteChartWarning(chartError: string | null | undefined) {
+  if (!chartError) {
+    return false;
+  }
+
+  const normalizedChartError = chartError.replace(/\s+/g, " ").trim().toLowerCase();
+
+  return (
+    normalizedChartError === "bloco de grafico incompleto." ||
+    normalizedChartError === "bloco chart_context incompleto."
+  );
+}
+
+function messageHasPartType(
+  message: ChatMessage,
+  type:
+    | "data-chart-spec"
+    | "data-chart-specs"
+    | "data-chart-warning"
+    | "data-export-context"
+    | "data-export-hint"
+) {
+  return message.parts.some((part) => part.type === type);
+}
+
+function enrichAssistantMessageForPersistence({
+  message,
+  isAgentEngineRequest,
+  extractedContext,
+  exportHint,
+}: {
+  message: ChatMessage;
+  isAgentEngineRequest: boolean;
+  extractedContext: VertexExtractedContext;
+  exportHint: ReturnType<typeof buildExportHintFromUserMessage>;
+}): ChatMessage {
+  if (message.role !== "assistant") {
+    return message;
+  }
+
+  const nextParts = [...message.parts];
+  let changed = false;
+  const singleChartSpec =
+    extractedContext.chartSpec ??
+    (extractedContext.chartSpecs.length === 1
+      ? extractedContext.chartSpecs[0]
+      : null);
+
+  if (isAgentEngineRequest) {
+    if (
+      extractedContext.chartSpecs.length > 1 &&
+      !messageHasPartType(message, "data-chart-specs")
+    ) {
+      nextParts.push({
+        type: "data-chart-specs",
+        data: extractedContext.chartSpecs,
+      } as ChatMessage["parts"][number]);
+      changed = true;
+    } else if (
+      singleChartSpec &&
+      !messageHasPartType(message, "data-chart-spec") &&
+      !messageHasPartType(message, "data-chart-specs")
+    ) {
+      nextParts.push({
+        type: "data-chart-spec",
+        data: singleChartSpec,
+      } as ChatMessage["parts"][number]);
+      changed = true;
+    }
+
+    if (
+      extractedContext.chartError &&
+      !isIncompleteChartWarning(extractedContext.chartError) &&
+      !messageHasPartType(message, "data-chart-warning")
+    ) {
+      nextParts.push({
+        type: "data-chart-warning",
+        data: extractedContext.chartError,
+      } as ChatMessage["parts"][number]);
+      changed = true;
+    }
+
+    if (
+      extractedContext.contextSheets.length > 0 &&
+      !messageHasPartType(message, "data-export-context")
+    ) {
+      nextParts.push({
+        type: "data-export-context",
+        data: extractedContext.contextSheets,
+      } as ChatMessage["parts"][number]);
+      changed = true;
+    }
+  }
+
+  if (exportHint && !messageHasPartType(message, "data-export-hint")) {
+    nextParts.push({
+      type: "data-export-hint",
+      data: exportHint,
+    } as ChatMessage["parts"][number]);
+    changed = true;
+  }
+
+  if (!changed) {
+    return message;
+  }
+
+  return {
+    ...message,
+    parts: nextParts,
+  };
+}
+
+function enrichMessagesForPersistence({
+  messages,
+  isAgentEngineRequest,
+  extractedContext,
+  exportHint,
+}: {
+  messages: ChatMessage[];
+  isAgentEngineRequest: boolean;
+  extractedContext: VertexExtractedContext;
+  exportHint: ReturnType<typeof buildExportHintFromUserMessage>;
+}) {
+  const lastAssistantMessage = [...messages]
+    .reverse()
+    .find((currentMessage) => currentMessage.role === "assistant");
+
+  if (!lastAssistantMessage) {
+    return messages;
+  }
+
+  return messages.map((currentMessage) => {
+    if (currentMessage.id !== lastAssistantMessage.id) {
+      return currentMessage;
+    }
+
+    return enrichAssistantMessageForPersistence({
+      message: currentMessage,
+      isAgentEngineRequest,
+      extractedContext,
+      exportHint,
+    });
+  });
+}
+
 function shouldAllowTableChartFallback(message: ChatMessage): boolean {
   const userText = getTextFromMessage(message);
 
@@ -652,17 +797,24 @@ export async function POST(request: Request) {
     }: {
       messages: ChatMessage[];
     }) => {
+      const messagesToPersist = enrichMessagesForPersistence({
+        messages: finishedMessages,
+        isAgentEngineRequest,
+        extractedContext,
+        exportHint,
+      });
+
       if (pendingPersistenceTasks.length > 0) {
         await Promise.allSettled([...pendingPersistenceTasks]);
       }
 
       const answeredInMs = Math.max(Date.now() - requestStartedAtMs, 0);
-      const lastAssistantMessageId = [...finishedMessages]
+      const lastAssistantMessageId = [...messagesToPersist]
         .reverse()
         .find((currentMessage) => currentMessage.role === "assistant")?.id;
 
       if (isToolApprovalFlow) {
-        for (const finishedMsg of finishedMessages) {
+        for (const finishedMsg of messagesToPersist) {
           const existingMsg = uiMessages.find((m) => m.id === finishedMsg.id);
           const shouldPersistChartContext =
             isAgentEngineRequest &&
@@ -702,9 +854,9 @@ export async function POST(request: Request) {
             });
           }
         }
-      } else if (finishedMessages.length > 0) {
+      } else if (messagesToPersist.length > 0) {
         await saveMessages({
-          messages: finishedMessages.map((currentMessage) => ({
+          messages: messagesToPersist.map((currentMessage) => ({
             id: currentMessage.id,
             role: currentMessage.role,
             parts: currentMessage.parts,
@@ -900,6 +1052,7 @@ export async function POST(request: Request) {
               });
 
               let fullResponseText = "";
+              let finalResponseText: string | null = null;
 
               for await (const event of streamVertexQuery({
                 accessToken: serviceAccountAccessToken,
@@ -919,6 +1072,27 @@ export async function POST(request: Request) {
                     type: "data-agent-status",
                     data: event.status,
                   });
+                  continue;
+                }
+
+                if (event.type === "final") {
+                  if (event.text.trim().length > 0) {
+                    finalResponseText = event.text;
+                    hasVisibleOutput = true;
+
+                    if (firstDeltaAtMs === null) {
+                      firstDeltaAtMs = Date.now();
+                      logAgentEngineEvent("info", {
+                        event: "first_delta",
+                        request_id: requestId,
+                        chat_id: id,
+                        session_id: currentProviderSessionId,
+                        user_id: bigQueryUserId,
+                        model_id: selectedChatModel,
+                        first_delta_ms: firstDeltaAtMs - requestStartedAtMs,
+                      });
+                    }
+                  }
                   continue;
                 }
 
@@ -946,25 +1120,21 @@ export async function POST(request: Request) {
                 }
               }
 
-              if (fullResponseText.length > 0) {
+              const responseTextToRender =
+                finalResponseText && finalResponseText.trim().length > 0
+                  ? finalResponseText
+                  : fullResponseText;
+
+              if (responseTextToRender.length > 0) {
                 dataStream.write({
                   type: "data-agent-status",
                   data: "Formatando resposta...",
                 });
-
-                // Smooth stream the buffered text
-                const chunkSize = 12; // characters per chunk
-                const delayMs = 10;   // ms between chunks
-
-                for (let i = 0; i < fullResponseText.length; i += chunkSize) {
-                  const chunk = fullResponseText.slice(i, i + chunkSize);
-                  dataStream.write({
-                    type: "text-delta",
-                    id: textPartId,
-                    delta: chunk,
-                  });
-                  await new Promise((resolve) => setTimeout(resolve, delayMs));
-                }
+                dataStream.write({
+                  type: "text-delta",
+                  id: textPartId,
+                  delta: responseTextToRender,
+                });
               }
 
               logAgentEngineEvent("info", {
@@ -1398,15 +1568,26 @@ export async function DELETE(request: Request) {
     return new ChatSDKError("forbidden:chat").toResponse();
   }
 
-  await softDeleteSessionMessagesByChatId({
-    chatId: id,
-    userId: bigQueryUserId,
-    fallbackUserId: fallbackBigQueryUserId,
-  });
+  try {
+    await softDeleteSessionMessagesByChatId({
+      chatId: id,
+      userId: bigQueryUserId,
+      fallbackUserId: fallbackBigQueryUserId,
+    });
 
-  const deletedChat = await deleteChatById({ id });
+    const deletedChat = await deleteChatById({ id });
 
-  return Response.json(deletedChat, { status: 200 });
+    return Response.json(deletedChat, { status: 200 });
+  } catch (error) {
+    if (error instanceof ChatSDKError) {
+      return error.toResponse();
+    }
+
+    return new ChatSDKError(
+      "bad_request:database",
+      "Failed to delete chat by id"
+    ).toResponse();
+  }
 }
 
 export async function PATCH(request: Request) {

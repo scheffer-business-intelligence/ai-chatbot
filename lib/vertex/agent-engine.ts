@@ -28,7 +28,8 @@ export type VertexExtractedContext = {
 
 export type VertexStreamEvent =
   | { type: "status"; status: string }
-  | { type: "text"; delta: string };
+  | { type: "text"; delta: string }
+  | { type: "final"; text: string };
 
 const DEFAULT_AGENT_STATUS_PREFIXES = [
   "Processando sua solicitação...",
@@ -1064,6 +1065,32 @@ function extractVisibleDelta(
   };
 }
 
+function pickPreferredVisibleText(currentBest: string, candidate: string): string {
+  const normalizedCandidate = candidate.trim();
+  if (!normalizedCandidate) {
+    return currentBest;
+  }
+
+  if (!currentBest) {
+    return candidate;
+  }
+
+  if (candidate === currentBest) {
+    return currentBest;
+  }
+
+  if (candidate.includes(currentBest)) {
+    return candidate;
+  }
+
+  if (currentBest.includes(candidate)) {
+    return currentBest;
+  }
+
+  // Prefer richer snapshots when stream payloads are inconsistent.
+  return candidate.length > currentBest.length ? candidate : currentBest;
+}
+
 type ChartResolutionSource =
   | "chart_context"
   | "bq_context_fallback"
@@ -1232,6 +1259,7 @@ export async function* streamVertexQuery({
 
   let accumulatedRawText = "";
   let accumulatedVisibleText = "";
+  let bestVisibleText = "";
   let lastStatus: string | null = null;
   const statusHistory: string[] = [];
   const seenStatuses = new Set<string>();
@@ -1297,6 +1325,15 @@ export async function* streamVertexQuery({
         continue;
       }
 
+      const candidateVisibleText = stripLeadingAgentStatuses(
+        stripContextBlocksForStream(text),
+        statusHistory
+      );
+      bestVisibleText = pickPreferredVisibleText(
+        bestVisibleText,
+        candidateVisibleText
+      );
+
       const nextRawText = computeNextRawText(text, accumulatedRawText);
       const { delta, nextVisibleText } = extractVisibleDelta(
         nextRawText,
@@ -1319,15 +1356,20 @@ export async function* streamVertexQuery({
     }
 
     writeExtractedContext(accumulatedRawText);
+    const finalVisibleText = bestVisibleText.trim()
+      ? bestVisibleText
+      : accumulatedVisibleText;
     applyChartResolution({
       allowFallback: allowTableChartFallback,
-      visibleText: accumulatedVisibleText,
+      visibleText: finalVisibleText,
       extractedContext,
     });
 
-    if (!accumulatedVisibleText.trim()) {
+    if (!finalVisibleText.trim()) {
       throw new Error("Vertex AI returned an empty response");
     }
+
+    yield { type: "final", text: finalVisibleText };
 
     return;
   }
@@ -1353,6 +1395,12 @@ export async function* streamVertexQuery({
       continue;
     }
 
+    const candidateVisibleText = stripLeadingAgentStatuses(
+      stripContextBlocksForStream(text),
+      statusHistory
+    );
+    bestVisibleText = pickPreferredVisibleText(bestVisibleText, candidateVisibleText);
+
     const nextRawText = computeNextRawText(text, accumulatedRawText);
     const { delta, nextVisibleText } = extractVisibleDelta(
       nextRawText,
@@ -1375,13 +1423,16 @@ export async function* streamVertexQuery({
   }
 
   writeExtractedContext(accumulatedRawText);
+  const finalVisibleText = bestVisibleText.trim()
+    ? bestVisibleText
+    : accumulatedVisibleText;
   applyChartResolution({
     allowFallback: allowTableChartFallback,
-    visibleText: accumulatedVisibleText,
+    visibleText: finalVisibleText,
     extractedContext,
   });
 
-  if (!accumulatedVisibleText.trim()) {
+  if (!finalVisibleText.trim()) {
     if (rawSamples.length > 0) {
       console.warn(
         "Vertex stream payload sample (no text extracted):",
@@ -1390,4 +1441,6 @@ export async function* streamVertexQuery({
     }
     throw new Error("Vertex AI returned an empty response");
   }
+
+  yield { type: "final", text: finalVisibleText };
 }

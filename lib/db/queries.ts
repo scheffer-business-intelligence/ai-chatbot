@@ -518,6 +518,19 @@ function isMetaSessionId(sessionId: string | null | undefined): boolean {
   return (sessionId ?? "").startsWith(META_SESSION_PREFIX);
 }
 
+function isStreamingBufferMutationError(error: unknown): boolean {
+  if (!(error instanceof Error)) {
+    return false;
+  }
+
+  const normalized = error.message.toLowerCase();
+
+  return (
+    normalized.includes("update or delete statement over table") &&
+    normalized.includes("streaming buffer")
+  );
+}
+
 function extractTextFromParts(parts: DBMessage["parts"]): string {
   if (!Array.isArray(parts)) {
     return "";
@@ -895,8 +908,8 @@ async function getChatMetaById(chatId: string): Promise<Chat | null> {
           is_deleted,
           ROW_NUMBER() OVER(
             PARTITION BY message_id 
-            ORDER BY COALESCE(SAFE_CAST(updated_at AS TIMESTAMP), SAFE_CAST(created_at AS TIMESTAMP)) DESC, 
-                     is_deleted DESC
+            ORDER BY is_deleted DESC,
+                     COALESCE(SAFE_CAST(updated_at AS TIMESTAMP), SAFE_CAST(created_at AS TIMESTAMP)) DESC
           ) as rn
         FROM \`${MESSAGES_TABLE_REF}\`
         WHERE message_id = @message_id
@@ -931,8 +944,8 @@ async function getChatMetaById(chatId: string): Promise<Chat | null> {
           is_deleted,
           ROW_NUMBER() OVER(
             PARTITION BY message_id 
-            ORDER BY COALESCE(SAFE_CAST(updated_at AS TIMESTAMP), SAFE_CAST(created_at AS TIMESTAMP)) DESC, 
-                     is_deleted DESC
+            ORDER BY is_deleted DESC,
+                     COALESCE(SAFE_CAST(updated_at AS TIMESTAMP), SAFE_CAST(created_at AS TIMESTAMP)) DESC
           ) as rn
         FROM \`${MESSAGES_TABLE_REF}\`
         WHERE message_id = @message_id
@@ -1242,8 +1255,8 @@ export async function deleteChatById({ id }: { id: string }) {
     try {
       await runQuery(
         `
-          INSERT INTO \`${MESSAGES_TABLE_REF}\` (message_id, session_id, role, content, created_at, user_id, is_deleted, answered_in, updated_at, parts_json, attachments_json, chart_spec_json, chart_error, visibility, chat_id)
-          SELECT message_id, session_id, role, content, created_at, user_id, TRUE as is_deleted, answered_in, CURRENT_TIMESTAMP() as updated_at, parts_json, attachments_json, chart_spec_json, chart_error, visibility, chat_id
+          INSERT INTO \`${MESSAGES_TABLE_REF}\` (message_id, session_id, role, content, created_at, user_id, is_deleted)
+          SELECT message_id, session_id, role, content, created_at, user_id, TRUE as is_deleted
           FROM \`${MESSAGES_TABLE_REF}\`
           WHERE (chat_id = @chat_id OR (chat_id IS NULL AND session_id = @chat_id))
             AND (is_deleted IS NULL OR is_deleted = FALSE)
@@ -1253,8 +1266,8 @@ export async function deleteChatById({ id }: { id: string }) {
     } catch {
       await runQuery(
         `
-          INSERT INTO \`${MESSAGES_TABLE_REF}\` (message_id, session_id, role, content, created_at, user_id, is_deleted, answered_in, updated_at, parts_json, attachments_json, chart_spec_json, chart_error, visibility, chat_id)
-          SELECT message_id, session_id, role, content, created_at, user_id, TRUE as is_deleted, answered_in, CURRENT_TIMESTAMP() as updated_at, parts_json, attachments_json, chart_spec_json, chart_error, visibility, chat_id
+          INSERT INTO \`${MESSAGES_TABLE_REF}\` (message_id, session_id, role, content, created_at, user_id, is_deleted)
+          SELECT message_id, session_id, role, content, created_at, user_id, TRUE as is_deleted
           FROM \`${MESSAGES_TABLE_REF}\`
           WHERE session_id = @chat_id
             AND (is_deleted IS NULL OR is_deleted = FALSE)
@@ -1265,8 +1278,8 @@ export async function deleteChatById({ id }: { id: string }) {
 
     await runQuery(
       `
-        INSERT INTO \`${MESSAGES_TABLE_REF}\` (message_id, session_id, role, content, created_at, user_id, is_deleted, answered_in, updated_at, parts_json, attachments_json, chart_spec_json, chart_error, visibility, chat_id)
-        SELECT message_id, session_id, role, content, created_at, user_id, TRUE as is_deleted, answered_in, CURRENT_TIMESTAMP() as updated_at, parts_json, attachments_json, chart_spec_json, chart_error, visibility, chat_id
+        INSERT INTO \`${MESSAGES_TABLE_REF}\` (message_id, session_id, role, content, created_at, user_id, is_deleted)
+        SELECT message_id, session_id, role, content, created_at, user_id, TRUE as is_deleted
         FROM \`${MESSAGES_TABLE_REF}\`
         WHERE STARTS_WITH(message_id, @provider_prefix)
           AND (session_id = @chat_id OR session_id = @provider_session)
@@ -1289,8 +1302,8 @@ export async function deleteChatById({ id }: { id: string }) {
 
     await runQuery(
       `
-        INSERT INTO \`${MESSAGES_TABLE_REF}\` (message_id, session_id, role, content, created_at, user_id, is_deleted, answered_in, updated_at, parts_json, attachments_json, chart_spec_json, chart_error, visibility, chat_id)
-        SELECT message_id, session_id, role, content, created_at, user_id, TRUE as is_deleted, answered_in, CURRENT_TIMESTAMP() as updated_at, parts_json, attachments_json, chart_spec_json, chart_error, visibility, chat_id
+        INSERT INTO \`${MESSAGES_TABLE_REF}\` (message_id, session_id, role, content, created_at, user_id, is_deleted)
+        SELECT message_id, session_id, role, content, created_at, user_id, TRUE as is_deleted
         FROM \`${MESSAGES_TABLE_REF}\`
         WHERE message_id = @message_id
           AND role = 'system'
@@ -1305,7 +1318,8 @@ export async function deleteChatById({ id }: { id: string }) {
     );
 
     return chat;
-  } catch (_error) {
+  } catch (error) {
+    console.warn("Failed to delete chat by id in BigQuery.", { id, error });
     throw new ChatSDKError(
       "bad_request:database",
       "Failed to delete chat by id"
@@ -1338,42 +1352,141 @@ export async function deleteAllChatsByUserId({ userId }: { userId: string }) {
     `
   );
 
-  const chatIds = rows
-    .map((row) => stripPrefix(row.message_id, "chat:"))
-    .filter((chatId) => chatId.length > 0);
+  const chatIds = [
+    ...new Set(
+      rows
+        .map((row) => stripPrefix(row.message_id, "chat:"))
+        .filter((chatId) => chatId.length > 0)
+    ),
+  ];
 
   if (chatIds.length === 0) {
     return { deletedCount: 0 };
   }
 
-  let deletedCount = 0;
-  const failedChatIds: string[] = [];
-
-  for (const chatId of chatIds) {
+  try {
+    await runQuery(
+      `
+        INSERT INTO \`${MESSAGES_TABLE_REF}\` (
+          message_id,
+          session_id,
+          role,
+          content,
+          created_at,
+          user_id,
+          is_deleted
+        )
+        WITH target_chats AS (
+          SELECT DISTINCT SUBSTR(message_id, LENGTH(@chat_prefix) + 1) AS chat_id
+          FROM \`${MESSAGES_TABLE_REF}\`
+          WHERE STARTS_WITH(message_id, @chat_prefix)
+            AND role = 'system'
+            AND user_id = @user_id
+            AND (is_deleted IS NULL OR is_deleted = FALSE)
+        )
+        SELECT
+          message_id,
+          session_id,
+          role,
+          content,
+          created_at,
+          user_id,
+          TRUE AS is_deleted
+        FROM \`${MESSAGES_TABLE_REF}\`
+        WHERE user_id = @user_id
+          AND (is_deleted IS NULL OR is_deleted = FALSE)
+          AND (
+            chat_id IN (SELECT chat_id FROM target_chats)
+            OR session_id IN (SELECT chat_id FROM target_chats)
+            OR (
+              STARTS_WITH(message_id, @chat_prefix)
+              AND SUBSTR(message_id, LENGTH(@chat_prefix) + 1)
+                IN (SELECT chat_id FROM target_chats)
+            )
+            OR (
+              STARTS_WITH(message_id, @provider_prefix)
+              AND REGEXP_EXTRACT(message_id, r'^provider:([^:]+):')
+                IN (SELECT chat_id FROM target_chats)
+            )
+          )
+      `,
+      [
+        { name: "chat_prefix", type: "STRING", value: CHAT_META_MESSAGE_PREFIX },
+        { name: "provider_prefix", type: "STRING", value: "provider:" },
+        { name: "user_id", type: "STRING", value: userId },
+      ]
+    );
+  } catch (error) {
     try {
-      await deleteChatById({ id: chatId });
-      deletedCount += 1;
-    } catch (error) {
-      failedChatIds.push(chatId);
-      console.warn(
-        "Failed to delete chat while deleting all chats by user id.",
-        {
-          userId,
-          chatId,
-          error,
-        }
+      await runQuery(
+        `
+          INSERT INTO \`${MESSAGES_TABLE_REF}\` (
+            message_id,
+            session_id,
+            role,
+            content,
+            created_at,
+            user_id,
+            is_deleted
+          )
+          WITH target_chats AS (
+            SELECT DISTINCT SUBSTR(message_id, LENGTH(@chat_prefix) + 1) AS chat_id
+            FROM \`${MESSAGES_TABLE_REF}\`
+            WHERE STARTS_WITH(message_id, @chat_prefix)
+              AND role = 'system'
+              AND user_id = @user_id
+              AND (is_deleted IS NULL OR is_deleted = FALSE)
+          )
+          SELECT
+            message_id,
+            session_id,
+            role,
+            content,
+            created_at,
+            user_id,
+            TRUE AS is_deleted
+          FROM \`${MESSAGES_TABLE_REF}\`
+          WHERE user_id = @user_id
+            AND (is_deleted IS NULL OR is_deleted = FALSE)
+            AND (
+              session_id IN (SELECT chat_id FROM target_chats)
+              OR (
+                STARTS_WITH(message_id, @chat_prefix)
+                AND SUBSTR(message_id, LENGTH(@chat_prefix) + 1)
+                  IN (SELECT chat_id FROM target_chats)
+              )
+              OR (
+                STARTS_WITH(message_id, @provider_prefix)
+                AND REGEXP_EXTRACT(message_id, r'^provider:([^:]+):')
+                  IN (SELECT chat_id FROM target_chats)
+              )
+            )
+        `,
+        [
+          {
+            name: "chat_prefix",
+            type: "STRING",
+            value: CHAT_META_MESSAGE_PREFIX,
+          },
+          { name: "provider_prefix", type: "STRING", value: "provider:" },
+          { name: "user_id", type: "STRING", value: userId },
+        ]
+      );
+    } catch (fallbackError) {
+      console.warn("Bulk delete chats failed in BigQuery.", {
+        userId,
+        error,
+        fallbackError,
+      });
+
+      throw new ChatSDKError(
+        "bad_request:database",
+        "Failed to delete all chats by user id"
       );
     }
   }
 
-  if (deletedCount === 0 && failedChatIds.length > 0) {
-    throw new ChatSDKError(
-      "bad_request:database",
-      "Failed to delete all chats by user id"
-    );
-  }
-
-  return { deletedCount };
+  return { deletedCount: chatIds.length };
 }
 
 export async function getChatsByUserId({
@@ -1421,8 +1534,8 @@ export async function getChatsByUserId({
             is_deleted,
             ROW_NUMBER() OVER(
               PARTITION BY message_id 
-              ORDER BY COALESCE(SAFE_CAST(updated_at AS TIMESTAMP), SAFE_CAST(created_at AS TIMESTAMP)) DESC, 
-                       is_deleted DESC
+              ORDER BY is_deleted DESC,
+                       COALESCE(SAFE_CAST(updated_at AS TIMESTAMP), SAFE_CAST(created_at AS TIMESTAMP)) DESC
             ) as rn
           FROM \`${MESSAGES_TABLE_REF}\`
           WHERE STARTS_WITH(message_id, @chat_prefix)
@@ -1472,8 +1585,8 @@ export async function getChatsByUserId({
             is_deleted,
             ROW_NUMBER() OVER(
               PARTITION BY message_id 
-              ORDER BY COALESCE(SAFE_CAST(updated_at AS TIMESTAMP), SAFE_CAST(created_at AS TIMESTAMP)) DESC, 
-                       is_deleted DESC
+              ORDER BY is_deleted DESC,
+                       COALESCE(SAFE_CAST(updated_at AS TIMESTAMP), SAFE_CAST(created_at AS TIMESTAMP)) DESC
             ) as rn
           FROM \`${MESSAGES_TABLE_REF}\`
           WHERE STARTS_WITH(message_id, @chat_prefix)
@@ -1521,8 +1634,8 @@ export async function getChatsByUserId({
               is_deleted,
               ROW_NUMBER() OVER(
                 PARTITION BY message_id 
-                ORDER BY COALESCE(SAFE_CAST(updated_at AS TIMESTAMP), SAFE_CAST(created_at AS TIMESTAMP)) DESC, 
-                         is_deleted DESC
+                ORDER BY is_deleted DESC,
+                         COALESCE(SAFE_CAST(updated_at AS TIMESTAMP), SAFE_CAST(created_at AS TIMESTAMP)) DESC
               ) as rn
             FROM \`${MESSAGES_TABLE_REF}\`
             WHERE user_id = @user_id
@@ -1577,8 +1690,8 @@ export async function getChatsByUserId({
               is_deleted,
               ROW_NUMBER() OVER(
                 PARTITION BY message_id 
-                ORDER BY COALESCE(SAFE_CAST(updated_at AS TIMESTAMP), SAFE_CAST(created_at AS TIMESTAMP)) DESC, 
-                         is_deleted DESC
+                ORDER BY is_deleted DESC,
+                         COALESCE(SAFE_CAST(updated_at AS TIMESTAMP), SAFE_CAST(created_at AS TIMESTAMP)) DESC
               ) as rn
             FROM \`${MESSAGES_TABLE_REF}\`
             WHERE user_id = @user_id
@@ -2046,6 +2159,11 @@ export async function updateMessageAnsweredIn({
       await runQuery(attempt.query, attempt.params);
       return;
     } catch (error) {
+      if (isStreamingBufferMutationError(error)) {
+        // answered_in is telemetry only; rows still in streaming buffer can be skipped.
+        return;
+      }
+
       attemptErrors.push(
         `${attempt.label}: ${error instanceof Error ? error.message : String(error)}`
       );
@@ -2079,8 +2197,8 @@ export async function getMessagesByChatId({ id }: { id: string }) {
             is_deleted,
             ROW_NUMBER() OVER(
               PARTITION BY message_id 
-              ORDER BY COALESCE(SAFE_CAST(updated_at AS TIMESTAMP), SAFE_CAST(created_at AS TIMESTAMP)) DESC, 
-                       is_deleted DESC
+              ORDER BY is_deleted DESC,
+                       COALESCE(SAFE_CAST(updated_at AS TIMESTAMP), SAFE_CAST(created_at AS TIMESTAMP)) DESC
             ) as rn
           FROM \`${MESSAGES_TABLE_REF}\`
           WHERE (chat_id = @chat_id OR (chat_id IS NULL AND session_id = @chat_id))
@@ -2121,8 +2239,8 @@ export async function getMessagesByChatId({ id }: { id: string }) {
             is_deleted,
             ROW_NUMBER() OVER(
               PARTITION BY message_id 
-              ORDER BY COALESCE(SAFE_CAST(updated_at AS TIMESTAMP), SAFE_CAST(created_at AS TIMESTAMP)) DESC, 
-                       is_deleted DESC
+              ORDER BY is_deleted DESC,
+                       COALESCE(SAFE_CAST(updated_at AS TIMESTAMP), SAFE_CAST(created_at AS TIMESTAMP)) DESC
             ) as rn
           FROM \`${MESSAGES_TABLE_REF}\`
           WHERE session_id = @chat_id
@@ -2457,8 +2575,8 @@ export async function deleteMessagesByChatIdAfterTimestamp({
     try {
       await runQuery(
         `
-          INSERT INTO \`${MESSAGES_TABLE_REF}\` (message_id, session_id, role, content, created_at, user_id, is_deleted, answered_in, updated_at, parts_json, attachments_json, chart_spec_json, chart_error, visibility, chat_id)
-          SELECT message_id, session_id, role, content, created_at, user_id, TRUE as is_deleted, answered_in, CURRENT_TIMESTAMP() as updated_at, parts_json, attachments_json, chart_spec_json, chart_error, visibility, chat_id
+          INSERT INTO \`${MESSAGES_TABLE_REF}\` (message_id, session_id, role, content, created_at, user_id, is_deleted)
+          SELECT message_id, session_id, role, content, created_at, user_id, TRUE as is_deleted
           FROM \`${MESSAGES_TABLE_REF}\`
           WHERE (chat_id = @chat_id OR (chat_id IS NULL AND session_id = @chat_id))
             AND NOT STARTS_WITH(session_id, @meta_prefix)
@@ -2474,8 +2592,8 @@ export async function deleteMessagesByChatIdAfterTimestamp({
     } catch {
       await runQuery(
         `
-          INSERT INTO \`${MESSAGES_TABLE_REF}\` (message_id, session_id, role, content, created_at, user_id, is_deleted, answered_in, updated_at, parts_json, attachments_json, chart_spec_json, chart_error, visibility, chat_id)
-          SELECT message_id, session_id, role, content, created_at, user_id, TRUE as is_deleted, answered_in, CURRENT_TIMESTAMP() as updated_at, parts_json, attachments_json, chart_spec_json, chart_error, visibility, chat_id
+          INSERT INTO \`${MESSAGES_TABLE_REF}\` (message_id, session_id, role, content, created_at, user_id, is_deleted)
+          SELECT message_id, session_id, role, content, created_at, user_id, TRUE as is_deleted
           FROM \`${MESSAGES_TABLE_REF}\`
           WHERE session_id = @chat_id
             AND NOT STARTS_WITH(session_id, @meta_prefix)

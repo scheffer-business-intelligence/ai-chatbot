@@ -1016,7 +1016,15 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 function looksLikeChartSpecCandidate(value: Record<string, unknown>): boolean {
   const chartSpecHints = [
     "type",
+    "chartType",
+    "chart_type",
     "data",
+    "rows",
+    "labels",
+    "datasets",
+    "values",
+    "x",
+    "y",
     "xKey",
     "yKey",
     "seriesKey",
@@ -1042,6 +1050,9 @@ function collectChartSpecCandidates(root: unknown): unknown[] {
     "chartSpecs",
     "chartContext",
     "chart_context",
+    "graphs",
+    "visualizations",
+    "graficos",
     "payload",
     "result",
     "output",
@@ -1117,6 +1128,497 @@ function dedupeChartSpecs(specs: ChartSpecV1[]): ChartSpecV1[] {
   return deduped;
 }
 
+function pickFirstPresentValue(
+  value: Record<string, unknown>,
+  keys: string[]
+): unknown {
+  for (const key of keys) {
+    if (key in value) {
+      return value[key];
+    }
+  }
+
+  return undefined;
+}
+
+function pickStringValue(
+  value: Record<string, unknown>,
+  keys: string[]
+): string | undefined {
+  const raw = pickFirstPresentValue(value, keys);
+  if (typeof raw !== "string") {
+    return undefined;
+  }
+
+  const trimmed = stripInlineMarkdown(raw).trim();
+  return trimmed.length > 0 ? trimmed : undefined;
+}
+
+function toNormalizedKey(raw: string, fallback: string): string {
+  const normalized = raw
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^a-zA-Z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "")
+    .toLowerCase();
+
+  return normalized.length > 0 ? normalized.slice(0, 40) : fallback;
+}
+
+function toLooseChartType(value: unknown): ChartSpecV1["type"] | null {
+  if (typeof value !== "string") {
+    return null;
+  }
+
+  const normalized = value.trim().toLowerCase();
+
+  if (
+    normalized.includes("line") ||
+    normalized.includes("linha") ||
+    normalized.includes("spline")
+  ) {
+    return "line";
+  }
+
+  if (normalized.includes("area")) {
+    return "area";
+  }
+
+  if (
+    normalized.includes("pie") ||
+    normalized.includes("donut") ||
+    normalized.includes("pizza") ||
+    normalized.includes("rosca")
+  ) {
+    return "pie";
+  }
+
+  if (
+    normalized.includes("bar") ||
+    normalized.includes("column") ||
+    normalized.includes("coluna") ||
+    normalized.includes("barras")
+  ) {
+    return "bar";
+  }
+
+  return null;
+}
+
+function toStringArray(value: unknown): string[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  return value
+    .map((entry) => toNormalizedCellText(entry))
+    .filter((entry) => entry.length > 0)
+    .slice(0, 50);
+}
+
+function toNumericArray(value: unknown): number[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  const numbers: number[] = [];
+
+  for (const entry of value) {
+    const parsed = parseLocaleNumberFromUnknown(entry);
+    if (parsed === null) {
+      continue;
+    }
+    numbers.push(parsed);
+  }
+
+  return numbers.slice(0, 50);
+}
+
+function inferSpecFromRecordRows(
+  rows: Record<string, unknown>[],
+  options: {
+    chartType: ChartSpecV1["type"] | null;
+    title?: string;
+    subtitle?: string;
+    xKeyHint?: string;
+    yLabelHint?: string;
+    unitHint?: string;
+  }
+): ChartSpecV1 | null {
+  const normalizedRows = rows.filter((row) => row !== null).slice(0, 50);
+  if (normalizedRows.length < 2) {
+    return null;
+  }
+
+  const columns = Array.from(
+    normalizedRows.reduce((set, row) => {
+      for (const key of Object.keys(row)) {
+        const trimmedKey = key.trim();
+        if (trimmedKey) {
+          set.add(trimmedKey);
+        }
+      }
+      return set;
+    }, new Set<string>())
+  );
+
+  if (columns.length < 2) {
+    return null;
+  }
+
+  const hintedCategoryColumn =
+    options.xKeyHint && columns.includes(options.xKeyHint)
+      ? options.xKeyHint
+      : null;
+  const categoryColumn =
+    hintedCategoryColumn ?? pickCategoryColumn(normalizedRows, columns);
+
+  if (!categoryColumn) {
+    return null;
+  }
+
+  const numericColumns = pickNumericColumns(normalizedRows, columns, categoryColumn);
+  if (numericColumns.length === 0) {
+    return null;
+  }
+
+  const normalizedData = normalizedRows
+    .map((row, index) => {
+      const normalizedRow: Record<string, unknown> = {
+        category: toNormalizedCellText(row[categoryColumn]) || `Item ${index + 1}`,
+      };
+
+      for (const numericColumn of numericColumns) {
+        const parsed = parseLocaleNumberFromUnknown(row[numericColumn]);
+        if (parsed !== null) {
+          normalizedRow[numericColumn] = parsed;
+        }
+      }
+
+      return normalizedRow;
+    })
+    .filter((row) =>
+      numericColumns.some((numericColumn) => typeof row[numericColumn] === "number")
+    );
+
+  if (normalizedData.length < 2) {
+    return null;
+  }
+
+  const primaryAxisInfo = extractLabelAndUnit(numericColumns[0] ?? "Valor");
+
+  const inferredSpec: ChartSpecV1 = {
+    version: "1.0",
+    type:
+      options.chartType && options.chartType !== "pie"
+        ? options.chartType
+        : numericColumns.length > 1
+          ? "line"
+          : "bar",
+    title: normalizeChartTitle(options.title),
+    subtitle: options.subtitle?.slice(0, 220) || undefined,
+    data: normalizedData,
+    xKey: "category",
+    series: numericColumns.map((column, index) => {
+      const axisInfo = extractLabelAndUnit(column);
+      const colors = ["#22c55e", "#0ea5e9", "#f97316", "#eab308"];
+
+      return {
+        key: column,
+        label: axisInfo.label,
+        color: colors[index % colors.length],
+      };
+    }),
+    yLabel: options.yLabelHint || primaryAxisInfo.label || undefined,
+    unit: options.unitHint || primaryAxisInfo.unit,
+  };
+
+  const validation = chartSpecSchema.safeParse(inferredSpec);
+  return validation.success ? validation.data : null;
+}
+
+function inferSpecFromLoosePayload(value: unknown): ChartSpecV1 | null {
+  if (!isRecord(value)) {
+    return null;
+  }
+
+  const chartType =
+    toLooseChartType(value.type) ??
+    toLooseChartType(value.chartType) ??
+    toLooseChartType(value.chart_type);
+  const title = pickStringValue(value, ["title", "name", "chartTitle", "titulo"]);
+  const subtitle = pickStringValue(value, [
+    "subtitle",
+    "description",
+    "observations",
+    "subtitulo",
+  ]);
+  const unit = pickStringValue(value, ["unit", "unidade"]);
+  const yLabel = pickStringValue(value, [
+    "yLabel",
+    "y_axis_label",
+    "metric",
+    "medida",
+  ]);
+  const xKeyHint = pickStringValue(value, [
+    "xKey",
+    "x_key",
+    "categoryKey",
+    "labelKey",
+  ]);
+
+  const rowsCandidate = pickFirstPresentValue(value, [
+    "data",
+    "rows",
+    "records",
+    "items",
+    "points",
+  ]);
+
+  if (Array.isArray(rowsCandidate)) {
+    const recordRows = rowsCandidate.filter((entry): entry is Record<string, unknown> =>
+      isRecord(entry)
+    );
+
+    if (recordRows.length > 0) {
+      if (chartType === "pie") {
+        const columns = Array.from(
+          recordRows.reduce((set, row) => {
+            for (const key of Object.keys(row)) {
+              const trimmedKey = key.trim();
+              if (trimmedKey) {
+                set.add(trimmedKey);
+              }
+            }
+            return set;
+          }, new Set<string>())
+        );
+
+        const nameKey =
+          pickStringValue(value, ["nameKey", "name_key", "labelKey", "categoryKey"]) ??
+          pickCategoryColumn(recordRows, columns) ??
+          "category";
+        const valueKey =
+          pickStringValue(value, ["valueKey", "value_key", "yKey", "y_key"]) ??
+          pickNumericColumns(recordRows, columns, nameKey)[0] ??
+          "value";
+
+        const normalizedData = recordRows
+          .map((row, index) => {
+            const name = toNormalizedCellText(row[nameKey]) || `Item ${index + 1}`;
+            const numericValue = parseLocaleNumberFromUnknown(row[valueKey]);
+            if (numericValue === null) {
+              return null;
+            }
+            return { [nameKey]: name, [valueKey]: numericValue };
+          })
+          .filter(
+            (row): row is Record<string, string | number> => row !== null
+          )
+          .slice(0, 50);
+
+        if (normalizedData.length > 0) {
+          const pieSpec: ChartSpecV1 = {
+            version: "1.0",
+            type: "pie",
+            title: normalizeChartTitle(title),
+            subtitle: subtitle?.slice(0, 220) || undefined,
+            data: normalizedData,
+            nameKey,
+            valueKey,
+            unit: unit || undefined,
+          };
+
+          const validation = chartSpecSchema.safeParse(pieSpec);
+          if (validation.success) {
+            return validation.data;
+          }
+        }
+      } else {
+        const fromRows = inferSpecFromRecordRows(recordRows, {
+          chartType,
+          title,
+          subtitle,
+          xKeyHint,
+          yLabelHint: yLabel,
+          unitHint: unit,
+        });
+
+        if (fromRows) {
+          return fromRows;
+        }
+      }
+    }
+  }
+
+  const dataContainer = isRecord(rowsCandidate) ? rowsCandidate : null;
+  const labels = toStringArray(
+    pickFirstPresentValue(value, ["labels", "categories", "x", "xValues"]) ??
+      (dataContainer
+        ? pickFirstPresentValue(dataContainer, [
+            "labels",
+            "categories",
+            "x",
+            "xValues",
+          ])
+        : undefined)
+  );
+  const plainValues = toNumericArray(
+    pickFirstPresentValue(value, ["values", "y", "yValues", "dataPoints"]) ??
+      (dataContainer
+        ? pickFirstPresentValue(dataContainer, [
+            "values",
+            "y",
+            "yValues",
+            "dataPoints",
+          ])
+        : undefined)
+  );
+  const datasetsCandidate =
+    pickFirstPresentValue(value, ["datasets", "series"]) ??
+    (dataContainer
+      ? pickFirstPresentValue(dataContainer, ["datasets", "series"])
+      : undefined);
+
+  if (chartType === "pie" && labels.length > 0 && plainValues.length > 0) {
+    const rowCount = Math.min(labels.length, plainValues.length, 50);
+    if (rowCount > 0) {
+      const pieRows = Array.from({ length: rowCount }).map((_, index) => ({
+        category: labels[index] ?? `Item ${index + 1}`,
+        value: plainValues[index],
+      }));
+
+      const pieSpec: ChartSpecV1 = {
+        version: "1.0",
+        type: "pie",
+        title: normalizeChartTitle(title),
+        subtitle: subtitle?.slice(0, 220) || undefined,
+        data: pieRows,
+        nameKey: "category",
+        valueKey: "value",
+        unit: unit || undefined,
+      };
+
+      const validation = chartSpecSchema.safeParse(pieSpec);
+      if (validation.success) {
+        return validation.data;
+      }
+    }
+  }
+
+  if (Array.isArray(datasetsCandidate) && datasetsCandidate.length > 0) {
+    const datasetSpecs = datasetsCandidate
+      .map((entry, index) => {
+        if (!isRecord(entry)) {
+          return null;
+        }
+
+        const key = toNormalizedKey(
+          pickStringValue(entry, ["key", "id", "field", "label", "name"]) ??
+            `serie_${index + 1}`,
+          `serie_${index + 1}`
+        );
+        const label = pickStringValue(entry, ["label", "name"]) ?? `Serie ${index + 1}`;
+        const values = toNumericArray(
+          pickFirstPresentValue(entry, ["data", "values", "points", "y"])
+        );
+        if (values.length === 0) {
+          return null;
+        }
+
+        return {
+          key,
+          label,
+          values,
+        };
+      })
+      .filter(
+        (
+          entry
+        ): entry is { key: string; label: string; values: number[] } => entry !== null
+      );
+
+    const maxRowCount = datasetSpecs.reduce((max, dataset) => {
+      return Math.max(max, dataset.values.length);
+    }, 0);
+    const rowCount = Math.min(Math.max(labels.length, maxRowCount), 50);
+
+    if (datasetSpecs.length > 0 && rowCount > 1) {
+      const rows = Array.from({ length: rowCount }).map((_, index) => {
+        const row: Record<string, unknown> = {
+          category: labels[index] ?? `Item ${index + 1}`,
+        };
+
+        for (const dataset of datasetSpecs) {
+          const numericValue = dataset.values[index];
+          if (typeof numericValue === "number" && Number.isFinite(numericValue)) {
+            row[dataset.key] = numericValue;
+          }
+        }
+
+        return row;
+      }).filter((row) =>
+        datasetSpecs.some((dataset) => typeof row[dataset.key] === "number")
+      );
+
+      if (rows.length > 1) {
+        const inferredSpec: ChartSpecV1 = {
+          version: "1.0",
+          type: chartType && chartType !== "pie" ? chartType : "line",
+          title: normalizeChartTitle(title),
+          subtitle: subtitle?.slice(0, 220) || undefined,
+          data: rows,
+          xKey: "category",
+          series: datasetSpecs.map((dataset, index) => {
+            const colors = ["#22c55e", "#0ea5e9", "#f97316", "#eab308"];
+            return {
+              key: dataset.key,
+              label: dataset.label,
+              color: colors[index % colors.length],
+            };
+          }),
+          yLabel: yLabel || undefined,
+          unit: unit || undefined,
+        };
+
+        const validation = chartSpecSchema.safeParse(inferredSpec);
+        if (validation.success) {
+          return validation.data;
+        }
+      }
+    }
+  }
+
+  if (labels.length > 0 && plainValues.length > 1) {
+    const rowCount = Math.min(labels.length, plainValues.length, 50);
+    if (rowCount > 1) {
+      const rows = Array.from({ length: rowCount }).map((_, index) => ({
+        category: labels[index] ?? `Item ${index + 1}`,
+        value: plainValues[index],
+      }));
+
+      const inferredSpec: ChartSpecV1 = {
+        version: "1.0",
+        type: chartType && chartType !== "pie" ? chartType : "bar",
+        title: normalizeChartTitle(title),
+        subtitle: subtitle?.slice(0, 220) || undefined,
+        data: rows,
+        xKey: "category",
+        series: [{ key: "value", label: yLabel || "Valor" }],
+        yLabel: yLabel || undefined,
+        unit: unit || undefined,
+      };
+
+      const validation = chartSpecSchema.safeParse(inferredSpec);
+      if (validation.success) {
+        return validation.data;
+      }
+    }
+  }
+
+  return null;
+}
+
 function parseChartSpecsFromPayload(payload: unknown): {
   chartSpecs: ChartSpecV1[];
   firstIssue: string | null;
@@ -1130,6 +1632,12 @@ function parseChartSpecsFromPayload(payload: unknown): {
 
     if (validation.success) {
       chartSpecs.push(validation.data);
+      continue;
+    }
+
+    const inferredSpec = inferSpecFromLoosePayload(candidate);
+    if (inferredSpec) {
+      chartSpecs.push(inferredSpec);
       continue;
     }
 

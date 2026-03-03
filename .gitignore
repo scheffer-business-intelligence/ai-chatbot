@@ -45,3 +45,6 @@ yarn-error.log*
 
 # Credentials
 bi-scheffer.json
+
+# Others
+.gcloud
