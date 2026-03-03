@@ -1,7 +1,11 @@
 import { z } from "zod";
 import { auth } from "@/app/(auth)/auth";
 import { getBigQueryUserIdCandidates } from "@/lib/auth/user-id";
-import { getChatById, getMessageById } from "@/lib/db/queries";
+import {
+  findMessageReferenceById,
+  getChatMessagesByChatId,
+} from "@/lib/chat-store";
+import { getChatById } from "@/lib/db/queries";
 import { ChatSDKError } from "@/lib/errors";
 import { getBigQueryAccessToken, insertFeedbackRow } from "@/lib/gcp/bigquery";
 import { sanitizeText } from "@/lib/utils";
@@ -16,7 +20,7 @@ const feedbackBodySchema = z.object({
 
 function sanitizeFeedback(input: string) {
   return input
-    .replace(/[\u0000-\u001F\u007F]/g, "")
+    .replace(/[\x00-\x1F\x7F]/g, "")
     .trim()
     .slice(0, MAX_FEEDBACK_LENGTH);
 }
@@ -27,16 +31,15 @@ function extractTextFromMessageParts(parts: unknown) {
   }
 
   return parts
-    .filter(
-      (part): part is { type: "text"; text: string } =>
-        Boolean(
-          part &&
-            typeof part === "object" &&
-            "type" in part &&
-            (part as { type?: unknown }).type === "text" &&
-            "text" in part &&
-            typeof (part as { text?: unknown }).text === "string"
-        )
+    .filter((part): part is { type: "text"; text: string } =>
+      Boolean(
+        part &&
+          typeof part === "object" &&
+          "type" in part &&
+          (part as { type?: unknown }).type === "text" &&
+          "text" in part &&
+          typeof (part as { text?: unknown }).text === "string"
+      )
     )
     .map((part) => sanitizeText(part.text))
     .join("\n")
@@ -54,6 +57,7 @@ export async function POST(request: Request) {
     if (!userId) {
       return new ChatSDKError("unauthorized:chat").toResponse();
     }
+
     const chatOwnerIds = new Set(
       [session.user.id, userId, fallbackUserId].filter(Boolean) as string[]
     );
@@ -63,7 +67,7 @@ export async function POST(request: Request) {
     if (!parsedBody.success) {
       return new ChatSDKError(
         "bad_request:api",
-        "chatId, messageId e feedback são obrigatórios."
+        "chatId, messageId e feedback sao obrigatorios."
       ).toResponse();
     }
 
@@ -80,12 +84,11 @@ export async function POST(request: Request) {
     if (feedback.trim().length > MAX_FEEDBACK_LENGTH) {
       return new ChatSDKError(
         "bad_request:api",
-        `Feedback muito longo (máx. ${MAX_FEEDBACK_LENGTH} caracteres).`
+        `Feedback muito longo (max. ${MAX_FEEDBACK_LENGTH} caracteres).`
       ).toResponse();
     }
 
     const chat = await getChatById({ id: chatId });
-
     if (!chat) {
       return new ChatSDKError("not_found:chat").toResponse();
     }
@@ -94,35 +97,61 @@ export async function POST(request: Request) {
       return new ChatSDKError("forbidden:chat").toResponse();
     }
 
-    const messages = await getMessageById({ id: messageId });
-    const assistantMessage = messages.find(
-      (message) => message.chatId === chatId && message.role === "assistant"
-    );
+    const chatMessages = await getChatMessagesByChatId({
+      chatId,
+      userId,
+      fallbackUserId,
+      dedupeAssistantDuplicates: false,
+    });
 
+    const assistantMessage = chatMessages.find(
+      (message) => message.id === messageId && message.role === "assistant"
+    );
     if (!assistantMessage) {
       return new ChatSDKError(
         "not_found:chat",
-        "Mensagem do assistente não encontrada para este chat."
+        "Mensagem do assistente nao encontrada para este chat."
       ).toResponse();
     }
 
     const content = extractTextFromMessageParts(assistantMessage.parts);
-
     if (!content) {
       return new ChatSDKError(
         "bad_request:api",
-        "A mensagem selecionada não possui conteúdo textual para feedback."
+        "A mensagem selecionada nao possui conteudo textual para feedback."
+      ).toResponse();
+    }
+
+    const metadataSessionId = assistantMessage.metadata?.sessionId?.trim();
+    const metadataCreatedAt = assistantMessage.metadata?.createdAt?.trim();
+    const messageReference =
+      !metadataSessionId || !metadataCreatedAt
+        ? await findMessageReferenceById({
+            messageId: assistantMessage.id,
+            userId,
+            fallbackUserId,
+          })
+        : null;
+
+    const feedbackSessionId = metadataSessionId || messageReference?.sessionId;
+    const feedbackCreatedAt =
+      metadataCreatedAt || messageReference?.createdAt.toISOString();
+
+    if (!feedbackSessionId || !feedbackCreatedAt) {
+      return new ChatSDKError(
+        "not_found:chat",
+        "Nao foi possivel resolver a sessao da mensagem para registrar feedback."
       ).toResponse();
     }
 
     const accessToken = await getBigQueryAccessToken();
     await insertFeedbackRow(accessToken, {
       message_id: assistantMessage.id,
-      session_id: chatId,
+      session_id: feedbackSessionId,
       user_id: userId,
       role: assistantMessage.role,
       content,
-      created_at: assistantMessage.createdAt.toISOString(),
+      created_at: feedbackCreatedAt,
       feedback_message: sanitizedFeedback,
     });
 

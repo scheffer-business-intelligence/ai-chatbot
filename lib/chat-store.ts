@@ -15,7 +15,10 @@ import {
   softDeleteSessionMessages,
   upsertChatMessageRow,
 } from "@/lib/gcp/bigquery";
-import { dedupeChatAssistantMessages } from "@/lib/messages/dedupe";
+import {
+  collapseAssistantResponseRegenerations,
+  dedupeChatAssistantMessages,
+} from "@/lib/messages/dedupe";
 import type { ChatMessage, ChatTools, CustomUIDataTypes } from "@/lib/types";
 import { sanitizeText } from "@/lib/utils";
 
@@ -35,6 +38,7 @@ type PersistChatMessageParams = {
 
 type MessageReference = {
   chatId: string;
+  sessionId: string;
   createdAt: Date;
 };
 
@@ -126,6 +130,7 @@ function toChatMessageFromBigQueryRow(
     parts,
     metadata: {
       createdAt: createdAtIso,
+      sessionId: row.session_id || undefined,
       chartSpec: chartSpec as any,
       chartError: row.chart_error,
     },
@@ -266,12 +271,13 @@ export async function getChatMessagesByChatId({
         return messageATimestamp - messageBTimestamp;
       })
       .map((row) => toChatMessageFromBigQueryRow(row));
+    const visibleMessages = collapseAssistantResponseRegenerations(messages);
 
     if (!dedupeAssistantDuplicates) {
-      return messages;
+      return visibleMessages;
     }
 
-    return dedupeChatAssistantMessages(messages);
+    return dedupeChatAssistantMessages(visibleMessages);
   } catch (error) {
     console.error("Failed to load chat messages from BigQuery:", error);
     return [];
@@ -372,6 +378,7 @@ export async function findMessageReferenceById({
       if (!Number.isNaN(createdAt.getTime())) {
         return {
           chatId: message.chat_id || message.session_id,
+          sessionId: message.session_id,
           createdAt,
         };
       }

@@ -11,6 +11,7 @@ export type DataPart = { type: "append-message"; message: string };
 
 export const messageMetadataSchema = z.object({
   createdAt: z.string(),
+  sessionId: z.string().optional(),
   chartSpec: chartSpecSchema.optional().nullable(),
   chartError: z.string().optional().nullable(),
 });

@@ -1962,28 +1962,102 @@ export async function updateMessageAnsweredIn({
   answeredIn: number;
 }) {
   const now = new Date().toISOString();
-
-  try {
-    await runQuery(
-      `
+  const attempts: Array<{
+    label: string;
+    query: string;
+    params: QueryParameter[];
+  }> = [
+    {
+      label: "int64_answered_in:string_updated_at",
+      query: `
         UPDATE \`${MESSAGES_TABLE_REF}\`
         SET
           answered_in = @answered_in,
           updated_at = @updated_at
         WHERE message_id = @message_id
       `,
-      [
+      params: [
         { name: "answered_in", type: "INT64", value: answeredIn },
         { name: "updated_at", type: "STRING", value: now },
         { name: "message_id", type: "STRING", value: id },
-      ]
-    );
-  } catch (_error) {
-    throw new ChatSDKError(
-      "bad_request:database",
-      "Failed to update message answered_in"
-    );
+      ],
+    },
+    {
+      label: "int64_answered_in:timestamp_updated_at",
+      query: `
+        UPDATE \`${MESSAGES_TABLE_REF}\`
+        SET
+          answered_in = @answered_in,
+          updated_at = SAFE_CAST(@updated_at AS TIMESTAMP)
+        WHERE message_id = @message_id
+      `,
+      params: [
+        { name: "answered_in", type: "INT64", value: answeredIn },
+        { name: "updated_at", type: "STRING", value: now },
+        { name: "message_id", type: "STRING", value: id },
+      ],
+    },
+    {
+      label: "string_answered_in:string_updated_at",
+      query: `
+        UPDATE \`${MESSAGES_TABLE_REF}\`
+        SET
+          answered_in = @answered_in,
+          updated_at = @updated_at
+        WHERE message_id = @message_id
+      `,
+      params: [
+        { name: "answered_in", type: "STRING", value: String(answeredIn) },
+        { name: "updated_at", type: "STRING", value: now },
+        { name: "message_id", type: "STRING", value: id },
+      ],
+    },
+    {
+      label: "updated_at_only:string",
+      query: `
+        UPDATE \`${MESSAGES_TABLE_REF}\`
+        SET
+          updated_at = @updated_at
+        WHERE message_id = @message_id
+      `,
+      params: [
+        { name: "updated_at", type: "STRING", value: now },
+        { name: "message_id", type: "STRING", value: id },
+      ],
+    },
+    {
+      label: "updated_at_only:timestamp",
+      query: `
+        UPDATE \`${MESSAGES_TABLE_REF}\`
+        SET
+          updated_at = SAFE_CAST(@updated_at AS TIMESTAMP)
+        WHERE message_id = @message_id
+      `,
+      params: [
+        { name: "updated_at", type: "STRING", value: now },
+        { name: "message_id", type: "STRING", value: id },
+      ],
+    },
+  ];
+  const attemptErrors: string[] = [];
+
+  for (const attempt of attempts) {
+    try {
+      await runQuery(attempt.query, attempt.params);
+      return;
+    } catch (error) {
+      attemptErrors.push(
+        `${attempt.label}: ${error instanceof Error ? error.message : String(error)}`
+      );
+    }
   }
+
+  // answered_in is telemetry only; do not fail the chat response if this write fails.
+  console.warn("Failed to update message answered_in in BigQuery.", {
+    messageId: id,
+    answeredIn,
+    errors: attemptErrors,
+  });
 }
 
 export async function getMessagesByChatId({ id }: { id: string }) {

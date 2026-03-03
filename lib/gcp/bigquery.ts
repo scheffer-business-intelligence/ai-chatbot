@@ -646,7 +646,10 @@ function buildChatMessageMergeQuery(
   const sourceSelect = enabledColumns
     .map((column) => `${getSourceExpression(column)} AS ${column}`)
     .join(",\n        ");
-  const updateSet = enabledColumns
+  const updateColumns = enabledColumns.filter(
+    (column) => column !== "created_at"
+  );
+  const updateSet = updateColumns
     .map((column) => `${column} = source.${column}`)
     .join(",\n      ");
   const insertColumns = ["message_id", ...enabledColumns].join(",\n        ");
@@ -920,6 +923,7 @@ export async function getChatMessageById(
     FROM \`${messagesTable}\`
     WHERE user_id = @user_id
       AND message_id = @message_id
+      AND (is_deleted IS NULL OR is_deleted = FALSE)
     ORDER BY updated_at DESC, created_at DESC
     LIMIT 1
   `;

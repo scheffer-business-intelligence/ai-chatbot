@@ -122,3 +122,37 @@ export function dedupeDbAssistantMessages(
     }),
   });
 }
+
+function collapseConsecutiveAssistantMessages<T extends { role: string }>(
+  messages: T[]
+) {
+  const collapsed: T[] = [];
+  let index = 0;
+
+  while (index < messages.length) {
+    const currentMessage = messages[index];
+
+    if (currentMessage.role !== "assistant") {
+      collapsed.push(currentMessage);
+      index += 1;
+      continue;
+    }
+
+    let assistantRunEnd = index;
+    while (
+      assistantRunEnd + 1 < messages.length &&
+      messages[assistantRunEnd + 1]?.role === "assistant"
+    ) {
+      assistantRunEnd += 1;
+    }
+
+    collapsed.push(messages[assistantRunEnd]);
+    index = assistantRunEnd + 1;
+  }
+
+  return collapsed;
+}
+
+export function collapseAssistantResponseRegenerations(messages: ChatMessage[]) {
+  return collapseConsecutiveAssistantMessages(messages);
+}
