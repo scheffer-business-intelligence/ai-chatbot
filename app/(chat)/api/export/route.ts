@@ -13,6 +13,8 @@ const MAX_SHEET_NAME_LENGTH = 31;
 type ExportRequestBody = {
   filename?: unknown;
   contextSheets?: unknown;
+  tableRows?: unknown;
+  tableTitle?: unknown;
 };
 
 function asNonEmptyString(value: unknown): string | null {
@@ -79,6 +81,58 @@ function normalizeCellValue(value: unknown): string | number | boolean | Date {
   }
 }
 
+function normalizeTableRows(rawRows: unknown): string[][] {
+  if (!Array.isArray(rawRows)) {
+    return [];
+  }
+
+  const rows: string[][] = [];
+
+  for (const rawRow of rawRows) {
+    if (!Array.isArray(rawRow)) {
+      continue;
+    }
+
+    const normalizedRow = rawRow
+      .map((cell) => normalizeCellValue(cell))
+      .map((value) =>
+        typeof value === "string" ? value.trim() : String(value)
+      );
+
+    if (normalizedRow.every((cell) => cell.length === 0)) {
+      continue;
+    }
+
+    rows.push(normalizedRow);
+  }
+
+  return rows;
+}
+
+function buildUniqueColumnNames(
+  header: string[],
+  columnCount: number
+): string[] {
+  const used = new Map<string, number>();
+  const columns: string[] = [];
+
+  for (let index = 0; index < columnCount; index += 1) {
+    const baseName = header[index]?.trim() || `coluna_${index + 1}`;
+    const key = baseName.toLowerCase();
+    const seenCount = used.get(key) ?? 0;
+    used.set(key, seenCount + 1);
+
+    if (seenCount === 0) {
+      columns.push(baseName);
+      continue;
+    }
+
+    columns.push(`${baseName}_${seenCount + 1}`);
+  }
+
+  return columns;
+}
+
 function applyRowsToWorksheet(
   worksheet: ExcelJS.Worksheet,
   columns: string[],
@@ -116,7 +170,10 @@ async function buildWorkbookBuffer(sheets: ExportContextSheet[]) {
   });
 
   const rawBuffer: unknown = await workbook.xlsx.writeBuffer();
+  return toArrayBuffer(rawBuffer);
+}
 
+function toArrayBuffer(rawBuffer: unknown) {
   if (rawBuffer instanceof ArrayBuffer) {
     return rawBuffer;
   }
@@ -128,6 +185,64 @@ async function buildWorkbookBuffer(sheets: ExportContextSheet[]) {
   const copy = new Uint8Array(source.byteLength);
   copy.set(source);
   return copy.buffer;
+}
+
+async function buildTableWorkbookBuffer(title: string, rows: string[][]) {
+  const workbook = new ExcelJS.Workbook();
+  const usedSheetNames = new Set<string>();
+  const worksheet = workbook.addWorksheet(
+    sanitizeSheetName(title, 1, usedSheetNames)
+  );
+
+  const columnCount = Math.max(1, ...rows.map((row) => row.length));
+  const header = rows[0] ?? [];
+  const columns = buildUniqueColumnNames(header, columnCount);
+  const dataRows = rows.slice(1);
+
+  worksheet.addRow(columns);
+
+  for (const row of dataRows) {
+    const normalizedRow = columns.map((_, index) => row[index] ?? "");
+    worksheet.addRow(normalizedRow);
+  }
+
+  const headerRow = worksheet.getRow(1);
+  headerRow.font = { bold: true, color: { argb: "FFFFFFFF" } };
+  headerRow.alignment = { vertical: "middle", horizontal: "left" };
+
+  for (let index = 1; index <= columnCount; index += 1) {
+    const cell = headerRow.getCell(index);
+    cell.fill = {
+      type: "pattern",
+      pattern: "solid",
+      fgColor: { argb: "FF1F7A3E" },
+    };
+  }
+
+  worksheet.autoFilter = {
+    from: { row: 1, column: 1 },
+    to: { row: 1, column: columnCount },
+  };
+  worksheet.views = [
+    {
+      state: "frozen",
+      ySplit: 1,
+    },
+  ];
+
+  for (let index = 0; index < columnCount; index += 1) {
+    let maxLength = Math.max(columns[index]?.length ?? 0, 12);
+
+    for (const row of dataRows) {
+      const value = row[index] ?? "";
+      maxLength = Math.max(maxLength, value.length + 2);
+    }
+
+    worksheet.getColumn(index + 1).width = Math.min(maxLength, 50);
+  }
+
+  const rawBuffer: unknown = await workbook.xlsx.writeBuffer();
+  return toArrayBuffer(rawBuffer);
 }
 
 export async function POST(request: Request) {
@@ -144,22 +259,40 @@ export async function POST(request: Request) {
     requestBody = {};
   }
 
-  const filename = asNonEmptyString(requestBody.filename) ?? "export";
-  const normalizedSheets = extractContextSheets(requestBody.contextSheets).map(
-    (sheet) => ({
-      ...sheet,
-      rows: sheet.rows.slice(0, MAX_ROWS_PER_SHEET),
-    })
-  );
+  const contextSheets = extractContextSheets(requestBody.contextSheets);
+  const tableRows = normalizeTableRows(requestBody.tableRows);
+  const tableTitle = asNonEmptyString(requestBody.tableTitle) ?? "Tabela";
+  const filename =
+    asNonEmptyString(requestBody.filename) ??
+    asNonEmptyString(requestBody.tableTitle) ??
+    "export";
 
-  if (normalizedSheets.length === 0) {
+  if (contextSheets.length === 0 && tableRows.length === 0) {
     return NextResponse.json(
-      { detail: "Nao encontrei dados de contexto para exportar." },
+      { detail: "Nao encontrei dados para exportar." },
       { status: 400 }
     );
   }
 
   try {
+    if (contextSheets.length === 0) {
+      const buffer = await buildTableWorkbookBuffer(tableTitle, tableRows);
+      const safeFilename = normalizeExportFilename(filename);
+
+      return new NextResponse(buffer, {
+        status: 200,
+        headers: {
+          "Content-Type":
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+          "Content-Disposition": `attachment; filename="${safeFilename}.xlsx"`,
+        },
+      });
+    }
+
+    const normalizedSheets = contextSheets.map((sheet) => ({
+      ...sheet,
+      rows: sheet.rows.slice(0, MAX_ROWS_PER_SHEET),
+    }));
     const buffer = await buildWorkbookBuffer(normalizedSheets);
     const safeFilename = normalizeExportFilename(filename);
 
