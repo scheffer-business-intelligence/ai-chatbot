@@ -2,9 +2,16 @@ import "server-only";
 
 import type { UIMessagePart } from "ai";
 import {
+  inferChartSpecsFromBulletListText,
+  inferChartSpecsFromContextSheets,
+  inferChartSpecsFromInlineSeriesText,
+  inferChartSpecsFromTableText,
+} from "@/lib/charts/context";
+import {
   deleteMessagesByChatIdAfterTimestamp,
   getProviderSessionByChatId,
 } from "@/lib/db/queries";
+import { parseBqContextFromText, parseExportAwareText } from "@/lib/export-context";
 import {
   type BigQueryChatMessageRow,
   countUserMessagesSince,
@@ -23,6 +30,12 @@ import type { ChatMessage, ChatTools, CustomUIDataTypes } from "@/lib/types";
 import { sanitizeText } from "@/lib/utils";
 
 const AGENT_ENGINE_PROVIDER = "google-agent-engine";
+const INCOMPLETE_CHART_WARNINGS = new Set([
+  "bloco de grafico incompleto.",
+  "bloco chart_context incompleto.",
+]);
+
+type UIChatPart = UIMessagePart<CustomUIDataTypes, ChatTools>;
 
 type PersistChatMessageParams = {
   chatId: string;
@@ -108,31 +121,212 @@ function parseJsonString<T>(value: string | null | undefined): T | null {
   }
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value && typeof value === "object" && !Array.isArray(value));
+}
+
+function normalizeParsedParts(value: unknown): UIChatPart[] | null {
+  if (Array.isArray(value)) {
+    return value as UIChatPart[];
+  }
+
+  if (!isRecord(value)) {
+    return null;
+  }
+
+  if (Array.isArray(value.parts)) {
+    return value.parts as UIChatPart[];
+  }
+
+  if (typeof value.text === "string" && value.text.trim()) {
+    return [{ type: "text", text: value.text }] as UIChatPart[];
+  }
+
+  if (typeof value.content === "string" && value.content.trim()) {
+    return [{ type: "text", text: value.content }] as UIChatPart[];
+  }
+
+  return null;
+}
+
+function hasPartType(parts: UIChatPart[], type: string) {
+  return parts.some((part) => part.type === type);
+}
+
+function extractTextFromParts(parts: UIChatPart[]) {
+  return parts
+    .filter((part) => part.type === "text")
+    .map((part) => part.text)
+    .join("\n")
+    .trim();
+}
+
+function normalizeChartError(value: string | null | undefined) {
+  return value?.replace(/\s+/g, " ").trim().toLowerCase() ?? "";
+}
+
+function hydrateAssistantPartsFromRow({
+  parts,
+  row,
+}: {
+  parts: UIChatPart[];
+  row: BigQueryChatMessageRow;
+}) {
+  const hydratedParts = [...parts];
+  const hasChartSpecPart =
+    hasPartType(hydratedParts, "data-chart-spec") ||
+    hasPartType(hydratedParts, "data-chart-specs");
+  const hasChartWarningPart = hasPartType(hydratedParts, "data-chart-warning");
+  const hasExportContextPart = hasPartType(hydratedParts, "data-export-context");
+  const hasExportHintPart = hasPartType(hydratedParts, "data-export-hint");
+  const chartSpecFromRow = parseJsonString<unknown>(row.chart_spec_json);
+
+  if (
+    !hasChartSpecPart &&
+    chartSpecFromRow &&
+    typeof chartSpecFromRow === "object"
+  ) {
+    hydratedParts.push({
+      type: "data-chart-spec",
+      data: chartSpecFromRow,
+    } as UIChatPart);
+  }
+
+  const text = extractTextFromParts(hydratedParts);
+  const parsedBqContext = parseBqContextFromText(text);
+  const parsedExportAwareText = parseExportAwareText(text);
+  const contextSheets =
+    parsedBqContext.contextSheets.length > 0
+      ? parsedBqContext.contextSheets
+      : parsedExportAwareText.contextSheets;
+  const hasChartIntent =
+    /\b(gr[a\u00e1]fic(?:o|a)|chart|plot|visualiza(?:r|c(?:ao|[\u00e7c][\u00e3a]o)))\b/i.test(
+      text
+    );
+
+  if (!hasExportContextPart && contextSheets.length > 0) {
+    hydratedParts.push({
+      type: "data-export-context",
+      data: contextSheets,
+    } as UIChatPart);
+  }
+
+  if (!hasExportHintPart && parsedExportAwareText.exportData) {
+    hydratedParts.push({
+      type: "data-export-hint",
+      data: {
+        filename: parsedExportAwareText.exportData.filename,
+        description: parsedExportAwareText.exportData.description,
+      },
+    } as UIChatPart);
+  }
+
+  if (
+    !hasChartSpecPart &&
+    (!chartSpecFromRow || typeof chartSpecFromRow !== "object") &&
+    (contextSheets.length > 0 || hasChartIntent || Boolean(row.chart_error))
+  ) {
+    const visibleText =
+      parsedExportAwareText.cleanText.trim() ||
+      parsedBqContext.cleanText.trim() ||
+      text;
+    const inferredFromContext = inferChartSpecsFromContextSheets(contextSheets);
+    const inferredFromTable =
+      inferredFromContext.length > 0
+        ? []
+        : inferChartSpecsFromTableText(visibleText);
+    const inferredFromInline =
+      inferredFromContext.length > 0 || inferredFromTable.length > 0
+        ? []
+        : inferChartSpecsFromInlineSeriesText(visibleText);
+    const inferredFromBullets =
+      inferredFromContext.length > 0 ||
+      inferredFromTable.length > 0 ||
+      inferredFromInline.length > 0
+        ? []
+        : inferChartSpecsFromBulletListText(visibleText);
+    const inferredSpecs =
+      inferredFromContext.length > 0
+        ? inferredFromContext
+        : inferredFromTable.length > 0
+          ? inferredFromTable
+          : inferredFromInline.length > 0
+            ? inferredFromInline
+            : inferredFromBullets;
+
+    if (inferredSpecs.length > 1) {
+      hydratedParts.push({
+        type: "data-chart-specs",
+        data: inferredSpecs,
+      } as UIChatPart);
+    } else if (inferredSpecs.length === 1) {
+      hydratedParts.push({
+        type: "data-chart-spec",
+        data: inferredSpecs[0],
+      } as UIChatPart);
+    }
+  }
+
+  if (!hasChartWarningPart && row.chart_error) {
+    const normalizedChartError = normalizeChartError(row.chart_error);
+
+    if (!INCOMPLETE_CHART_WARNINGS.has(normalizedChartError)) {
+      hydratedParts.push({
+        type: "data-chart-warning",
+        data: row.chart_error,
+      } as UIChatPart);
+    }
+  }
+
+  return hydratedParts;
+}
+
 function toChatMessageFromBigQueryRow(
   row: BigQueryChatMessageRow
 ): ChatMessage {
-  const parsedParts = parseJsonString<
-    UIMessagePart<CustomUIDataTypes, ChatTools>[]
-  >(row.parts_json);
-  const fallbackParts: UIMessagePart<CustomUIDataTypes, ChatTools>[] =
+  const parsedParts = normalizeParsedParts(parseJsonString<unknown>(row.parts_json));
+  const fallbackParts: UIChatPart[] =
     row.content ? [{ type: "text", text: row.content }] : [];
+  const role = (row.role as ChatMessage["role"]) || "assistant";
+  const rawParts = parsedParts ?? fallbackParts;
   const parts =
-    parsedParts && Array.isArray(parsedParts) ? parsedParts : fallbackParts;
+    role === "assistant"
+      ? hydrateAssistantPartsFromRow({ parts: rawParts, row })
+      : rawParts;
   const createdAtIso =
     row.created_at && !Number.isNaN(new Date(row.created_at).getTime())
       ? new Date(row.created_at).toISOString()
       : new Date().toISOString();
-  const chartSpec = parseJsonString(row.chart_spec_json);
+  const chartSpecFromRow = parseJsonString(row.chart_spec_json);
+  const chartSpecFromParts =
+    (parts.find((part) => part.type === "data-chart-spec") as
+      | { type: "data-chart-spec"; data?: unknown }
+      | undefined)?.data ??
+    (parts.find((part) => part.type === "data-chart-specs") as
+      | { type: "data-chart-specs"; data?: unknown }
+      | undefined)?.data;
+  const chartSpec =
+    chartSpecFromRow && typeof chartSpecFromRow === "object"
+      ? chartSpecFromRow
+      : Array.isArray(chartSpecFromParts)
+        ? chartSpecFromParts[0]
+        : chartSpecFromParts;
+  const chartWarningFromParts = (parts.find(
+    (part) => part.type === "data-chart-warning"
+  ) as { type: "data-chart-warning"; data?: unknown } | undefined)?.data;
 
   return {
     id: row.message_id,
-    role: (row.role as ChatMessage["role"]) || "assistant",
+    role,
     parts,
     metadata: {
       createdAt: createdAtIso,
       sessionId: row.session_id || undefined,
       chartSpec: chartSpec as any,
-      chartError: row.chart_error,
+      chartError:
+        (typeof chartWarningFromParts === "string"
+          ? chartWarningFromParts
+          : row.chart_error) ?? null,
     },
   };
 }
@@ -213,6 +407,7 @@ export async function getChatMessagesByChatId({
     }
 
     const messagesById = new Map<string, BigQueryChatMessageRow>();
+    let providerSessionId: string | null = null;
 
     // ── Primary lookup: query by chatId (matches chat_id or session_id) ──
     for (const candidateUserId of userIds) {
@@ -227,40 +422,39 @@ export async function getChatMessagesByChatId({
       }
     }
 
-    // ── Fallback: if no messages found, look up the provider (Vertex) session
-    //    ID for this chat and re-query. This handles the case where the BigQuery
-    //    table does not have a `chat_id` column and messages are stored under the
-    //    Vertex provider session_id instead of the chat UUID. ──
-    if (messagesById.size === 0) {
-      try {
-        const providerSession = await getProviderSessionByChatId({
-          chatId,
-          provider: AGENT_ENGINE_PROVIDER,
-        });
+    // Merge provider-session rows as well so legacy messages stored only under
+    // provider `session_id` are not missed when loading by `chat_id`.
+    try {
+      const providerSession = await getProviderSessionByChatId({
+        chatId,
+        provider: AGENT_ENGINE_PROVIDER,
+      });
+      providerSessionId = providerSession?.sessionId ?? null;
+    } catch (providerError) {
+      console.warn(
+        "[getChatMessagesByChatId] Provider session lookup failed:",
+        providerError
+      );
+    }
 
-        if (providerSession?.sessionId && providerSession.sessionId !== chatId) {
-          console.log(
-            "[getChatMessagesByChatId] No messages found by chatId, retrying with provider sessionId:",
-            { chatId, providerSessionId: providerSession.sessionId }
-          );
+    if (providerSessionId && providerSessionId !== chatId) {
+      console.log(
+        messagesById.size === 0
+          ? "[getChatMessagesByChatId] No messages found by chatId, retrying with provider sessionId."
+          : "[getChatMessagesByChatId] Merging additional rows from provider sessionId.",
+        { chatId, providerSessionId }
+      );
 
-          for (const candidateUserId of userIds) {
-            const candidateRows = await querySessionMessages(
-              accessToken,
-              candidateUserId,
-              providerSession.sessionId
-            );
-
-            for (const candidateRow of candidateRows) {
-              mergeMessageRow(messagesById, candidateRow);
-            }
-          }
-        }
-      } catch (providerError) {
-        console.warn(
-          "[getChatMessagesByChatId] Provider session lookup failed:",
-          providerError
+      for (const candidateUserId of userIds) {
+        const candidateRows = await querySessionMessages(
+          accessToken,
+          candidateUserId,
+          providerSessionId
         );
+
+        for (const candidateRow of candidateRows) {
+          mergeMessageRow(messagesById, candidateRow);
+        }
       }
     }
 
@@ -284,6 +478,42 @@ export async function getChatMessagesByChatId({
   }
 }
 
+function getRowRichnessScore(row: BigQueryChatMessageRow) {
+  let score = 0;
+  const partsJson = row.parts_json?.trim() ?? "";
+  const chartSpecJson = row.chart_spec_json?.trim() ?? "";
+
+  if (partsJson && partsJson !== "[]" && partsJson !== "{}") {
+    score += 1;
+  }
+
+  if (partsJson.includes('"type":"data-chart-specs"')) {
+    score += 6;
+  }
+
+  if (partsJson.includes('"type":"data-chart-spec"')) {
+    score += 5;
+  }
+
+  if (partsJson.includes('"type":"data-export-context"')) {
+    score += 4;
+  }
+
+  if (partsJson.includes('"type":"data-export-hint"')) {
+    score += 3;
+  }
+
+  if (chartSpecJson && chartSpecJson !== "null") {
+    score += 4;
+  }
+
+  if ((row.chart_error ?? "").trim().length > 0) {
+    score += 1;
+  }
+
+  return score;
+}
+
 function mergeMessageRow(
   messagesById: Map<string, BigQueryChatMessageRow>,
   candidateRow: BigQueryChatMessageRow
@@ -298,11 +528,23 @@ function mergeMessageRow(
   const nextUpdatedAt = parseSortableTimestamp(candidateRow.updated_at);
   const existingCreatedAt = parseSortableTimestamp(existingRow.created_at);
   const nextCreatedAt = parseSortableTimestamp(candidateRow.created_at);
+  const existingRichnessScore = getRowRichnessScore(existingRow);
+  const nextRichnessScore = getRowRichnessScore(candidateRow);
+  const existingContent = sanitizeText(existingRow.content ?? "").trim();
+  const nextContent = sanitizeText(candidateRow.content ?? "").trim();
+  const sameContent =
+    existingContent.length > 0 &&
+    nextContent.length > 0 &&
+    existingContent === nextContent;
 
   if (
     nextUpdatedAt > existingUpdatedAt ||
     (nextUpdatedAt === existingUpdatedAt &&
-      nextCreatedAt > existingCreatedAt)
+      nextCreatedAt > existingCreatedAt) ||
+    (nextUpdatedAt === existingUpdatedAt &&
+      nextCreatedAt === existingCreatedAt &&
+      nextRichnessScore > existingRichnessScore) ||
+    (sameContent && nextRichnessScore > existingRichnessScore)
   ) {
     messagesById.set(candidateRow.message_id, candidateRow);
   }

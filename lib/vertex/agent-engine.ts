@@ -1100,7 +1100,7 @@ type ChartResolutionSource =
   | "none";
 
 const CHART_FALLBACK_MISSING_CONTEXT_WARNING =
-  "Nao foi possivel montar o grafico automaticamente: resposta sem CHART_CONTEXT valido ou dados estruturados suficientes.";
+  "Não foi possível montar o gráfico automaticamente: resposta sem CHART_CONTEXT válido ou dados estruturados suficientes.";
 
 function setResolvedChartSpecs(
   extractedContext: VertexExtractedContext,
