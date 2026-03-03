@@ -899,6 +899,8 @@ export async function POST(request: Request) {
                 model_id: selectedChatModel,
               });
 
+              let fullResponseText = "";
+
               for await (const event of streamVertexQuery({
                 accessToken: serviceAccountAccessToken,
                 sessionId: currentProviderSessionId,
@@ -925,11 +927,7 @@ export async function POST(request: Request) {
                   continue;
                 }
 
-                dataStream.write({
-                  type: "text-delta",
-                  id: textPartId,
-                  delta,
-                });
+                fullResponseText += delta;
 
                 if (delta.trim().length > 0) {
                   if (firstDeltaAtMs === null) {
@@ -945,6 +943,27 @@ export async function POST(request: Request) {
                     });
                   }
                   hasVisibleOutput = true;
+                }
+              }
+
+              if (fullResponseText.length > 0) {
+                dataStream.write({
+                  type: "data-agent-status",
+                  data: "Formatando resposta...",
+                });
+
+                // Smooth stream the buffered text
+                const chunkSize = 12; // characters per chunk
+                const delayMs = 10;   // ms between chunks
+
+                for (let i = 0; i < fullResponseText.length; i += chunkSize) {
+                  const chunk = fullResponseText.slice(i, i + chunkSize);
+                  dataStream.write({
+                    type: "text-delta",
+                    id: textPartId,
+                    delta: chunk,
+                  });
+                  await new Promise((resolve) => setTimeout(resolve, delayMs));
                 }
               }
 
