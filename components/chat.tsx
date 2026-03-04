@@ -9,14 +9,6 @@ import { unstable_serialize } from "swr/infinite";
 import { ChatHeader } from "@/components/chat-header";
 import { useDataStream } from "@/components/data-stream-provider";
 import {
-  type AgentEngineErrorAnalysis,
-  agentEngineErrorAnalysisResponseSchema,
-} from "@/lib/agent-engine/error-analysis";
-import {
-  parseAgentEngineErrorFromUnknown,
-  type AgentEngineErrorEnvelope,
-} from "@/lib/agent-engine/error-envelope";
-import {
   AlertDialog,
   AlertDialogAction,
   AlertDialogCancel,
@@ -36,6 +28,14 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { useArtifactSelector } from "@/hooks/use-artifact";
+import {
+  type AgentEngineErrorAnalysis,
+  agentEngineErrorAnalysisResponseSchema,
+} from "@/lib/agent-engine/error-analysis";
+import {
+  type AgentEngineErrorEnvelope,
+  parseAgentEngineErrorFromUnknown,
+} from "@/lib/agent-engine/error-envelope";
 import { ChatSDKError } from "@/lib/errors";
 import type { Attachment, ChatMessage } from "@/lib/types";
 import { fetchWithErrorHandlers, generateUUID } from "@/lib/utils";
@@ -75,6 +75,7 @@ export function Chat({
   const [input, setInput] = useState<string>("");
   const [showCreditCardAlert, setShowCreditCardAlert] = useState(false);
   const [isContinuingSharedChat, setIsContinuingSharedChat] = useState(false);
+  const [isSharingChat, setIsSharingChat] = useState(false);
   const [currentModelId, setCurrentModelId] = useState(initialChatModel);
   const [agentStatus, setAgentStatus] = useState<string | null>(null);
   const [agentEngineError, setAgentEngineError] =
@@ -263,14 +264,12 @@ export function Chat({
         body: JSON.stringify(agentEngineError),
       });
 
-      const payload = (await response.json().catch(() => null)) as
-        | {
-            analysis?: unknown;
-            model?: unknown;
-            message?: unknown;
-            cause?: unknown;
-          }
-        | null;
+      const payload = (await response.json().catch(() => null)) as {
+        analysis?: unknown;
+        model?: unknown;
+        message?: unknown;
+        cause?: unknown;
+      } | null;
 
       if (!response.ok) {
         const cause =
@@ -278,14 +277,14 @@ export function Chat({
             ? payload.cause
             : typeof payload?.message === "string"
               ? payload.message
-              : "Falha ao solicitar analise com Gemini.";
+              : "Falha ao solicitar análise com Gemini.";
         throw new Error(cause);
       }
 
       const validated =
         agentEngineErrorAnalysisResponseSchema.safeParse(payload);
       if (!validated.success) {
-        throw new Error("Resposta de analise do Gemini em formato invalido.");
+        throw new Error("Resposta de análise do Gemini em formato inválido.");
       }
 
       setAgentEngineAnalysis(validated.data.analysis);
@@ -432,10 +431,81 @@ export function Chat({
     }
   }, [id, isContinuingSharedChat, mutate, router]);
 
+  const handleShareChat = useCallback(async () => {
+    if (isSharingChat || isReadonly) {
+      return;
+    }
+
+    setIsSharingChat(true);
+
+    try {
+      const response = await fetch("/api/chat", {
+        method: "PATCH",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          id,
+          visibility: "public",
+        }),
+      });
+
+      const payload = (await response.json().catch(() => null)) as {
+        message?: string;
+        cause?: string;
+        error?: string;
+      } | null;
+
+      if (!response.ok) {
+        throw new Error(
+          payload?.cause ||
+            payload?.error ||
+            payload?.message ||
+            "Falha ao habilitar compartilhamento."
+        );
+      }
+
+      const shareUrl = `${window.location.origin}/chat/${id}`;
+
+      if (!navigator.clipboard?.writeText) {
+        throw new Error(
+          "Não foi possível copiar automaticamente. Copie o link na barra do navegador."
+        );
+      }
+
+      try {
+        await navigator.clipboard.writeText(shareUrl);
+      } catch {
+        throw new Error(
+          "Não foi possível copiar automaticamente. Copie o link na barra do navegador."
+        );
+      }
+
+      await mutate(unstable_serialize(getChatHistoryPaginationKey));
+
+      toast({
+        type: "success",
+        description: "Link de compartilhamento copiado!",
+      });
+    } catch (error) {
+      toast({
+        type: "error",
+        description:
+          error instanceof Error ? error.message : "Falha ao compartilhar.",
+      });
+    } finally {
+      setIsSharingChat(false);
+    }
+  }, [id, isReadonly, isSharingChat, mutate]);
+
   return (
     <>
       <div className="overscroll-behavior-contain flex h-dvh min-w-0 touch-pan-y flex-col bg-background">
-        <ChatHeader />
+        <ChatHeader
+          isReadonly={isReadonly}
+          isSharing={isSharingChat}
+          onShare={handleShareChat}
+        />
 
         <Messages
           addToolApprovalResponse={addToolApprovalResponse}
@@ -580,30 +650,33 @@ export function Chat({
                   </div>
                 )}
 
-                {agentEngineAnalysisStatus === "success" && agentEngineAnalysis && (
-                  <div className="space-y-2 text-sm">
-                    <div>
-                      <span className="font-semibold">Diagnostico:</span>{" "}
-                      {agentEngineAnalysis.diagnosisSummary}
+                {agentEngineAnalysisStatus === "success" &&
+                  agentEngineAnalysis && (
+                    <div className="space-y-2 text-sm">
+                      <div>
+                        <span className="font-semibold">Diagnostico:</span>{" "}
+                        {agentEngineAnalysis.diagnosisSummary}
+                      </div>
+                      <div>
+                        <span className="font-semibold">Confianca:</span>{" "}
+                        {agentEngineAnalysis.confidence}
+                      </div>
+                      <div>
+                        <span className="font-semibold">Causas provaveis:</span>{" "}
+                        {agentEngineAnalysis.likelyCauses.join(" | ")}
+                      </div>
+                      <div>
+                        <span className="font-semibold">
+                          Acoes recomendadas:
+                        </span>{" "}
+                        {agentEngineAnalysis.recommendedActions.join(" | ")}
+                      </div>
+                      <div>
+                        <span className="font-semibold">Checks sugeridos:</span>{" "}
+                        {agentEngineAnalysis.checksToRun.join(" | ")}
+                      </div>
                     </div>
-                    <div>
-                      <span className="font-semibold">Confianca:</span>{" "}
-                      {agentEngineAnalysis.confidence}
-                    </div>
-                    <div>
-                      <span className="font-semibold">Causas provaveis:</span>{" "}
-                      {agentEngineAnalysis.likelyCauses.join(" | ")}
-                    </div>
-                    <div>
-                      <span className="font-semibold">Acoes recomendadas:</span>{" "}
-                      {agentEngineAnalysis.recommendedActions.join(" | ")}
-                    </div>
-                    <div>
-                      <span className="font-semibold">Checks sugeridos:</span>{" "}
-                      {agentEngineAnalysis.checksToRun.join(" | ")}
-                    </div>
-                  </div>
-                )}
+                  )}
               </div>
             </div>
           )}
