@@ -1271,6 +1271,104 @@ export async function querySessionFiles(
   }
 }
 
+export async function getSessionFileById(
+  accessToken: string,
+  userId: string,
+  chatId: string,
+  fileId: string
+): Promise<BigQueryChatFileRow | null> {
+  const filesTable = getFilesTableRef();
+  const fullQuery = `
+    SELECT
+      file_id,
+      session_id,
+      user_id,
+      chat_id,
+      message_id,
+      filename,
+      content_type,
+      CAST(file_size AS STRING) AS file_size,
+      gcs_url,
+      object_path,
+      created_at,
+      CAST(is_deleted AS STRING) AS is_deleted
+    FROM \`${filesTable}\`
+    WHERE user_id = @user_id
+      AND file_id = @file_id
+      AND (chat_id = @chat_id OR (chat_id IS NULL AND session_id = @chat_id))
+      AND (is_deleted IS NULL OR is_deleted = FALSE)
+    ORDER BY SAFE_CAST(created_at AS TIMESTAMP) DESC
+    LIMIT 1
+  `;
+
+  let row: GenericBigQueryRow | undefined;
+
+  try {
+    const response = await runQuery(accessToken, fullQuery, [
+      { name: "user_id", type: "STRING", value: userId },
+      { name: "file_id", type: "STRING", value: fileId },
+      { name: "chat_id", type: "STRING", value: chatId },
+    ]);
+    const rows = mapRows(
+      response.rows as BigQueryRow[] | undefined,
+      response.schema as BigQuerySchema | undefined
+    );
+    row = rows[0];
+  } catch {
+    const fallbackQuery = `
+      SELECT
+        file_id,
+        session_id,
+        user_id,
+        session_id AS chat_id,
+        NULL AS message_id,
+        filename,
+        content_type,
+        CAST(file_size AS STRING) AS file_size,
+        gcs_url,
+        '' AS object_path,
+        created_at,
+        'false' AS is_deleted
+      FROM \`${filesTable}\`
+      WHERE user_id = @user_id
+        AND file_id = @file_id
+        AND session_id = @chat_id
+      ORDER BY created_at DESC
+      LIMIT 1
+    `;
+
+    const response = await runQuery(accessToken, fallbackQuery, [
+      { name: "user_id", type: "STRING", value: userId },
+      { name: "file_id", type: "STRING", value: fileId },
+      { name: "chat_id", type: "STRING", value: chatId },
+    ]);
+    const rows = mapRows(
+      response.rows as BigQueryRow[] | undefined,
+      response.schema as BigQuerySchema | undefined
+    );
+    row = rows[0];
+  }
+
+  if (!row) {
+    return null;
+  }
+
+  return {
+    file_id: row.file_id ?? "",
+    session_id: row.session_id ?? "",
+    user_id: row.user_id ?? "",
+    chat_id: row.chat_id ?? row.session_id ?? "",
+    message_id: row.message_id,
+    filename: row.filename ?? "",
+    content_type: row.content_type ?? "",
+    file_size: parseIntOrNull(row.file_size) ?? 0,
+    gcs_url: row.gcs_url ?? "",
+    object_path: row.object_path ?? "",
+    created_at: row.created_at ?? "",
+    is_deleted: parseBool(row.is_deleted),
+  };
+}
+
 export async function getBigQueryAccessToken() {
   return await getServiceAccountAccessToken();
 }

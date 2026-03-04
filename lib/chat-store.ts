@@ -82,6 +82,63 @@ function parseSortableTimestamp(value: string | null | undefined) {
   return Number.isNaN(parsed) ? 0 : parsed;
 }
 
+function buildChatFileUrl(chatId: string, fileId: string) {
+  const params = new URLSearchParams({
+    chatId,
+    fileId,
+  });
+  return `/api/files?${params.toString()}`;
+}
+
+function getFilePartId(part: UIChatPart): string | null {
+  if (!isRecord(part)) {
+    return null;
+  }
+
+  const rawFileId = (part as Record<string, unknown>).fileId;
+  if (typeof rawFileId !== "string") {
+    return null;
+  }
+
+  const normalized = rawFileId.trim();
+  return normalized.length > 0 ? normalized : null;
+}
+
+function withResolvedChatFileUrls(message: ChatMessage, chatId: string) {
+  let changed = false;
+
+  const nextParts = message.parts.map((part) => {
+    if (part.type !== "file") {
+      return part;
+    }
+
+    const fileId = getFilePartId(part);
+    if (!fileId) {
+      return part;
+    }
+
+    const resolvedUrl = buildChatFileUrl(chatId, fileId);
+    if (part.url === resolvedUrl) {
+      return part;
+    }
+
+    changed = true;
+    return {
+      ...part,
+      url: resolvedUrl,
+    };
+  });
+
+  if (!changed) {
+    return message;
+  }
+
+  return {
+    ...message,
+    parts: nextParts as ChatMessage["parts"],
+  };
+}
+
 function getPlainTextFromMessage(message: ChatMessage) {
   return message.parts
     .filter((part) => part.type === "text")
@@ -467,7 +524,9 @@ export async function getChatMessagesByChatId({
         const messageBTimestamp = parseSortableTimestamp(messageB.created_at);
         return messageATimestamp - messageBTimestamp;
       })
-      .map((row) => toChatMessageFromBigQueryRow(row));
+      .map((row) =>
+        withResolvedChatFileUrls(toChatMessageFromBigQueryRow(row), chatId)
+      );
     const visibleMessages = collapseAssistantResponseRegenerations(messages);
 
     if (!dedupeAssistantDuplicates) {

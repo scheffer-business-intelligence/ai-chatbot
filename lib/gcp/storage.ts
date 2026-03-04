@@ -79,6 +79,29 @@ export async function generateSignedUrl(gcsUrl: string) {
   return `${mediaUrl}&access_token=${accessToken}`;
 }
 
+export async function fetchGcsObject(gcsUrl: string, signal?: AbortSignal) {
+  const accessToken = await getServiceAccountAccessToken();
+  const { bucket, objectPath } = parseGcsUrl(gcsUrl);
+
+  const mediaUrl = `${GCS_BASE_URL}/storage/v1/b/${bucket}/o/${encodeURIComponent(objectPath)}?alt=media`;
+  const response = await fetch(mediaUrl, {
+    method: "GET",
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+    },
+    signal,
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(
+      `GCS read failed: ${response.status} - ${errorText || "unknown"}`
+    );
+  }
+
+  return response;
+}
+
 export async function deleteFromGCS(gcsUrl: string) {
   const accessToken = await getServiceAccountAccessToken();
   const { bucket, objectPath } = parseGcsUrl(gcsUrl);

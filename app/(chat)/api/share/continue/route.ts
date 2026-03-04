@@ -6,12 +6,57 @@ import {
 } from "@/lib/chat-store";
 import { getChatById, saveChat } from "@/lib/db/queries";
 import { ChatSDKError } from "@/lib/errors";
+import {
+  getBigQueryAccessToken,
+  insertFileMetadata,
+  querySessionFiles,
+} from "@/lib/gcp/bigquery";
 import type { ChatMessage } from "@/lib/types";
 import { generateUUID } from "@/lib/utils";
 
 type ContinueShareRequestBody = {
   chatId?: string;
 };
+
+function getFileIdFromPart(part: ChatMessage["parts"][number]) {
+  if (part.type !== "file") {
+    return null;
+  }
+
+  const rawFileId =
+    "fileId" in part && typeof part.fileId === "string" ? part.fileId : "";
+  const normalized = rawFileId.trim();
+  return normalized.length > 0 ? normalized : null;
+}
+
+function remapFileIdsInParts({
+  parts,
+  fileIdMap,
+}: {
+  parts: ChatMessage["parts"];
+  fileIdMap: ReadonlyMap<string, string>;
+}): ChatMessage["parts"] {
+  return parts.map((part) => {
+    if (part.type !== "file") {
+      return part;
+    }
+
+    const sourceFileId = getFileIdFromPart(part);
+    if (!sourceFileId) {
+      return part;
+    }
+
+    const mappedFileId = fileIdMap.get(sourceFileId);
+    if (!mappedFileId || mappedFileId === sourceFileId) {
+      return part;
+    }
+
+    return {
+      ...part,
+      fileId: mappedFileId,
+    };
+  }) as ChatMessage["parts"];
+}
 
 function toMonotonicIsoTimestamp({
   rawCreatedAt,
@@ -95,6 +140,52 @@ export async function POST(request: Request) {
       visibility: "private",
     });
 
+    const accessToken = await getBigQueryAccessToken();
+    const sourceFiles = await querySessionFiles(
+      accessToken,
+      sourceChat.userId,
+      sourceChatId
+    );
+
+    const referencedFileIds = new Set<string>();
+    for (const sourceMessage of messagesToClone) {
+      for (const part of sourceMessage.parts) {
+        const fileId = getFileIdFromPart(part);
+        if (fileId) {
+          referencedFileIds.add(fileId);
+        }
+      }
+    }
+
+    const clonedFileIdMap = new Map<string, string>();
+    for (const sourceFile of sourceFiles) {
+      const sourceFileId = sourceFile.file_id?.trim();
+      if (!sourceFileId || !referencedFileIds.has(sourceFileId)) {
+        continue;
+      }
+      if (clonedFileIdMap.has(sourceFileId)) {
+        continue;
+      }
+
+      const clonedFileId = generateUUID();
+      clonedFileIdMap.set(sourceFileId, clonedFileId);
+
+      await insertFileMetadata(accessToken, {
+        file_id: clonedFileId,
+        session_id: newChatId,
+        user_id: bigQueryUserId,
+        chat_id: newChatId,
+        message_id: null,
+        filename: sourceFile.filename,
+        content_type: sourceFile.content_type,
+        file_size: sourceFile.file_size,
+        gcs_url: sourceFile.gcs_url,
+        object_path: sourceFile.object_path,
+        created_at: new Date().toISOString(),
+        is_deleted: false,
+      });
+    }
+
     let previousCreatedAtMs: number | null = null;
     const fallbackNowMs = Date.now();
 
@@ -109,7 +200,10 @@ export async function POST(request: Request) {
       const clonedMessage: ChatMessage = {
         id: generateUUID(),
         role: sourceMessage.role,
-        parts: sourceMessage.parts,
+        parts: remapFileIdsInParts({
+          parts: sourceMessage.parts,
+          fileIdMap: clonedFileIdMap,
+        }),
         metadata: {
           createdAt,
           chartSpec: sourceMessage.metadata?.chartSpec ?? null,
