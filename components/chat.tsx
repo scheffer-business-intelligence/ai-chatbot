@@ -543,6 +543,7 @@ export function Chat({
                 Este chat compartilhado está em modo somente leitura.
               </p>
               <Button
+                className="cursor-pointer"
                 disabled={isContinuingSharedChat}
                 onClick={handleContinueSharedChat}
                 size="sm"

@@ -384,6 +384,9 @@ export async function persistMessageToBigQuery(
     await upsertChatMessageRow(accessToken, row);
   } catch (error) {
     console.error("Failed to persist chat message to BigQuery:", error);
+    throw error instanceof Error
+      ? error
+      : new Error("Failed to persist chat message to BigQuery.");
   }
 }
 

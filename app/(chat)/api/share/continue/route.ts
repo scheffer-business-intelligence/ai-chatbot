@@ -1,15 +1,46 @@
 import { auth } from "@/app/(auth)/auth";
 import { getBigQueryUserIdCandidates } from "@/lib/auth/user-id";
-import { persistMessageToBigQuery } from "@/lib/chat-store";
-import { getChatById, getMessagesByChatId, saveChat } from "@/lib/db/queries";
+import {
+  getChatMessagesByChatId,
+  persistMessageToBigQuery,
+} from "@/lib/chat-store";
+import { getChatById, saveChat } from "@/lib/db/queries";
 import { ChatSDKError } from "@/lib/errors";
-import { dedupeDbAssistantMessages } from "@/lib/messages/dedupe";
 import type { ChatMessage } from "@/lib/types";
 import { generateUUID } from "@/lib/utils";
 
 type ContinueShareRequestBody = {
   chatId?: string;
 };
+
+function toMonotonicIsoTimestamp({
+  rawCreatedAt,
+  previousCreatedAtMs,
+  fallbackNowMs,
+}: {
+  rawCreatedAt?: string;
+  previousCreatedAtMs: number | null;
+  fallbackNowMs: number;
+}) {
+  const parsedMs =
+    typeof rawCreatedAt === "string" ? new Date(rawCreatedAt).getTime() : NaN;
+  const candidateMs = Number.isFinite(parsedMs) ? parsedMs : fallbackNowMs;
+
+  if (previousCreatedAtMs === null) {
+    return {
+      createdAt: new Date(candidateMs).toISOString(),
+      createdAtMs: candidateMs,
+    };
+  }
+
+  const normalizedMs =
+    candidateMs > previousCreatedAtMs ? candidateMs : previousCreatedAtMs + 1;
+
+  return {
+    createdAt: new Date(normalizedMs).toISOString(),
+    createdAtMs: normalizedMs,
+  };
+}
 
 export async function POST(request: Request) {
   try {
@@ -46,11 +77,14 @@ export async function POST(request: Request) {
       return new ChatSDKError("forbidden:chat").toResponse();
     }
 
-    const sourceMessages = await getMessagesByChatId({ id: sourceChatId });
-    const messagesToClone = dedupeDbAssistantMessages(
-      sourceMessages.filter(
-        (message) => message.role === "user" || message.role === "assistant"
-      )
+    const sourceMessages = await getChatMessagesByChatId({
+      chatId: sourceChatId,
+      userId: sourceChat.userId,
+      dedupeAssistantDuplicates: true,
+    });
+
+    const messagesToClone = sourceMessages.filter(
+      (message) => message.role === "user" || message.role === "assistant"
     );
 
     const newChatId = generateUUID();
@@ -61,15 +95,25 @@ export async function POST(request: Request) {
       visibility: "private",
     });
 
-    for (const sourceMessage of messagesToClone) {
+    let previousCreatedAtMs: number | null = null;
+    const fallbackNowMs = Date.now();
+
+    for (const [index, sourceMessage] of messagesToClone.entries()) {
+      const { createdAt, createdAtMs } = toMonotonicIsoTimestamp({
+        rawCreatedAt: sourceMessage.metadata?.createdAt,
+        previousCreatedAtMs,
+        fallbackNowMs: fallbackNowMs + index,
+      });
+      previousCreatedAtMs = createdAtMs;
+
       const clonedMessage: ChatMessage = {
         id: generateUUID(),
-        role: sourceMessage.role as ChatMessage["role"],
-        parts: sourceMessage.parts as ChatMessage["parts"],
+        role: sourceMessage.role,
+        parts: sourceMessage.parts,
         metadata: {
-          createdAt: sourceMessage.createdAt.toISOString(),
-          chartSpec: sourceMessage.chartSpec as any,
-          chartError: sourceMessage.chartError ?? null,
+          createdAt,
+          chartSpec: sourceMessage.metadata?.chartSpec ?? null,
+          chartError: sourceMessage.metadata?.chartError ?? null,
         },
       };
 
@@ -79,8 +123,8 @@ export async function POST(request: Request) {
         userId: bigQueryUserId,
         message: clonedMessage,
         visibility: "private",
-        chartSpec: sourceMessage.chartSpec ?? undefined,
-        chartError: sourceMessage.chartError ?? null,
+        chartSpec: sourceMessage.metadata?.chartSpec ?? undefined,
+        chartError: sourceMessage.metadata?.chartError ?? null,
         answeredIn: null,
       });
     }
