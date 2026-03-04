@@ -5,13 +5,17 @@ import {
   inferChartSpecsFromBulletListText,
   inferChartSpecsFromContextSheets,
   inferChartSpecsFromInlineSeriesText,
+  inferChartSpecsFromLooseJsonText,
   inferChartSpecsFromTableText,
 } from "@/lib/charts/context";
 import {
   deleteMessagesByChatIdAfterTimestamp,
   getProviderSessionByChatId,
 } from "@/lib/db/queries";
-import { parseBqContextFromText, parseExportAwareText } from "@/lib/export-context";
+import {
+  parseBqContextFromText,
+  parseExportAwareText,
+} from "@/lib/export-context";
 import {
   type BigQueryChatMessageRow,
   countUserMessagesSince,
@@ -234,7 +238,10 @@ function hydrateAssistantPartsFromRow({
     hasPartType(hydratedParts, "data-chart-spec") ||
     hasPartType(hydratedParts, "data-chart-specs");
   const hasChartWarningPart = hasPartType(hydratedParts, "data-chart-warning");
-  const hasExportContextPart = hasPartType(hydratedParts, "data-export-context");
+  const hasExportContextPart = hasPartType(
+    hydratedParts,
+    "data-export-context"
+  );
   const hasExportHintPart = hasPartType(hydratedParts, "data-export-hint");
   const chartSpecFromRow = parseJsonString<unknown>(row.chart_spec_json);
 
@@ -278,38 +285,54 @@ function hydrateAssistantPartsFromRow({
     } as UIChatPart);
   }
 
+  const visibleTextForChartInference =
+    parsedExportAwareText.cleanText.trim() ||
+    parsedBqContext.cleanText.trim() ||
+    text;
+  const inferredFromLooseJsonCandidate = inferChartSpecsFromLooseJsonText(
+    visibleTextForChartInference
+  );
+
   if (
     !hasChartSpecPart &&
     (!chartSpecFromRow || typeof chartSpecFromRow !== "object") &&
-    (contextSheets.length > 0 || hasChartIntent || Boolean(row.chart_error))
+    (contextSheets.length > 0 ||
+      hasChartIntent ||
+      Boolean(row.chart_error) ||
+      inferredFromLooseJsonCandidate.length > 0)
   ) {
-    const visibleText =
-      parsedExportAwareText.cleanText.trim() ||
-      parsedBqContext.cleanText.trim() ||
-      text;
     const inferredFromContext = inferChartSpecsFromContextSheets(contextSheets);
     const inferredFromTable =
       inferredFromContext.length > 0
         ? []
-        : inferChartSpecsFromTableText(visibleText);
-    const inferredFromInline =
+        : inferChartSpecsFromTableText(visibleTextForChartInference);
+    const inferredFromLooseJson =
       inferredFromContext.length > 0 || inferredFromTable.length > 0
         ? []
-        : inferChartSpecsFromInlineSeriesText(visibleText);
+        : inferredFromLooseJsonCandidate;
+    const inferredFromInline =
+      inferredFromContext.length > 0 ||
+      inferredFromTable.length > 0 ||
+      inferredFromLooseJson.length > 0
+        ? []
+        : inferChartSpecsFromInlineSeriesText(visibleTextForChartInference);
     const inferredFromBullets =
       inferredFromContext.length > 0 ||
       inferredFromTable.length > 0 ||
+      inferredFromLooseJson.length > 0 ||
       inferredFromInline.length > 0
         ? []
-        : inferChartSpecsFromBulletListText(visibleText);
+        : inferChartSpecsFromBulletListText(visibleTextForChartInference);
     const inferredSpecs =
       inferredFromContext.length > 0
         ? inferredFromContext
         : inferredFromTable.length > 0
           ? inferredFromTable
-          : inferredFromInline.length > 0
-            ? inferredFromInline
-            : inferredFromBullets;
+          : inferredFromLooseJson.length > 0
+            ? inferredFromLooseJson
+            : inferredFromInline.length > 0
+              ? inferredFromInline
+              : inferredFromBullets;
 
     if (inferredSpecs.length > 1) {
       hydratedParts.push({
@@ -324,7 +347,11 @@ function hydrateAssistantPartsFromRow({
     }
   }
 
-  if (!hasChartWarningPart && row.chart_error) {
+  const hasHydratedChartSpecPart =
+    hasPartType(hydratedParts, "data-chart-spec") ||
+    hasPartType(hydratedParts, "data-chart-specs");
+
+  if (!hasChartWarningPart && row.chart_error && !hasHydratedChartSpecPart) {
     const normalizedChartError = normalizeChartError(row.chart_error);
 
     if (!INCOMPLETE_CHART_WARNINGS.has(normalizedChartError)) {
@@ -341,9 +368,12 @@ function hydrateAssistantPartsFromRow({
 function toChatMessageFromBigQueryRow(
   row: BigQueryChatMessageRow
 ): ChatMessage {
-  const parsedParts = normalizeParsedParts(parseJsonString<unknown>(row.parts_json));
-  const fallbackParts: UIChatPart[] =
-    row.content ? [{ type: "text", text: row.content }] : [];
+  const parsedParts = normalizeParsedParts(
+    parseJsonString<unknown>(row.parts_json)
+  );
+  const fallbackParts: UIChatPart[] = row.content
+    ? [{ type: "text", text: row.content }]
+    : [];
   const role = (row.role as ChatMessage["role"]) || "assistant";
   const rawParts = parsedParts ?? fallbackParts;
   const parts =
@@ -356,21 +386,27 @@ function toChatMessageFromBigQueryRow(
       : new Date().toISOString();
   const chartSpecFromRow = parseJsonString(row.chart_spec_json);
   const chartSpecFromParts =
-    (parts.find((part) => part.type === "data-chart-spec") as
-      | { type: "data-chart-spec"; data?: unknown }
-      | undefined)?.data ??
-    (parts.find((part) => part.type === "data-chart-specs") as
-      | { type: "data-chart-specs"; data?: unknown }
-      | undefined)?.data;
+    (
+      parts.find((part) => part.type === "data-chart-spec") as
+        | { type: "data-chart-spec"; data?: unknown }
+        | undefined
+    )?.data ??
+    (
+      parts.find((part) => part.type === "data-chart-specs") as
+        | { type: "data-chart-specs"; data?: unknown }
+        | undefined
+    )?.data;
   const chartSpec =
     chartSpecFromRow && typeof chartSpecFromRow === "object"
       ? chartSpecFromRow
       : Array.isArray(chartSpecFromParts)
         ? chartSpecFromParts[0]
         : chartSpecFromParts;
-  const chartWarningFromParts = (parts.find(
-    (part) => part.type === "data-chart-warning"
-  ) as { type: "data-chart-warning"; data?: unknown } | undefined)?.data;
+  const chartWarningFromParts = (
+    parts.find((part) => part.type === "data-chart-warning") as
+      | { type: "data-chart-warning"; data?: unknown }
+      | undefined
+  )?.data;
 
   return {
     id: row.message_id,
@@ -469,7 +505,7 @@ export async function getChatMessagesByChatId({
     const messagesById = new Map<string, BigQueryChatMessageRow>();
     let providerSessionId: string | null = null;
 
-    // ── Primary lookup: query by chatId (matches chat_id or session_id) ──
+    // Primary lookup: query by chatId (matches chat_id or session_id)
     for (const candidateUserId of userIds) {
       const candidateRows = await querySessionMessages(
         accessToken,
@@ -671,7 +707,11 @@ export async function findMessageReferenceById({
     let message: BigQueryChatMessageRow | null = null;
 
     for (const candidateUserId of userIds) {
-      message = await getChatMessageById(accessToken, candidateUserId, messageId);
+      message = await getChatMessageById(
+        accessToken,
+        candidateUserId,
+        messageId
+      );
       if (message) {
         break;
       }

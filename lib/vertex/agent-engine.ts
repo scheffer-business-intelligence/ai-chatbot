@@ -2,6 +2,7 @@ import {
   inferChartSpecsFromBulletListText,
   inferChartSpecsFromContextSheets,
   inferChartSpecsFromInlineSeriesText,
+  inferChartSpecsFromLooseJsonText,
   inferChartSpecsFromTableText,
   parseChartContextFromText,
 } from "@/lib/charts/context";
@@ -360,7 +361,7 @@ function ensureStatusSuffix(text: string): string {
     return normalized;
   }
 
-  if (/[.!?…]$/.test(normalized)) {
+  if (/[.!?]$/.test(normalized)) {
     return normalized;
   }
 
@@ -383,7 +384,7 @@ function extractKnownStatusesInOrder(text: string): string[] {
     format: (rawMatch: string) => string;
   }> = [
     {
-      regex: /processando sua solicitação\.{0,3}/gi,
+      regex: /processando sua solicita(?:ção|cao)\.{0,3}/gi,
       format: (rawMatch) => ensureStatusSuffix(rawMatch),
     },
     {
@@ -584,7 +585,7 @@ function stripLeadingAgentStatuses(
 
   const stripKnownStatusTokens = (value: string): string => {
     const knownStatusRegex =
-      /^\s*(?:processando sua solicitação|ativando(?:\s+(?:o|a))?\s+agente especialista(?:\s*\([^)]+\))?|obtendo os dados|dados obtidos com sucesso!?|gerando resposta)\s*\.{0,3}\s*/i;
+      /^\s*(?:processando sua solicita(?:ção|cao)|ativando(?:\s+(?:o|a))?\s+agente especialista(?:\s*\([^)]+\))?|obtendo os dados|dados obtidos com sucesso!?|gerando resposta)\s*\.{0,3}\s*/i;
     const agentTagRegex = /^\s*\([^)]+_agent\)\s*\.{0,3}\s*/i;
 
     let nextValue = value;
@@ -1099,6 +1100,8 @@ type ChartResolutionSource =
   | "chart_context"
   | "bq_context_fallback"
   | "markdown_table_fallback"
+  | "json_payload_fallback"
+  | "json_payload_direct"
   | "inline_text_fallback"
   | "bullet_list_fallback"
   | "none";
@@ -1138,6 +1141,12 @@ function resolveChartFromFallbacks(
     return "markdown_table_fallback";
   }
 
+  const inferredFromLooseJson = inferChartSpecsFromLooseJsonText(visibleText);
+  if (inferredFromLooseJson.length > 0) {
+    setResolvedChartSpecs(extractedContext, inferredFromLooseJson);
+    return "json_payload_fallback";
+  }
+
   const inferredFromInline = inferChartSpecsFromInlineSeriesText(visibleText);
   if (inferredFromInline.length > 0) {
     setResolvedChartSpecs(extractedContext, inferredFromInline);
@@ -1173,6 +1182,14 @@ function applyChartResolution({
     resolutionSource = "chart_context";
   } else if (allowFallback) {
     resolutionSource = resolveChartFromFallbacks(visibleText, extractedContext);
+  } else {
+    // Even when user text has no explicit chart intent, recover chart specs
+    // when the assistant returns a chart JSON payload directly in text.
+    const inferredFromLooseJson = inferChartSpecsFromLooseJsonText(visibleText);
+    if (inferredFromLooseJson.length > 0) {
+      setResolvedChartSpecs(extractedContext, inferredFromLooseJson);
+      resolutionSource = "json_payload_direct";
+    }
   }
 
   if (

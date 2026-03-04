@@ -1761,3 +1761,49 @@ export function parseChartContextFromText(text: string): ParsedChartContext {
     hasChartContext: true,
   };
 }
+
+export function inferChartSpecsFromLooseJsonText(text: string): ChartSpecV1[] {
+  const codeFenceRegex = /```(?:[a-zA-Z0-9_-]+)?\s*([\s\S]*?)```/g;
+  const candidatePayloads: string[] = [];
+
+  while (true) {
+    const match = codeFenceRegex.exec(text);
+    if (!match) {
+      break;
+    }
+
+    const payload = match[1]?.trim();
+    if (payload) {
+      candidatePayloads.push(payload);
+    }
+  }
+
+  const trimmedText = text.trim();
+  if (trimmedText) {
+    candidatePayloads.push(trimmedText);
+  }
+
+  if (candidatePayloads.length === 0) {
+    return [];
+  }
+
+  const uniquePayloads = [...new Set(candidatePayloads)];
+  const inferredSpecs: ChartSpecV1[] = [];
+
+  for (const payload of uniquePayloads) {
+    let parsedPayload: unknown;
+
+    try {
+      parsedPayload = tryParseChartPayload(payload);
+    } catch {
+      continue;
+    }
+
+    const parsedSpecs = parseChartSpecsFromPayload(parsedPayload);
+    if (parsedSpecs.chartSpecs.length > 0) {
+      inferredSpecs.push(...parsedSpecs.chartSpecs);
+    }
+  }
+
+  return dedupeChartSpecs(inferredSpecs).slice(0, 6);
+}

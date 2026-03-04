@@ -29,6 +29,134 @@ import { MessageReasoning } from "./message-reasoning";
 import { PreviewAttachment } from "./preview-attachment";
 import { Weather } from "./weather";
 
+const CHART_CODE_FENCE_REGEX =
+  /```(?:json|javascript|js|ts|typescript)?\s*([\s\S]*?)```/gi;
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function parseChartJsonCandidate(payload: string): unknown | null {
+  const trimmed = payload.trim();
+  if (!trimmed) {
+    return null;
+  }
+
+  const candidates = [trimmed];
+  const sliceStrategies: Array<{ open: string; close: string }> = [
+    { open: "{", close: "}" },
+    { open: "[", close: "]" },
+  ];
+
+  for (const { open, close } of sliceStrategies) {
+    const firstIndex = trimmed.indexOf(open);
+    const lastIndex = trimmed.lastIndexOf(close);
+
+    if (firstIndex < 0 || lastIndex <= firstIndex) {
+      continue;
+    }
+
+    const candidateSlice = trimmed.slice(firstIndex, lastIndex + 1).trim();
+    if (candidateSlice) {
+      candidates.push(candidateSlice);
+    }
+  }
+
+  for (const candidate of candidates) {
+    try {
+      return JSON.parse(candidate);
+    } catch {
+      // Ignore invalid candidates.
+    }
+  }
+
+  return null;
+}
+
+function looksLikeChartJsonPayload(value: unknown, depth = 0): boolean {
+  if (depth > 5) {
+    return false;
+  }
+
+  if (Array.isArray(value)) {
+    return value.some((entry) => looksLikeChartJsonPayload(entry, depth + 1));
+  }
+
+  if (!isRecord(value)) {
+    return false;
+  }
+
+  const chartType =
+    typeof value.type === "string" ? value.type.trim().toLowerCase() : null;
+  if (chartType && ["bar", "line", "area", "pie"].includes(chartType)) {
+    return true;
+  }
+
+  if (Array.isArray(value.labels) && Array.isArray(value.datasets)) {
+    return true;
+  }
+
+  const wrapperKeys = [
+    "chart",
+    "chartSpec",
+    "chartSpecs",
+    "chartContext",
+    "chart_context",
+    "spec",
+    "payload",
+    "result",
+    "output",
+    "data",
+  ];
+
+  for (const key of wrapperKeys) {
+    if (key in value && looksLikeChartJsonPayload(value[key], depth + 1)) {
+      return true;
+    }
+  }
+
+  const hintKeys = [
+    "xKey",
+    "yKey",
+    "series",
+    "seriesKey",
+    "nameKey",
+    "valueKey",
+    "labels",
+    "datasets",
+  ];
+  const hintCount = hintKeys.reduce(
+    (count, key) => count + Number(key in value),
+    0
+  );
+  return hintCount >= 3;
+}
+
+function stripChartJsonCodeBlocks(text: string): string {
+  if (!text.includes("```")) {
+    return text;
+  }
+
+  let removedAny = false;
+  const stripped = text.replace(
+    CHART_CODE_FENCE_REGEX,
+    (fullMatch, payload: string | undefined) => {
+      const parsedPayload = parseChartJsonCandidate(payload ?? "");
+      if (parsedPayload && looksLikeChartJsonPayload(parsedPayload)) {
+        removedAny = true;
+        return "";
+      }
+
+      return fullMatch;
+    }
+  );
+
+  if (!removedAny) {
+    return text;
+  }
+
+  return stripped.replace(/\n{3,}/g, "\n\n").trim();
+}
 const PurePreviewMessage = ({
   chatId,
   addToolApprovalResponse,
@@ -196,7 +324,11 @@ const PurePreviewMessage = ({
       }
 
       const parsedText = parseExportAwareText(part.text);
-      const visibleText = sanitizeText(parsedText.cleanText).trim();
+      const visibleText = sanitizeText(parsedText.cleanText);
+      const renderableText =
+        message.role === "assistant" && chartSpecs.length > 0
+          ? stripChartJsonCodeBlocks(visibleText)
+          : visibleText;
       const contextSheets =
         exportContextSheetsFromParts.length > 0
           ? exportContextSheetsFromParts
@@ -216,7 +348,9 @@ const PurePreviewMessage = ({
         exportHint !== null &&
         contextSheets.length > 0;
 
-      return visibleText.length > 0 || hasParsedExport || hasFallbackExport;
+      return (
+        renderableText.trim().length > 0 || hasParsedExport || hasFallbackExport
+      );
     }) ?? false;
   const hasVisibleAssistantContent =
     message.role !== "assistant" ||
@@ -226,6 +360,11 @@ const PurePreviewMessage = ({
     message.parts.some((part) => {
       if (part.type === "text") {
         const parsedText = parseExportAwareText(part.text);
+        const visibleText = sanitizeText(parsedText.cleanText);
+        const renderableText =
+          message.role === "assistant" && chartSpecs.length > 0
+            ? stripChartJsonCodeBlocks(visibleText)
+            : visibleText;
         const contextSheets =
           exportContextSheetsFromParts.length > 0
             ? exportContextSheetsFromParts
@@ -246,7 +385,7 @@ const PurePreviewMessage = ({
           contextSheets.length > 0;
 
         return (
-          sanitizeText(parsedText.cleanText).trim().length > 0 ||
+          renderableText.trim().length > 0 ||
           hasParsedExport ||
           hasFallbackExport
         );
@@ -349,6 +488,10 @@ const PurePreviewMessage = ({
               const parsedText = parseExportAwareText(part.text);
               const parsedExportData = parsedText.exportData;
               const visibleText = sanitizeText(parsedText.cleanText);
+              const renderableText =
+                message.role === "assistant" && chartSpecs.length > 0
+                  ? stripChartJsonCodeBlocks(visibleText)
+                  : visibleText;
               const contextSheets =
                 exportContextSheetsFromParts.length > 0
                   ? exportContextSheetsFromParts
@@ -382,13 +525,13 @@ const PurePreviewMessage = ({
                     : null;
 
               if (mode === "view") {
-                if (!visibleText.trim() && !exportData) {
+                if (!renderableText.trim() && !exportData) {
                   return null;
                 }
 
                 return (
                   <div key={key}>
-                    {visibleText.trim().length > 0 && (
+                    {renderableText.trim().length > 0 && (
                       <MessageContent
                         className={cn({
                           "wrap-break-word w-fit rounded-2xl px-3 py-2 text-right text-white":
@@ -407,7 +550,7 @@ const PurePreviewMessage = ({
                           components={responseComponents}
                           mode={isLoading ? "streaming" : "static"}
                         >
-                          {visibleText}
+                          {renderableText}
                         </Response>
                       </MessageContent>
                     )}
@@ -626,7 +769,7 @@ export const PreviewMessage = PurePreviewMessage;
 export const ThinkingMessage = ({ statusText }: { statusText?: string }) => {
   // Strip trailing dots/ellipsis from status text so we can animate them
   const label = (
-    statusText?.trim().replace(/\.{2,}$|…$/g, "") || "Pensando"
+    statusText?.trim().replace(/\.{2,}$|\u2026$/g, "") || "Pensando"
   ).trim();
 
   return (

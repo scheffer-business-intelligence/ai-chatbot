@@ -532,7 +532,7 @@ function shouldAllowTableChartFallback(message: ChatMessage): boolean {
     return false;
   }
 
-  return /\b(gr[aá]fico|chart|plot|plotar|visualiza(?:r|ção))\b/i.test(
+  return /\b(gr[a\u00e1]fico|chart|plot|plotar|visualiza(?:r|(?:c|[\u00e7])(?:ao|[\u00e3a]o)))\b/i.test(
     userText
   );
 }
@@ -1032,7 +1032,7 @@ export async function POST(request: Request) {
             earlyProviderSessionPromise!,
           ]);
 
-        // Start building the vertex message immediately — it depends only
+        // Start building the vertex message immediately - it depends only
         // on the user message and request signal, NOT on the provider session.
         // This overlaps file download/encoding with session creation.
         const vertexMessagePromise = buildVertexMessageFromUserMessage(
@@ -1049,7 +1049,7 @@ export async function POST(request: Request) {
             bigQueryUserId
           );
 
-          // Defer persistence — the stream only needs the in-memory session ID.
+          // Defer persistence - the stream only needs the in-memory session ID.
           queuePersistenceTask(
             upsertProviderSession({
               chatId: id,
