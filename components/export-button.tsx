@@ -30,11 +30,13 @@ export function ExportButton({ exportData }: { exportData: ExportButtonData }) {
     [exportData.contextSheets]
   );
   const exportRequiresContext = isContextExport(exportData.query);
-  const isDisabled = isLoading || (exportRequiresContext && rowCount === 0);
+  const isDisabled = isLoading;
 
   const handleDownload = async () => {
     if (exportRequiresContext && rowCount === 0) {
-      setError("Os dados de contexto ainda nao estao prontos para exportacao.");
+      setError(
+        "Os dados da exportação ainda não ficaram disponíveis nesta resposta."
+      );
       return;
     }
 
@@ -48,7 +50,7 @@ export function ExportButton({ exportData }: { exportData: ExportButtonData }) {
           "Content-Type": "application/json",
         },
         body: JSON.stringify({
-          query: DATA_FROM_CONTEXT_MARKER,
+          query: exportData.query,
           filename: exportData.filename,
           contextSheets: exportData.contextSheets,
         }),

@@ -1369,6 +1369,32 @@ export async function getSessionFileById(
   };
 }
 
+export type BigQuerySelectRow = Record<string, string | null>;
+
+export type BigQuerySelectResult = {
+  columns: string[];
+  rows: BigQuerySelectRow[];
+};
+
+export async function runSelectQuery(
+  query: string
+): Promise<BigQuerySelectResult> {
+  const accessToken = await getServiceAccountAccessToken();
+  const response = await runQuery(accessToken, query);
+  const schema = response.schema as BigQuerySchema | undefined;
+  const rows = mapRows(response.rows as BigQueryRow[] | undefined, schema);
+  const columns =
+    schema?.fields
+      .map((field) => field.name)
+      .filter((name): name is string => typeof name === "string" && !!name) ??
+    (rows[0] ? Object.keys(rows[0]) : []);
+
+  return {
+    columns,
+    rows,
+  };
+}
+
 export async function getBigQueryAccessToken() {
   return await getServiceAccountAccessToken();
 }

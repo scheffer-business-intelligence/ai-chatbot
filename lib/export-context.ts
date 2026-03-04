@@ -62,6 +62,12 @@ function extractContextBlock(
   }
 
   if (openTagRegex.test(text)) {
+    const danglingPayloadMatch = text.match(
+      new RegExp(
+        `(?:\\[\\s*${escapedTag}\\s*\\]|${escapedTag}\\])\\s*([\\s\\S]*)$`,
+        "i"
+      )
+    );
     const withoutDangling = text.replace(
       new RegExp(
         `(?:\\[\\s*${escapedTag}\\s*\\]|${escapedTag}\\])[\\s\\S]*$`,
@@ -71,7 +77,7 @@ function extractContextBlock(
     );
 
     return {
-      payload: null,
+      payload: asNonEmptyString(danglingPayloadMatch?.[1] ?? null),
       cleanedText: withoutDangling.replace(closingTagRegex, "").trim(),
     };
   }
@@ -82,18 +88,55 @@ function extractContextBlock(
   };
 }
 
-function getTaggedField(payload: string, key: string): string | null {
-  const escapedKey = escapeForRegex(key);
-  const fieldRegex = new RegExp(
-    `${escapedKey}\\s*:\\s*([\\s\\S]*?)(?=\\n\\s*[a-zA-Z_]+\\s*:|$)`,
-    "i"
-  );
-  const match = payload.match(fieldRegex);
-  if (!match) {
-    return null;
+function parseExportTaggedFields(
+  payload: string
+): Partial<Record<"query" | "filename" | "description", string>> {
+  const markerRegex = /\b(query|filename|description)\s*:/gi;
+  const markers: Array<{
+    key: "query" | "filename" | "description";
+    start: number;
+    valueStart: number;
+  }> = [];
+
+  for (const match of payload.matchAll(markerRegex)) {
+    const rawKey = match[1]?.toLowerCase();
+    if (
+      rawKey !== "query" &&
+      rawKey !== "filename" &&
+      rawKey !== "description"
+    ) {
+      continue;
+    }
+
+    markers.push({
+      key: rawKey,
+      start: match.index ?? 0,
+      valueStart: (match.index ?? 0) + match[0].length,
+    });
   }
 
-  return asNonEmptyString(match[1]);
+  if (markers.length === 0) {
+    return {};
+  }
+
+  const fields: Partial<Record<"query" | "filename" | "description", string>> =
+    {};
+
+  for (let index = 0; index < markers.length; index += 1) {
+    const current = markers[index];
+    const next = markers[index + 1];
+    const value = asNonEmptyString(
+      payload.slice(current.valueStart, next?.start ?? payload.length)
+    );
+
+    if (!value || fields[current.key]) {
+      continue;
+    }
+
+    fields[current.key] = value;
+  }
+
+  return fields;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -123,6 +166,151 @@ function extractRecordRows(rows: unknown): Record<string, unknown>[] {
   }
 
   return rows.filter(isRecord);
+}
+
+function unwrapCodeFence(payload: string): string {
+  const trimmed = payload.trim();
+  const fenceMatch = trimmed.match(/^```[a-zA-Z0-9_-]*\s*([\s\S]*?)\s*```$/);
+
+  if (!fenceMatch) {
+    return trimmed;
+  }
+
+  return fenceMatch[1]?.trim() ?? trimmed;
+}
+
+function tryParseJsonPayload(payload: string): unknown {
+  const baseCandidate = payload.trim();
+  const candidates = [baseCandidate, unwrapCodeFence(baseCandidate)];
+
+  for (const candidate of candidates) {
+    if (!candidate) {
+      continue;
+    }
+
+    try {
+      return JSON.parse(candidate);
+    } catch {
+      // Try the next candidate.
+    }
+
+    const sliceStrategies: Array<{ open: string; close: string }> = [
+      { open: "{", close: "}" },
+      { open: "[", close: "]" },
+    ];
+
+    for (const { open, close } of sliceStrategies) {
+      const firstIndex = candidate.indexOf(open);
+      const lastIndex = candidate.lastIndexOf(close);
+
+      if (firstIndex < 0 || lastIndex <= firstIndex) {
+        continue;
+      }
+
+      const jsonSlice = candidate.slice(firstIndex, lastIndex + 1).trim();
+      if (!jsonSlice) {
+        continue;
+      }
+
+      try {
+        return JSON.parse(jsonSlice);
+      } catch {
+        // Ignore and keep trying.
+      }
+    }
+  }
+
+  throw new Error("JSON invalido no bloco BQ_CONTEXT");
+}
+
+function normalizeColumnName(rawValue: unknown, index: number): string {
+  if (typeof rawValue === "string" && rawValue.trim()) {
+    return rawValue.trim();
+  }
+
+  return `coluna_${index + 1}`;
+}
+
+function normalizeColumns(rawColumns: unknown): string[] {
+  if (!Array.isArray(rawColumns)) {
+    return [];
+  }
+
+  return rawColumns
+    .map((column, index) => normalizeColumnName(column, index))
+    .map((column) => column.trim())
+    .filter((column) => column.length > 0);
+}
+
+function buildRowsFromTupleRows(
+  tupleRows: unknown[][],
+  columnsFromSheet: string[]
+): {
+  columns: string[];
+  rows: Record<string, unknown>[];
+} {
+  if (tupleRows.length === 0) {
+    return { columns: [], rows: [] };
+  }
+
+  let columns = [...columnsFromSheet];
+  let dataRows = tupleRows;
+
+  if (columns.length === 0) {
+    const headerRow = tupleRows[0] ?? [];
+    const normalizedFromHeader = headerRow.map((cell, index) =>
+      normalizeColumnName(cell, index)
+    );
+
+    if (normalizedFromHeader.length > 0) {
+      columns = normalizedFromHeader;
+      dataRows = tupleRows.slice(1);
+    }
+  }
+
+  if (columns.length === 0) {
+    const maxLength = tupleRows.reduce(
+      (currentMax, currentRow) => Math.max(currentMax, currentRow.length),
+      0
+    );
+
+    columns = Array.from({ length: maxLength }).map((_, index) =>
+      normalizeColumnName("", index)
+    );
+  }
+
+  if (columns.length === 0 || dataRows.length === 0) {
+    return { columns: [], rows: [] };
+  }
+
+  const rows = dataRows
+    .map((row) => {
+      const record: Record<string, unknown> = {};
+
+      columns.forEach((column, index) => {
+        record[column] = row[index] ?? "";
+      });
+
+      return record;
+    })
+    .filter((row) =>
+      Object.values(row).some((value) => {
+        if (value === null || value === undefined) {
+          return false;
+        }
+
+        if (typeof value === "string") {
+          return value.trim().length > 0;
+        }
+
+        return true;
+      })
+    );
+
+  return {
+    columns,
+    rows,
+  };
 }
 
 export function normalizeExportFilename(filename: string): string {
@@ -161,9 +349,9 @@ export function parseExportDataFromText(text: string): {
     };
   }
 
-  const query = getTaggedField(exportBlock.payload, "query");
-  const filename = getTaggedField(exportBlock.payload, "filename");
-  const description = getTaggedField(exportBlock.payload, "description");
+  const { query, filename, description } = parseExportTaggedFields(
+    exportBlock.payload
+  );
 
   if (!query || !filename || !description) {
     return {
@@ -183,6 +371,41 @@ export function parseExportDataFromText(text: string): {
 }
 
 export function extractContextSheets(rawSheets: unknown): ExportContextSheet[] {
+  if (typeof rawSheets === "string" && rawSheets.trim()) {
+    try {
+      const parsedSheets = tryParseJsonPayload(rawSheets);
+      return extractContextSheets(parsedSheets);
+    } catch {
+      return [];
+    }
+  }
+
+  if (isRecord(rawSheets)) {
+    const candidateValues: unknown[] = [
+      rawSheets.contextSheets,
+      rawSheets.sheets,
+      rawSheets.tables,
+      rawSheets.datasets,
+      rawSheets.results,
+      rawSheets.result,
+      rawSheets.data,
+      rawSheets.rows,
+    ];
+
+    for (const candidate of candidateValues) {
+      if (candidate === rawSheets) {
+        continue;
+      }
+
+      const sheetsFromCandidate = extractContextSheets(candidate);
+      if (sheetsFromCandidate.length > 0) {
+        return sheetsFromCandidate;
+      }
+    }
+
+    return extractContextSheets([rawSheets]);
+  }
+
   if (!Array.isArray(rawSheets)) {
     return [];
   }
@@ -194,19 +417,34 @@ export function extractContextSheets(rawSheets: unknown): ExportContextSheet[] {
       return;
     }
 
-    const rows = extractRecordRows(sheet.rows);
+    const rowsCandidate =
+      sheet.rows ?? sheet.data ?? sheet.values ?? sheet.records ?? sheet.items;
+    const columnsFromSheet = normalizeColumns(
+      sheet.columns ?? sheet.headers ?? sheet.header
+    );
+    const recordRows = extractRecordRows(rowsCandidate);
+    const tupleRows = Array.isArray(rowsCandidate)
+      ? rowsCandidate.filter(
+          (row): row is unknown[] => Array.isArray(row) && row.length > 0
+        )
+      : [];
+    const tupleResolution =
+      recordRows.length === 0 && tupleRows.length > 0
+        ? buildRowsFromTupleRows(tupleRows, columnsFromSheet)
+        : null;
+    const rows =
+      recordRows.length > 0 ? recordRows : (tupleResolution?.rows ?? []);
+
     if (rows.length === 0) {
       return;
     }
 
-    const columnsFromSheet = Array.isArray(sheet.columns)
-      ? sheet.columns
-          .filter((column): column is string => typeof column === "string")
-          .map((column) => column.trim())
-          .filter((column) => column.length > 0)
-      : [];
     const columns =
-      columnsFromSheet.length > 0 ? columnsFromSheet : deriveColumns(rows);
+      tupleResolution && tupleResolution.columns.length > 0
+        ? tupleResolution.columns
+        : columnsFromSheet.length > 0
+          ? columnsFromSheet
+          : deriveColumns(rows);
 
     if (columns.length === 0) {
       return;
@@ -214,6 +452,7 @@ export function extractContextSheets(rawSheets: unknown): ExportContextSheet[] {
 
     const name =
       asNonEmptyString(sheet.name) ??
+      asNonEmptyString(sheet.title) ??
       (index === 0 ? "Dados" : `Tabela ${index + 1}`);
 
     sheets.push({
@@ -530,11 +769,69 @@ export function parseBqContextFromText(text: string): ParsedBqContext {
 
   let parsedPayload: unknown;
   try {
-    parsedPayload = JSON.parse(bqBlock.payload);
+    parsedPayload = tryParseJsonPayload(bqBlock.payload);
   } catch {
     return {
       cleanText: bqBlock.cleanedText,
       contextSheets: [],
+    };
+  }
+
+  const parseFromRecord = (record: Record<string, unknown>) => {
+    const candidateSheetsValues: unknown[] = [
+      record.contextSheets,
+      record.sheets,
+      record.tables,
+      record.datasets,
+      record.results,
+      record.result,
+      record.data,
+    ];
+
+    for (const candidate of candidateSheetsValues) {
+      const sheetsFromCandidate = extractContextSheets(candidate);
+      if (sheetsFromCandidate.length > 0) {
+        return sheetsFromCandidate;
+      }
+    }
+
+    const directSheet = extractContextSheets([record]);
+    if (directSheet.length > 0) {
+      return directSheet;
+    }
+
+    const rowCandidates: unknown[] = [
+      record.rows,
+      record.records,
+      record.items,
+      record.values,
+      record.data,
+      record.result,
+      record.results,
+    ];
+
+    for (const rowsCandidate of rowCandidates) {
+      const fallbackFromRows = buildFallbackSheetsFromRows(rowsCandidate);
+      if (fallbackFromRows.length > 0) {
+        return fallbackFromRows;
+      }
+    }
+
+    return [];
+  };
+
+  if (Array.isArray(parsedPayload)) {
+    const directSheets = extractContextSheets(parsedPayload);
+    if (directSheets.length > 0) {
+      return {
+        cleanText: bqBlock.cleanedText,
+        contextSheets: directSheets,
+      };
+    }
+
+    return {
+      cleanText: bqBlock.cleanedText,
+      contextSheets: buildFallbackSheetsFromRows(parsedPayload),
     };
   }
 
@@ -545,7 +842,7 @@ export function parseBqContextFromText(text: string): ParsedBqContext {
     };
   }
 
-  const sheetsFromContext = extractContextSheets(parsedPayload.contextSheets);
+  const sheetsFromContext = parseFromRecord(parsedPayload);
   if (sheetsFromContext.length > 0) {
     return {
       cleanText: bqBlock.cleanedText,
@@ -555,7 +852,7 @@ export function parseBqContextFromText(text: string): ParsedBqContext {
 
   return {
     cleanText: bqBlock.cleanedText,
-    contextSheets: buildFallbackSheetsFromRows(parsedPayload.rows),
+    contextSheets: [],
   };
 }
 

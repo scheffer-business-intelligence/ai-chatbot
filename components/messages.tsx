@@ -6,6 +6,7 @@ import { useMessages } from "@/hooks/use-messages";
 import {
   type ExportContextSheet,
   extractContextSheets,
+  isDataFromContextQuery,
   parseExportAwareText,
 } from "@/lib/export-context";
 import type { ChatMessage } from "@/lib/types";
@@ -55,6 +56,25 @@ function getContextSheetsFromMessage(
   return [];
 }
 
+function getMessageText(message: ChatMessage): string {
+  return message.parts
+    .filter((part) => part.type === "text")
+    .map((part) => part.text)
+    .join(" ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function isExportIntentText(text: string): boolean {
+  if (!text.trim()) {
+    return false;
+  }
+
+  return /\b(exportar|exporte|export|excel|xlsx|planilha|baixar\s+planilha|download\s+(?:da\s+)?(?:tabela|planilha))\b/i.test(
+    text
+  );
+}
+
 function PureMessages({
   chatId,
   addToolApprovalResponse,
@@ -97,9 +117,13 @@ function PureMessages({
         lastMessage.parts?.some((part) => {
           if (part.type === "text") {
             const parsedText = parseExportAwareText(part.text);
+            const hasParsedExport =
+              parsedText.exportData !== null &&
+              (!isDataFromContextQuery(parsedText.exportData.query) ||
+                parsedText.contextSheets.length > 0);
             return (
               sanitizeText(parsedText.cleanText).trim().length > 0 ||
-              parsedText.exportData !== null
+              hasParsedExport
             );
           }
 
@@ -119,14 +143,6 @@ function PureMessages({
             return true;
           }
 
-          if (part.type === "data-export-context") {
-            return true;
-          }
-
-          if (part.type === "data-export-hint") {
-            return true;
-          }
-
           return part.type === "file";
         }) ?? false
       );
@@ -135,12 +151,26 @@ function PureMessages({
   const isWaitingForAssistant =
     !hasToolApprovalResponse &&
     (status === "submitted" || status === "streaming");
-  const shouldShowStatusLine = isWaitingForAssistant && Boolean(agentStatus);
+  const shouldShowStatusLine =
+    isWaitingForAssistant &&
+    !hasVisibleStreamingAssistantContent &&
+    Boolean(agentStatus);
   const shouldShowThinkingFallback =
     isWaitingForAssistant &&
     !agentStatus &&
     (status === "submitted" ||
       (status === "streaming" && !hasVisibleStreamingAssistantContent));
+  const latestUserMessage = [...messages]
+    .reverse()
+    .find((message) => message.role === "user");
+  const latestUserText = latestUserMessage
+    ? getMessageText(latestUserMessage)
+    : "";
+  const hasPendingExportIntent = isExportIntentText(latestUserText);
+  const fallbackStatusText =
+    shouldShowThinkingFallback && hasPendingExportIntent
+      ? "Gerando o arquivo..."
+      : undefined;
 
   const createRegenerateHandler = (assistantMessageIndex: number) => {
     return async () => {
@@ -225,7 +255,9 @@ function PureMessages({
             <ThinkingMessage statusText={agentStatus ?? undefined} />
           )}
 
-          {shouldShowThinkingFallback && <ThinkingMessage />}
+          {shouldShowThinkingFallback && (
+            <ThinkingMessage statusText={fallbackStatusText} />
+          )}
 
           <div
             className="min-h-[24px] min-w-[24px] shrink-0"

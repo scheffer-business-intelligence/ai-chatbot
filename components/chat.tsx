@@ -322,9 +322,7 @@ export function Chat({
         if (
           part.type === "data-chart-spec" ||
           part.type === "data-chart-specs" ||
-          part.type === "data-chart-warning" ||
-          part.type === "data-export-context" ||
-          part.type === "data-export-hint"
+          part.type === "data-chart-warning"
         ) {
           return true;
         }

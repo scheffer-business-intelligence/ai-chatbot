@@ -1,15 +1,16 @@
 "use client";
 import type { UseChatHelpers } from "@ai-sdk/react";
 import { type ImgHTMLAttributes, useMemo, useState } from "react";
+import { useDataStream } from "@/components/data-stream-provider";
 import {
   containsAllowedChartImageMarkdown,
   isAllowedChartImageUrl,
 } from "@/lib/charts/image-fallback";
-import { useDataStream } from "@/components/data-stream-provider";
 import {
   DATA_FROM_CONTEXT_MARKER,
   type ExportContextSheet,
   extractContextSheets,
+  isDataFromContextQuery,
   parseExportAwareText,
 } from "@/lib/export-context";
 import type { ChatMessage } from "@/lib/types";
@@ -202,16 +203,20 @@ const PurePreviewMessage = ({
           : parsedText.contextSheets.length > 0
             ? parsedText.contextSheets
             : inheritedExportContextSheets;
+      const parsedExportRequiresContext =
+        parsedText.exportData !== null &&
+        isDataFromContextQuery(parsedText.exportData.query);
+      const hasParsedExport =
+        !isLoading &&
+        parsedText.exportData !== null &&
+        (!parsedExportRequiresContext || contextSheets.length > 0);
       const hasFallbackExport =
         message.role === "assistant" &&
+        !isLoading &&
         exportHint !== null &&
         contextSheets.length > 0;
 
-      return (
-        visibleText.length > 0 ||
-        parsedText.exportData !== null ||
-        hasFallbackExport
-      );
+      return visibleText.length > 0 || hasParsedExport || hasFallbackExport;
     }) ?? false;
   const hasVisibleAssistantContent =
     message.role !== "assistant" ||
@@ -227,14 +232,22 @@ const PurePreviewMessage = ({
             : parsedText.contextSheets.length > 0
               ? parsedText.contextSheets
               : inheritedExportContextSheets;
+        const parsedExportRequiresContext =
+          parsedText.exportData !== null &&
+          isDataFromContextQuery(parsedText.exportData.query);
+        const hasParsedExport =
+          !isLoading &&
+          parsedText.exportData !== null &&
+          (!parsedExportRequiresContext || contextSheets.length > 0);
         const hasFallbackExport =
           message.role === "assistant" &&
+          !isLoading &&
           exportHint !== null &&
           contextSheets.length > 0;
 
         return (
           sanitizeText(parsedText.cleanText).trim().length > 0 ||
-          parsedText.exportData !== null ||
+          hasParsedExport ||
           hasFallbackExport
         );
       }
@@ -247,23 +260,12 @@ const PurePreviewMessage = ({
         return true;
       }
 
-      if (
-        part.type === "data-chart-spec" ||
-        part.type === "data-chart-specs"
-      ) {
+      if (part.type === "data-chart-spec" || part.type === "data-chart-specs") {
         return true;
       }
 
       if (part.type === "data-chart-warning") {
         return !hasChartImageFallback;
-      }
-
-      if (part.type === "data-export-context") {
-        return true;
-      }
-
-      if (part.type === "data-export-hint") {
-        return true;
       }
 
       return part.type === "file";
@@ -345,6 +347,7 @@ const PurePreviewMessage = ({
 
             if (type === "text") {
               const parsedText = parseExportAwareText(part.text);
+              const parsedExportData = parsedText.exportData;
               const visibleText = sanitizeText(parsedText.cleanText);
               const contextSheets =
                 exportContextSheetsFromParts.length > 0
@@ -352,14 +355,22 @@ const PurePreviewMessage = ({
                   : parsedText.contextSheets.length > 0
                     ? parsedText.contextSheets
                     : inheritedExportContextSheets;
+              const parsedExportRequiresContext =
+                parsedExportData !== null &&
+                isDataFromContextQuery(parsedExportData.query);
+              const hasParsedExport =
+                !isLoading &&
+                parsedExportData !== null &&
+                (!parsedExportRequiresContext || contextSheets.length > 0);
               const exportData =
-                parsedText.exportData !== null
+                hasParsedExport && parsedExportData
                   ? {
-                      ...parsedText.exportData,
-                      query: DATA_FROM_CONTEXT_MARKER,
-                      contextSheets,
+                      ...parsedExportData,
+                      contextSheets:
+                        contextSheets.length > 0 ? contextSheets : undefined,
                     }
                   : message.role === "assistant" &&
+                      !isLoading &&
                       exportHint &&
                       contextSheets.length > 0
                     ? {
@@ -581,6 +592,7 @@ const PurePreviewMessage = ({
                   <ChartRenderer
                     chartSpec={chartSpec}
                     chartWarning={index === 0 ? resolvedChartWarning : null}
+                    // biome-ignore lint/suspicious/noArrayIndexKey: chart specs can repeat without stable ids.
                     key={`chart-${message.id}-${index}`}
                   />
                 ))}
@@ -613,7 +625,9 @@ export const PreviewMessage = PurePreviewMessage;
 
 export const ThinkingMessage = ({ statusText }: { statusText?: string }) => {
   // Strip trailing dots/ellipsis from status text so we can animate them
-  const label = (statusText?.trim().replace(/\.{2,}$|…$/g, "") || "Pensando").trim();
+  const label = (
+    statusText?.trim().replace(/\.{2,}$|…$/g, "") || "Pensando"
+  ).trim();
 
   return (
     <div

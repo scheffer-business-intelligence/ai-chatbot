@@ -44,6 +44,10 @@ import {
   upsertProviderSession,
 } from "@/lib/db/queries";
 import { ChatSDKError } from "@/lib/errors";
+import {
+  isDataFromContextQuery,
+  parseExportDataFromText,
+} from "@/lib/export-context";
 import { generateSignedUrl } from "@/lib/gcp/storage";
 import type { ChatMessage } from "@/lib/types";
 import { generateUUID, getTextFromMessage } from "@/lib/utils";
@@ -279,6 +283,101 @@ function buildExportHintFromUserMessage(message: ChatMessage | null) {
     filename: deriveExportFilenameFromPrompt(promptText),
     description: "Baixar os dados desta resposta em Excel.",
   };
+}
+
+function getContextSheetsQuality(
+  contextSheets: VertexExtractedContext["contextSheets"]
+) {
+  let rowCount = 0;
+  let columnCount = 0;
+  let filledCellCount = 0;
+  let numericCellCount = 0;
+
+  for (const sheet of contextSheets) {
+    rowCount += sheet.rows.length;
+    columnCount += sheet.columns.length;
+
+    for (const row of sheet.rows) {
+      for (const column of sheet.columns) {
+        const value = row[column];
+        if (value === null || value === undefined) {
+          continue;
+        }
+
+        if (typeof value === "string" && !value.trim()) {
+          continue;
+        }
+
+        filledCellCount += 1;
+
+        if (typeof value === "number" && Number.isFinite(value)) {
+          numericCellCount += 1;
+          continue;
+        }
+
+        if (typeof value === "string") {
+          const normalized =
+            value.includes(",") && value.includes(".")
+              ? value.replace(/\./g, "").replace(",", ".")
+              : value.replace(",", ".");
+          if (/^-?\d+(\.\d+)?$/.test(normalized)) {
+            numericCellCount += 1;
+          }
+        }
+      }
+    }
+  }
+
+  return {
+    sheetCount: contextSheets.length,
+    rowCount,
+    columnCount,
+    filledCellCount,
+    numericCellCount,
+  };
+}
+
+function isContextQualityBetter(
+  candidate: ReturnType<typeof getContextSheetsQuality>,
+  current: ReturnType<typeof getContextSheetsQuality>
+) {
+  if (candidate.filledCellCount !== current.filledCellCount) {
+    return candidate.filledCellCount > current.filledCellCount;
+  }
+
+  if (candidate.numericCellCount !== current.numericCellCount) {
+    return candidate.numericCellCount > current.numericCellCount;
+  }
+
+  if (candidate.columnCount !== current.columnCount) {
+    return candidate.columnCount > current.columnCount;
+  }
+
+  if (candidate.rowCount !== current.rowCount) {
+    return candidate.rowCount > current.rowCount;
+  }
+
+  return candidate.sheetCount > current.sheetCount;
+}
+
+function pickRicherContextSheets(
+  currentSheets: VertexExtractedContext["contextSheets"],
+  candidateSheets: VertexExtractedContext["contextSheets"]
+) {
+  if (candidateSheets.length === 0) {
+    return currentSheets;
+  }
+
+  if (currentSheets.length === 0) {
+    return candidateSheets;
+  }
+
+  const currentQuality = getContextSheetsQuality(currentSheets);
+  const candidateQuality = getContextSheetsQuality(candidateSheets);
+
+  return isContextQualityBetter(candidateQuality, currentQuality)
+    ? candidateSheets
+    : currentSheets;
 }
 
 function isIncompleteChartWarning(chartError: string | null | undefined) {
@@ -719,6 +818,9 @@ export async function POST(request: Request) {
       message?.role === "user"
         ? (message as ChatMessage)
         : getLatestUserMessage(uiMessages);
+    const latestUserPromptText = latestUserMessage
+      ? getTextFromMessage(latestUserMessage).replace(/\s+/g, " ").trim()
+      : "";
     const exportHint = buildExportHintFromUserMessage(latestUserMessage);
 
     const { longitude, latitude, city, country } = geolocation(request);
@@ -1017,6 +1119,7 @@ export async function POST(request: Request) {
             const textPartId = generateUUID();
             let hasVisibleOutput = false;
             let activeProviderSessionId = initialProviderSessionId;
+            let hasQueryBasedExportInResponse = false;
             if (streamOpenedAtMs === null) {
               streamOpenedAtMs = Date.now();
               logAgentEngineEvent("info", {
@@ -1126,6 +1229,15 @@ export async function POST(request: Request) {
                   : fullResponseText;
 
               if (responseTextToRender.length > 0) {
+                const parsedExportFromResponse =
+                  parseExportDataFromText(responseTextToRender).exportData;
+                hasQueryBasedExportInResponse = Boolean(
+                  parsedExportFromResponse &&
+                    !isDataFromContextQuery(parsedExportFromResponse.query)
+                );
+              }
+
+              if (responseTextToRender.length > 0) {
                 dataStream.write({
                   type: "data-agent-status",
                   data: "Formatando resposta...",
@@ -1146,6 +1258,140 @@ export async function POST(request: Request) {
                 model_id: selectedChatModel,
                 duration_ms: Date.now() - streamStartedAtMs,
               });
+            };
+
+            const recoverExportContextForHint = async (
+              currentProviderSessionId: string
+            ) => {
+              if (!exportHint) {
+                return;
+              }
+
+              const recoveryContext: VertexExtractedContext = {
+                chartSpec: null,
+                chartSpecs: [],
+                chartError: null,
+                hasChartContext: false,
+                contextSheets: [],
+              };
+
+              try {
+                dataStream.write({
+                  type: "data-agent-status",
+                  data: "Gerando o arquivo...",
+                });
+
+                const baseRecoveryPrompt = [
+                  "Solicitacao original do usuario:",
+                  latestUserPromptText || "sem texto",
+                  "Recupere os dados estruturados para exportacao usando o resultado tabular completo da query que responde a solicitacao.",
+                  "Nao resuma e nao reduza o dataset para poucas colunas de identificacao.",
+                  "Retorne SOMENTE um bloco [BQ_CONTEXT] com JSON valido contendo contextSheets.",
+                  "Cada sheet deve conter name, columns e rows.",
+                  "Nao inclua qualquer texto fora do bloco.",
+                  "Se nao houver dados estruturados disponiveis, responda exatamente: NO_EXPORT_CONTEXT.",
+                ].join(" ");
+
+                const strictRecoveryPrompt = [
+                  "A exportacao anterior veio sem dados suficientes.",
+                  "Reexecute a consulta necessaria para responder ao pedido do usuario e devolva o dataset completo da resposta.",
+                  "Nao envie apenas identificadores como cultura/talhao.",
+                  "Retorne SOMENTE [BQ_CONTEXT] em JSON valido com contextSheets (name, columns, rows).",
+                  "Se nao houver dados, responda exatamente: NO_EXPORT_CONTEXT.",
+                ].join(" ");
+
+                let bestSheets = extractedContext.contextSheets;
+                const initialQuality = getContextSheetsQuality(bestSheets);
+                const recoveryPrompts = [baseRecoveryPrompt, strictRecoveryPrompt];
+
+                for (
+                  let recoveryAttempt = 0;
+                  recoveryAttempt < recoveryPrompts.length;
+                  recoveryAttempt += 1
+                ) {
+                  resetExtractedContext(recoveryContext);
+
+                  for await (const _event of streamVertexQuery({
+                    accessToken: serviceAccountAccessToken,
+                    sessionId: currentProviderSessionId,
+                    userId: bigQueryUserId,
+                    message: recoveryPrompts[recoveryAttempt],
+                    signal: request.signal,
+                    extractedContext: recoveryContext,
+                    allowTableChartFallback: false,
+                    allowEmptyVisibleText: true,
+                  })) {
+                    // Export context is recovered from extractedContext side-channel only.
+                  }
+
+                  bestSheets = pickRicherContextSheets(
+                    bestSheets,
+                    recoveryContext.contextSheets
+                  );
+                  const bestQuality = getContextSheetsQuality(bestSheets);
+
+                  logAgentEngineEvent("info", {
+                    event: "export_context_recovery_attempt",
+                    request_id: requestId,
+                    chat_id: id,
+                    session_id: currentProviderSessionId,
+                    user_id: bigQueryUserId,
+                    model_id: selectedChatModel,
+                    attempt: recoveryAttempt + 1,
+                    context_sheets_count: bestSheets.length,
+                    context_rows_count: bestQuality.rowCount,
+                    context_columns_count: bestQuality.columnCount,
+                    context_filled_cells_count: bestQuality.filledCellCount,
+                  });
+
+                  if (isContextQualityBetter(bestQuality, initialQuality)) {
+                    break;
+                  }
+                }
+
+                if (bestSheets.length > 0) {
+                  extractedContext.contextSheets = bestSheets;
+                  const recoveredRows = bestSheets.reduce(
+                    (sum, sheet) => sum + sheet.rows.length,
+                    0
+                  );
+                  const mergedQuality = getContextSheetsQuality(bestSheets);
+
+                  logAgentEngineEvent("info", {
+                    event: "export_context_recovered",
+                    request_id: requestId,
+                    chat_id: id,
+                    session_id: currentProviderSessionId,
+                    user_id: bigQueryUserId,
+                    model_id: selectedChatModel,
+                    context_sheets_count: bestSheets.length,
+                    context_rows_count: recoveredRows,
+                    context_columns_count: mergedQuality.columnCount,
+                    context_filled_cells_count: mergedQuality.filledCellCount,
+                  });
+
+                  return;
+                }
+
+                logAgentEngineEvent("warn", {
+                  event: "export_context_missing",
+                  request_id: requestId,
+                  chat_id: id,
+                  session_id: currentProviderSessionId,
+                  user_id: bigQueryUserId,
+                  model_id: selectedChatModel,
+                });
+              } catch (error) {
+                logAgentEngineEvent("warn", {
+                  event: "export_context_recovery_failed",
+                  request_id: requestId,
+                  chat_id: id,
+                  session_id: currentProviderSessionId,
+                  user_id: bigQueryUserId,
+                  model_id: selectedChatModel,
+                  reason: error instanceof Error ? error.message : String(error),
+                });
+              }
             };
 
             for (
@@ -1264,6 +1510,10 @@ export async function POST(request: Request) {
                 user_id: bigQueryUserId,
                 model_id: selectedChatModel,
               });
+            }
+
+            if (hasVisibleOutput && !hasQueryBasedExportInResponse) {
+              await recoverExportContextForHint(activeProviderSessionId);
             }
 
             if (extractedContext.chartSpecs.length > 1) {

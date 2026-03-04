@@ -1,13 +1,14 @@
 import {
-  inferChartSpecsFromTableText,
+  inferChartSpecsFromBulletListText,
   inferChartSpecsFromContextSheets,
   inferChartSpecsFromInlineSeriesText,
-  inferChartSpecsFromBulletListText,
+  inferChartSpecsFromTableText,
   parseChartContextFromText,
 } from "@/lib/charts/context";
 import type { ChartSpecV1 } from "@/lib/charts/schema";
 import {
   type ExportContextSheet,
+  extractContextSheets,
   parseBqContextFromText,
 } from "@/lib/export-context";
 import { sanitizeText } from "@/lib/utils";
@@ -693,9 +694,9 @@ function stripContextPayloadByClosingTag(
 }
 
 function stripContextBlocksForStream(text: string): string {
-  let cleaned = stripContextPayloadByClosingTag(text, "BQ_CONTEXT", "\"query\"");
-  cleaned = stripContextPayloadByClosingTag(cleaned, "CHART_CONTEXT", "\"type\"");
-  cleaned = stripContextPayloadByClosingTag(cleaned, "CHART", "\"type\"");
+  let cleaned = stripContextPayloadByClosingTag(text, "BQ_CONTEXT", '"query"');
+  cleaned = stripContextPayloadByClosingTag(cleaned, "CHART_CONTEXT", '"type"');
+  cleaned = stripContextPayloadByClosingTag(cleaned, "CHART", '"type"');
   const withoutBqAndMarkers = sanitizeText(cleaned);
   return stripContextBlock(
     stripContextBlock(withoutBqAndMarkers, "CHART_CONTEXT"),
@@ -1065,7 +1066,10 @@ function extractVisibleDelta(
   };
 }
 
-function pickPreferredVisibleText(currentBest: string, candidate: string): string {
+function pickPreferredVisibleText(
+  currentBest: string,
+  candidate: string
+): string {
   const normalizedCandidate = candidate.trim();
   if (!normalizedCandidate) {
     return currentBest;
@@ -1202,6 +1206,270 @@ function applyChartResolution({
   return resolutionSource;
 }
 
+type ContextSheetsQuality = {
+  sheetCount: number;
+  rowCount: number;
+  columnCount: number;
+  filledCellCount: number;
+  numericCellCount: number;
+};
+
+function toNumericValue(value: unknown): number | null {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return value;
+  }
+
+  if (typeof value !== "string") {
+    return null;
+  }
+
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return null;
+  }
+
+  const normalized =
+    trimmed.includes(",") && trimmed.includes(".")
+      ? trimmed.replace(/\./g, "").replace(",", ".")
+      : trimmed.replace(",", ".");
+
+  if (!/^-?\d+(\.\d+)?$/.test(normalized)) {
+    return null;
+  }
+
+  const parsed = Number.parseFloat(normalized);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function getContextSheetsQuality(
+  sheets: ExportContextSheet[]
+): ContextSheetsQuality {
+  let rowCount = 0;
+  let columnCount = 0;
+  let filledCellCount = 0;
+  let numericCellCount = 0;
+
+  for (const sheet of sheets) {
+    rowCount += sheet.rows.length;
+    columnCount += sheet.columns.length;
+
+    for (const row of sheet.rows) {
+      for (const column of sheet.columns) {
+        const value = row[column];
+        if (value === null || value === undefined) {
+          continue;
+        }
+
+        if (typeof value === "string" && !value.trim()) {
+          continue;
+        }
+
+        filledCellCount += 1;
+
+        if (toNumericValue(value) !== null) {
+          numericCellCount += 1;
+        }
+      }
+    }
+  }
+
+  return {
+    sheetCount: sheets.length,
+    rowCount,
+    columnCount,
+    filledCellCount,
+    numericCellCount,
+  };
+}
+
+function compareContextSheetsQuality(
+  currentSheets: ExportContextSheet[],
+  candidateSheets: ExportContextSheet[]
+): number {
+  const currentQuality = getContextSheetsQuality(currentSheets);
+  const candidateQuality = getContextSheetsQuality(candidateSheets);
+
+  if (candidateQuality.filledCellCount !== currentQuality.filledCellCount) {
+    return candidateQuality.filledCellCount - currentQuality.filledCellCount;
+  }
+
+  if (candidateQuality.numericCellCount !== currentQuality.numericCellCount) {
+    return candidateQuality.numericCellCount - currentQuality.numericCellCount;
+  }
+
+  if (candidateQuality.columnCount !== currentQuality.columnCount) {
+    return candidateQuality.columnCount - currentQuality.columnCount;
+  }
+
+  if (candidateQuality.rowCount !== currentQuality.rowCount) {
+    return candidateQuality.rowCount - currentQuality.rowCount;
+  }
+
+  return candidateQuality.sheetCount - currentQuality.sheetCount;
+}
+
+function pickRicherContextSheets(
+  currentSheets: ExportContextSheet[],
+  candidateSheets: ExportContextSheet[]
+): ExportContextSheet[] {
+  if (candidateSheets.length === 0) {
+    return currentSheets;
+  }
+
+  if (currentSheets.length === 0) {
+    return candidateSheets;
+  }
+
+  return compareContextSheetsQuality(currentSheets, candidateSheets) > 0
+    ? candidateSheets
+    : currentSheets;
+}
+
+function collectContextCandidatesFromPayload(
+  node: unknown,
+  candidates: unknown[],
+  depth = 0
+) {
+  if (!node || depth > 6) {
+    return;
+  }
+
+  if (Array.isArray(node)) {
+    for (const item of node) {
+      collectContextCandidatesFromPayload(item, candidates, depth + 1);
+    }
+    return;
+  }
+
+  if (typeof node !== "object") {
+    return;
+  }
+
+  const record = node as Record<string, unknown>;
+
+  for (const [key, value] of Object.entries(record)) {
+    const normalizedKey = key.trim().toLowerCase();
+
+    if (
+      normalizedKey.includes("contextsheet") ||
+      normalizedKey === "sheets" ||
+      normalizedKey === "tables" ||
+      normalizedKey === "datasets" ||
+      normalizedKey === "rows" ||
+      normalizedKey === "data" ||
+      normalizedKey === "result" ||
+      normalizedKey === "results" ||
+      normalizedKey === "records" ||
+      normalizedKey === "items" ||
+      normalizedKey === "values"
+    ) {
+      candidates.push(value);
+    }
+
+    if (typeof value === "object" && value !== null) {
+      collectContextCandidatesFromPayload(value, candidates, depth + 1);
+    }
+  }
+}
+
+function collectStringCandidatesFromPayload(
+  node: unknown,
+  candidates: string[],
+  depth = 0
+) {
+  if (!node || depth > 6) {
+    return;
+  }
+
+  if (typeof node === "string") {
+    const trimmed = node.trim();
+    if (trimmed.length > 0) {
+      candidates.push(trimmed);
+    }
+    return;
+  }
+
+  if (Array.isArray(node)) {
+    for (const item of node) {
+      collectStringCandidatesFromPayload(item, candidates, depth + 1);
+    }
+    return;
+  }
+
+  if (typeof node !== "object") {
+    return;
+  }
+
+  for (const value of Object.values(node as Record<string, unknown>)) {
+    collectStringCandidatesFromPayload(value, candidates, depth + 1);
+  }
+}
+
+function maybeDecodeBase64Candidate(value: string): string | null {
+  const trimmed = value.trim();
+  if (trimmed.length < 32 || trimmed.length > 200_000) {
+    return null;
+  }
+
+  const normalized = trimmed.replace(/-/g, "+").replace(/_/g, "/");
+  if (!/^[A-Za-z0-9+/=]+$/.test(normalized)) {
+    return null;
+  }
+
+  try {
+    const decoded = Buffer.from(normalized, "base64").toString("utf-8").trim();
+    if (!decoded) {
+      return null;
+    }
+
+    if (
+      decoded.includes("BQ_CONTEXT") ||
+      decoded.includes("contextSheets") ||
+      decoded.includes('"rows"')
+    ) {
+      return decoded;
+    }
+  } catch {
+    return null;
+  }
+
+  return null;
+}
+
+function extractContextSheetsFromVertexPayload(
+  payload: Record<string, unknown>
+): ExportContextSheet[] {
+  let bestSheets: ExportContextSheet[] = [];
+  const registerCandidate = (candidateSheets: ExportContextSheet[]) => {
+    bestSheets = pickRicherContextSheets(bestSheets, candidateSheets);
+  };
+
+  const candidates: unknown[] = [payload];
+  collectContextCandidatesFromPayload(payload, candidates);
+
+  for (const candidate of candidates) {
+    registerCandidate(extractContextSheets(candidate));
+  }
+
+  const textCandidates: string[] = [];
+  collectStringCandidatesFromPayload(payload, textCandidates);
+
+  for (const candidate of textCandidates) {
+    registerCandidate(parseBqContextFromText(candidate).contextSheets);
+    registerCandidate(extractContextSheets(candidate));
+
+    const decoded = maybeDecodeBase64Candidate(candidate);
+    if (!decoded) {
+      continue;
+    }
+
+    registerCandidate(parseBqContextFromText(decoded).contextSheets);
+    registerCandidate(extractContextSheets(decoded));
+  }
+
+  return bestSheets;
+}
+
 export async function* streamVertexQuery({
   accessToken,
   sessionId,
@@ -1210,6 +1478,7 @@ export async function* streamVertexQuery({
   signal,
   extractedContext,
   allowTableChartFallback = false,
+  allowEmptyVisibleText = false,
 }: {
   accessToken: string;
   sessionId: string;
@@ -1218,6 +1487,7 @@ export async function* streamVertexQuery({
   signal?: AbortSignal;
   extractedContext?: VertexExtractedContext;
   allowTableChartFallback?: boolean;
+  allowEmptyVisibleText?: boolean;
 }): AsyncGenerator<VertexStreamEvent, void, void> {
   if (!VERTEX_PROJECT_ID) {
     throw new Error("VERTEX_PROJECT_ID is not configured");
@@ -1283,6 +1553,17 @@ export async function* streamVertexQuery({
 
     return nextStatuses;
   };
+  const mergePayloadContextSheets = (payload: Record<string, unknown>) => {
+    if (!extractedContext) {
+      return;
+    }
+
+    const sheetsFromPayload = extractContextSheetsFromVertexPayload(payload);
+    extractedContext.contextSheets = pickRicherContextSheets(
+      extractedContext.contextSheets,
+      sheetsFromPayload
+    );
+  };
   const writeExtractedContext = (rawText: string) => {
     if (!extractedContext) {
       return;
@@ -1293,7 +1574,10 @@ export async function* streamVertexQuery({
     extractedContext.chartSpecs = parsedContext.chartSpecs;
     extractedContext.chartError = parsedContext.chartError;
     extractedContext.hasChartContext = parsedContext.hasChartContext;
-    extractedContext.contextSheets = parsedBqContext.contextSheets;
+    extractedContext.contextSheets = pickRicherContextSheets(
+      extractedContext.contextSheets,
+      parsedBqContext.contextSheets
+    );
 
     if (parsedContext.chartErrorDetails) {
       console.warn("[agent-engine] chart_context_parse_issue", {
@@ -1319,6 +1603,8 @@ export async function* streamVertexQuery({
       )) {
         yield { type: "status", status };
       }
+
+      mergePayloadContextSheets(payload);
 
       const text = extractTextFromVertexResponse(payload);
       if (!text) {
@@ -1366,7 +1652,12 @@ export async function* streamVertexQuery({
     });
 
     if (!finalVisibleText.trim()) {
-      throw new Error("Vertex AI returned an empty response");
+      if (!allowEmptyVisibleText) {
+        throw new Error("Vertex AI returned an empty response");
+      }
+
+      yield { type: "final", text: "" };
+      return;
     }
 
     yield { type: "final", text: finalVisibleText };
@@ -1382,6 +1673,8 @@ export async function* streamVertexQuery({
     )) {
       yield { type: "status", status };
     }
+
+    mergePayloadContextSheets(data);
 
     const text = extractTextFromVertexResponse(data);
     if (!text) {
@@ -1399,7 +1692,10 @@ export async function* streamVertexQuery({
       stripContextBlocksForStream(text),
       statusHistory
     );
-    bestVisibleText = pickPreferredVisibleText(bestVisibleText, candidateVisibleText);
+    bestVisibleText = pickPreferredVisibleText(
+      bestVisibleText,
+      candidateVisibleText
+    );
 
     const nextRawText = computeNextRawText(text, accumulatedRawText);
     const { delta, nextVisibleText } = extractVisibleDelta(
@@ -1433,13 +1729,18 @@ export async function* streamVertexQuery({
   });
 
   if (!finalVisibleText.trim()) {
-    if (rawSamples.length > 0) {
-      console.warn(
-        "Vertex stream payload sample (no text extracted):",
-        rawSamples
-      );
+    if (!allowEmptyVisibleText) {
+      if (rawSamples.length > 0) {
+        console.warn(
+          "Vertex stream payload sample (no text extracted):",
+          rawSamples
+        );
+      }
+      throw new Error("Vertex AI returned an empty response");
     }
-    throw new Error("Vertex AI returned an empty response");
+
+    yield { type: "final", text: "" };
+    return;
   }
 
   yield { type: "final", text: finalVisibleText };

@@ -4,13 +4,20 @@ import { auth } from "@/app/(auth)/auth";
 import {
   type ExportContextSheet,
   extractContextSheets,
+  isDataFromContextQuery,
   normalizeExportFilename,
 } from "@/lib/export-context";
+import { runSelectQuery } from "@/lib/gcp/bigquery";
 
 const MAX_ROWS_PER_SHEET = 10_000;
 const MAX_SHEET_NAME_LENGTH = 31;
+const MAX_EXPORT_QUERY_ROWS = 5_000;
+const READ_ONLY_QUERY_REGEX = /^(with|select)\b/i;
+const FORBIDDEN_QUERY_KEYWORDS_REGEX =
+  /\b(insert|update|delete|merge|drop|create|alter|truncate|grant|revoke|call|execute|begin|declare)\b/i;
 
 type ExportRequestBody = {
+  query?: unknown;
   filename?: unknown;
   contextSheets?: unknown;
   tableRows?: unknown;
@@ -107,6 +114,73 @@ function normalizeTableRows(rawRows: unknown): string[][] {
   }
 
   return rows;
+}
+
+function stripSqlComments(query: string): string {
+  return query
+    .replace(/\/\*[\s\S]*?\*\//g, " ")
+    .replace(/--.*$/gm, " ")
+    .trim();
+}
+
+function normalizeExportQuery(rawQuery: string): string {
+  let query = rawQuery.trim();
+
+  while (query.endsWith(";")) {
+    query = query.slice(0, -1).trim();
+  }
+
+  if (!query) {
+    throw new Error("Query de exportacao vazia.");
+  }
+
+  if (query.includes(";")) {
+    throw new Error("A query de exportacao deve conter apenas uma instrucao.");
+  }
+
+  const normalizedForValidation = stripSqlComments(query)
+    .replace(/\s+/g, " ")
+    .trim();
+
+  if (!READ_ONLY_QUERY_REGEX.test(normalizedForValidation)) {
+    throw new Error("A query de exportacao deve ser somente leitura (SELECT/WITH).");
+  }
+
+  if (FORBIDDEN_QUERY_KEYWORDS_REGEX.test(normalizedForValidation)) {
+    throw new Error("A query de exportacao contem comandos nao permitidos.");
+  }
+
+  return `SELECT * FROM (\n${query}\n) AS export_query LIMIT ${MAX_EXPORT_QUERY_ROWS}`;
+}
+
+function buildContextSheetsFromQueryResult(
+  columns: string[],
+  rows: Array<Record<string, string | null>>
+): ExportContextSheet[] {
+  const resolvedColumns =
+    columns.length > 0 ? columns : rows[0] ? Object.keys(rows[0]) : [];
+
+  if (resolvedColumns.length === 0) {
+    return [];
+  }
+
+  const resolvedRows = rows.map((row) => {
+    const normalizedRow: Record<string, unknown> = {};
+
+    for (const column of resolvedColumns) {
+      normalizedRow[column] = row[column];
+    }
+
+    return normalizedRow;
+  });
+
+  return [
+    {
+      name: "Dados",
+      columns: resolvedColumns,
+      rows: resolvedRows,
+    },
+  ];
 }
 
 function buildUniqueColumnNames(
@@ -259,22 +333,53 @@ export async function POST(request: Request) {
     requestBody = {};
   }
 
-  const contextSheets = extractContextSheets(requestBody.contextSheets);
-  const tableRows = normalizeTableRows(requestBody.tableRows);
-  const tableTitle = asNonEmptyString(requestBody.tableTitle) ?? "Tabela";
+  const query = asNonEmptyString(requestBody.query);
   const filename =
     asNonEmptyString(requestBody.filename) ??
     asNonEmptyString(requestBody.tableTitle) ??
     "export";
+  const tableTitle = asNonEmptyString(requestBody.tableTitle) ?? "Tabela";
+  const contextSheets = extractContextSheets(requestBody.contextSheets);
+  const tableRows = normalizeTableRows(requestBody.tableRows);
 
-  if (contextSheets.length === 0 && tableRows.length === 0) {
-    return NextResponse.json(
-      { detail: "Nao encontrei dados para exportar." },
-      { status: 400 }
-    );
-  }
+  const shouldRunQueryExport = Boolean(query && !isDataFromContextQuery(query));
 
   try {
+    if (shouldRunQueryExport && query) {
+      const normalizedQuery = normalizeExportQuery(query);
+      const queryResult = await runSelectQuery(normalizedQuery);
+      const querySheets = buildContextSheetsFromQueryResult(
+        queryResult.columns,
+        queryResult.rows
+      );
+
+      if (querySheets.length === 0) {
+        return NextResponse.json(
+          { detail: "A query de exportacao nao retornou colunas." },
+          { status: 400 }
+        );
+      }
+
+      const buffer = await buildWorkbookBuffer(querySheets);
+      const safeFilename = normalizeExportFilename(filename);
+
+      return new NextResponse(buffer, {
+        status: 200,
+        headers: {
+          "Content-Type":
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+          "Content-Disposition": `attachment; filename="${safeFilename}.xlsx"`,
+        },
+      });
+    }
+
+    if (contextSheets.length === 0 && tableRows.length === 0) {
+      return NextResponse.json(
+        { detail: "Nao encontrei dados para exportar." },
+        { status: 400 }
+      );
+    }
+
     if (contextSheets.length === 0) {
       const buffer = await buildTableWorkbookBuffer(tableTitle, tableRows);
       const safeFilename = normalizeExportFilename(filename);
