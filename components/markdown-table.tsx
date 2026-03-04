@@ -326,6 +326,10 @@ export function MarkdownTable({
   };
 
   const actionDisabled = isAnimating || isDownloadingExcel;
+  const tableClassName = cn(
+    "w-full border-collapse border border-border",
+    className
+  );
 
   return (
     <div
@@ -411,10 +415,7 @@ export function MarkdownTable({
 
       <div className="overflow-x-auto">
         <table
-          className={cn(
-            "w-full border-collapse border border-border",
-            className
-          )}
+          className={tableClassName}
           data-streamdown="table"
           ref={tableRef}
           {...props}
@@ -424,18 +425,16 @@ export function MarkdownTable({
       </div>
 
       <Dialog onOpenChange={setIsExpanded} open={isExpanded}>
-        <DialogContent className="max-h-[92vh] max-w-[96vw] overflow-hidden p-4 md:max-w-6xl">
+        <DialogContent className="flex max-h-[92vh] max-w-[96vw] flex-col overflow-hidden p-4 md:max-w-6xl">
           <DialogHeader>
             <DialogTitle>Tabela</DialogTitle>
             <DialogDescription>
-              Visualizacao expandida da tabela da resposta.
+              Visualização expandida da tabela da resposta.
             </DialogDescription>
           </DialogHeader>
 
-          <div className="overflow-auto pb-2">
-            <table className="w-full border-collapse border border-border">
-              {children}
-            </table>
+          <div className="min-h-0 flex-1 overflow-auto pb-2">
+            <table className={tableClassName}>{children}</table>
           </div>
         </DialogContent>
       </Dialog>
